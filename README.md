@@ -66,7 +66,7 @@ Wiring: connect UART TX/RX to the VESC COMM port. No level shifter needed — bo
 ```bash
 # Clone the repository
 git clone https://github.com/Benni1123/VESCBLE-WiFiBridge.git
-cd VescBLEBridge
+cd VESCBLE-WiFiBridge
 
 # Build and flash
 pio run --target upload
