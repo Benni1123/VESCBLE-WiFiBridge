@@ -29,15 +29,13 @@ Connects a VESC motor controller via UART and exposes it over both Bluetooth Low
 - OTA Flash tab: server update check with version comparison, manual firmware upload via drag & drop
 <img width="753" height="775" alt="grafik" src="https://github.com/user-attachments/assets/e75c4ac6-92cc-47fa-a4a9-eb6913f9646d" />
 <img width="735" height="1821" alt="grafik" src="https://github.com/user-attachments/assets/6ffaca73-7bfc-445a-b288-c63fafa40f26" />
-<img width="757" height="785" alt="grafik" src="https://github.com/user-attachments/assets/d7d52651-041b-4eac-9adc-c0501e360286" />
-
 
 **OTA Updates**
 - Server-based OTA: checks version.txt, installs firmware.bin — supports HTTP and HTTPS (GitHub Releases)
 - Manual OTA: drag & drop firmware.bin directly in the browser
 - Emergency OTA via curl if web interface is unavailable
 - Build version auto-increments patch number on every compile
-
+<img width="757" height="785" alt="grafik" src="https://github.com/user-attachments/assets/d7d52651-041b-4eac-9adc-c0501e360286" />
 ---
 
 ## Hardware
