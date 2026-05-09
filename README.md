@@ -35,10 +35,7 @@ Connects a VESC motor controller via UART and exposes it over both Bluetooth Low
 **OTA Updates**
 - Server-based OTA: checks version.txt, installs firmware.bin — supports HTTP and HTTPS (GitHub Releases)
 - Manual OTA: drag & drop firmware.bin directly in the browser
-- Emergency OTA via curl if web interface is unavailable:
-  ```
-  curl.exe -X POST http://<ip>/update -F "firmware=@firmware.bin"
-  ```
+- Emergency OTA via curl if web interface is unavailable
 - Build version auto-increments patch number on every compile
 
 ---
