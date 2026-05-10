@@ -35,6 +35,7 @@ String cfg_ap_pass;
 String cfg_hostname;
 int    cfg_port;
 bool   cfg_vesc_poll;
+int    cfg_ap_timeout;
 String cfg_update_url;
 String cfg_version_url;
 int    cfg_rx_pin;
@@ -59,6 +60,7 @@ void loadConfig() {
   cfg_hostname = prefs.getString("hostname", DEFAULT_HOSTNAME);
   cfg_port        = prefs.getInt("port", VESC_TCP_PORT);
   cfg_vesc_poll   = prefs.getBool("vesc_poll", true);
+  cfg_ap_timeout  = prefs.getInt("ap_timeout", 0);
   cfg_update_url  = prefs.getString("update_url", DEFAULT_UPDATE_URL);
   cfg_version_url = prefs.getString("version_url", DEFAULT_VERSION_URL);
   cfg_rx_pin      = prefs.getInt("rx_pin", VESC_RX_PIN);
@@ -93,6 +95,7 @@ void saveConfig() {
   prefs.putString("hostname", cfg_hostname);
   prefs.putInt("port", cfg_port);
   prefs.putBool("vesc_poll", cfg_vesc_poll);
+  prefs.putInt("ap_timeout", cfg_ap_timeout);
   prefs.putString("update_url",  cfg_update_url);
   prefs.putString("version_url", cfg_version_url);
   prefs.putInt("rx_pin", cfg_rx_pin);
@@ -144,6 +147,8 @@ static WiFiClient wifiClient;
 static WebServer  otaServer(80);
 static DNSServer  dnsServer;
 static bool       isAPMode = false;
+static unsigned long apStartTime = 0;
+static bool       apActive = false;
 
 const size_t MAX_BUF         = 256;
 const size_t MAX_VESC_BUFFER = 1024;
@@ -272,6 +277,8 @@ static const char PAGE_HTML[] PROGMEM = R"rawliteral(
       <input type="text" id="ap_ssid" maxlength="32" placeholder="VESC-BLE-WiFi">
       <label id="lbl-ap-pass">AP Password (leave empty for open network)</label>
       <input type="password" id="ap_pass" maxlength="64" id="ph-ap-pass" placeholder="leave empty for open network">
+      <label id="lbl-ap-timeout">AP Timeout in seconds (0 = never off)</label>
+      <input type="text" id="ap_timeout" maxlength="6" placeholder="0">
     </div>
 
     <div class="section">
@@ -440,6 +447,7 @@ function applyTranslations() {
   s('lbl-ap-title',     'Access Point (Fallback)',         'Access Point (Fallback)');
   s('lbl-ap-name',      'AP Name (SSID)',                  'AP Name (SSID)');
   s('lbl-ap-pass',      'AP Password (leave empty for open network)', 'AP Passwort (leer = offenes Netz)');
+  s('lbl-ap-timeout',   'AP Timeout in seconds (0 = never off)',      'AP Timeout in Sekunden (0 = nie aus)');
   s('lbl-conn-title',   'Connection',                      'Verbindung');
   s('lbl-port',         'TCP Port (default: 65101)',        'TCP Port (Standard: 65101)');
   s('lbl-vesc-poll',    'Read VESC data (voltage, temp, fault)', 'VESC Daten auslesen (Spannung, Temp, Fault)');
@@ -482,6 +490,8 @@ function loadInfo() {
       ${d.mode!=='ap'?`<div class="info-row"><span>RSSI</span><span class="info-val">${d.rssi} dBm</span></div>`:''}
       <div class="info-row"><span>BLE Client</span><span class="info-val">${d.ble_connected?(de?'Verbunden':'Connected'):(de?'Getrennt':'Disconnected')}</span></div>
       <div class="info-row"><span>WiFi Client</span><span class="info-val">${d.wifi_client_connected?(de?'Verbunden':'Connected'):(de?'Getrennt':'Disconnected')}</span></div>
+      <div class="info-row"><span>AP</span><span class="info-val" style="color:${d.ap_active?'var(--ok)':'var(--text3)'}">${d.ap_active?(de?'Aktiv':'Active'):(de?'Aus':'Off')}${d.ap_active?' ('+d.ap_ip+')':''}</span></div>
+      ${d.ap_active && d.ap_timeout_remaining >= 0 ? `<div class="info-row"><span>${de?'AP aus in':'AP off in'}</span><span class="info-val">${d.ap_timeout_remaining}s</span></div>` : ''}
       <div class="info-row"><span>TCP Port</span><span class="info-val">${d.port}</span></div>
       <div class="info-row"><span>UART</span><span class="info-val">RX=GPIO${d.rx_pin} TX=GPIO${d.tx_pin}</span></div>
       <div style="margin:10px 0 6px 0;font-size:11px;color:#666;text-transform:uppercase;letter-spacing:1px">VESC</div>
@@ -653,6 +663,7 @@ function loadConfig() {
     document.getElementById('ble_name').value    = d.ble_name||'';
     document.getElementById('ap_ssid').value     = d.ap_ssid||'';
     document.getElementById('ap_pass').value     = d.ap_pass||'';
+    document.getElementById('ap_timeout').value  = d.ap_timeout||0;
     document.getElementById('vesc_port').value   = d.port||65101;
     document.getElementById('rx_pin').value      = d.rx_pin||6;
     document.getElementById('tx_pin').value      = d.tx_pin||5;
@@ -679,6 +690,7 @@ function saveConfig() {
     ble_name:    document.getElementById('ble_name').value,
     ap_ssid:     document.getElementById('ap_ssid').value,
     ap_pass:     document.getElementById('ap_pass').value,
+    ap_timeout:  parseInt(document.getElementById('ap_timeout').value)||0,
     port:        parseInt(document.getElementById('vesc_port').value)||65101,
     rx_pin:      parseInt(document.getElementById('rx_pin').value)||6,
     tx_pin:      parseInt(document.getElementById('tx_pin').value)||5,
@@ -744,6 +756,7 @@ void handleCaptivePortal() {
 }
 
 bool isCaptivePortalRequest() {
+  if (WiFi.status() == WL_CONNECTED) return false;
   String host = otaServer.hostHeader();
   return (host != "192.168.4.1" && host != cfg_hostname + ".local");
 }
@@ -761,6 +774,14 @@ void handleApiInfo() {
   json += "\"ble_connected\":" + String(deviceConnected?"true":"false") + ",";
   json += "\"ble_mac\":\"" + String(NimBLEDevice::getAddress().toString().c_str()) + "\",";
   json += "\"wifi_client_connected\":" + String((wifiClient && wifiClient.connected())?"true":"false") + ",";
+  json += "\"ap_active\":" + String(apActive?"true":"false") + ",";
+  if (apActive && cfg_ap_timeout > 0) {
+    long remaining = (long)cfg_ap_timeout - (long)((millis() - apStartTime) / 1000);
+    json += "\"ap_timeout_remaining\":" + String(max(remaining, 0L)) + ",";
+  } else {
+    json += "\"ap_timeout_remaining\":-1,";
+  }
+  json += "\"ap_ip\":\"" + WiFi.softAPIP().toString() + "\",";
   json += "\"heap\":" + String(ESP.getFreeHeap()) + ",";
   json += "\"uptime\":\"" + uptime + "\",";
   json += "\"build\":\"" + String(FIRMWARE_VERSION) + " (" + String(__DATE__) + " " + String(__TIME__) + ")\",";
@@ -793,6 +814,7 @@ void handleApiConfigGet() {
   json += "\"ap_pass\":\"" + cfg_ap_pass + "\",";
   json += "\"port\":" + String(cfg_port) + ",";
   json += "\"vesc_poll\":" + String(cfg_vesc_poll ? "true" : "false") + ",";
+  json += "\"ap_timeout\":" + String(cfg_ap_timeout) + ",";
   json += "\"rx_pin\":" + String(cfg_rx_pin) + ",";
   json += "\"tx_pin\":" + String(cfg_tx_pin) + ",";
   json += "\"update_url\":\"" + cfg_update_url + "\",";
@@ -853,8 +875,20 @@ void handleApiConfigPost() {
     int val = body.substring(start, end).toInt();
     return (val >= 0 && val <= 48) ? val : def;
   };
-  cfg_rx_pin = parseInt2("rx_pin", VESC_RX_PIN);
-  cfg_tx_pin = parseInt2("tx_pin", VESC_TX_PIN);
+  cfg_rx_pin     = parseInt2("rx_pin", VESC_RX_PIN);
+  cfg_tx_pin     = parseInt2("tx_pin", VESC_TX_PIN);
+  {
+    String search = "\"ap_timeout\":";
+    int start = body.indexOf(search);
+    if (start >= 0) {
+      start += search.length();
+      int end = body.indexOf(",", start);
+      if (end < 0) end = body.indexOf("}", start);
+      cfg_ap_timeout = end > 0 ? body.substring(start, end).toInt() : 0;
+    } else {
+      cfg_ap_timeout = 0;
+    }
+  }
 
   cfg_wifi.clear();
   int arrStart = body.indexOf("\"wifi\":[");
@@ -929,7 +963,7 @@ String getCurrentVersion() {
 }
 
 void handleApiUpdateCheck() {
-  if (isAPMode) { otaServer.send(400, "application/json", "{\"error\":\"Only available in WiFi mode\"}"); return; }
+  if (WiFi.status() != WL_CONNECTED) { otaServer.send(400, "application/json", "{\"error\":\"Only available in WiFi mode\"}"); return; }
   if (cfg_version_url.isEmpty()) { otaServer.send(400, "application/json", "{\"error\":\"No version URL configured\"}"); return; }
 
   HTTPClient http;
@@ -956,7 +990,7 @@ void handleApiUpdateCheck() {
 }
 
 void handleApiUpdateInstall() {
-  if (isAPMode) { otaServer.send(400, "text/plain", "Only available in WiFi mode"); return; }
+  if (WiFi.status() != WL_CONNECTED) { otaServer.send(400, "text/plain", "Only available in WiFi mode"); return; }
   if (cfg_update_url.isEmpty()) { otaServer.send(400, "text/plain", "No update URL configured"); return; }
 
   otaServer.send(200, "text/plain", "OK");
@@ -1087,7 +1121,7 @@ bool setupWiFiClient() {
     return false;
   }
   Serial.println("WiFi Client: scanning known networks...");
-  WiFi.mode(WIFI_STA);
+  WiFi.mode(WIFI_AP_STA);
   WiFi.setHostname(cfg_hostname.c_str());
   for (auto &n : cfg_wifi) {
     wifiMulti.addAP(n.ssid.c_str(), n.pass.c_str());
@@ -1131,6 +1165,8 @@ bool setupAccessPoint() {
   bool ok = WiFi.softAP(cfg_ap_ssid.c_str(), pass, 6, 0, 4);
   if (ok) {
     isAPMode = true;
+    apActive = true;
+    apStartTime = millis();
     Serial.printf("AP IP: %s\n", WiFi.softAPIP().toString().c_str());
   } else {
     Serial.println("AP start failed!");
@@ -1173,18 +1209,25 @@ void setup() {
   Serial.printf("BLE advertising: %s\n", cfg_ble_name.c_str());
 
   bool wifiOK = setupWiFiClient();
-  if (!wifiOK) wifiOK = setupAccessPoint();
+  if (wifiOK) {
+    setupAccessPoint();
+  } else {
+    wifiOK = setupAccessPoint();
+  }
 
   if (wifiOK) {
-    IPAddress myIP = isAPMode ? WiFi.softAPIP() : WiFi.localIP();
+    IPAddress myIP = isAPMode && !WiFi.isConnected() ? WiFi.softAPIP() : WiFi.localIP();
 
     setupWebServer();
     Serial.printf("Web: http://%s/\n", myIP.toString().c_str());
+    if (WiFi.localIP()[0] != 0) {
+      Serial.printf("Web (AP): http://%s/\n", WiFi.softAPIP().toString().c_str());
+    }
 
     if (isAPMode) {
       dnsServer.setErrorReplyCode(DNSReplyCode::NoError);
       dnsServer.start(53, "*", WiFi.softAPIP());
-      Serial.println("Captive Portal DNS aktiv");
+      Serial.println("Captive Portal active");
     }
 
     server = WiFiServer(cfg_port);
@@ -1192,7 +1235,7 @@ void setup() {
     server.setNoDelay(true);
     Serial.printf("VESC TCP: %s:%d\n", myIP.toString().c_str(), cfg_port);
   } else {
-    Serial.println("WiFi failed — nur BLE aktiv");
+    Serial.println("WiFi failed — BLE only");
   }
 
   NimBLEDevice::startAdvertising();
@@ -1293,6 +1336,41 @@ void loop() {
 
   if (isAPMode) {
     dnsServer.processNextRequest();
+  }
+
+  if (apActive && cfg_ap_timeout > 0) {
+    if (millis() - apStartTime > (unsigned long)cfg_ap_timeout * 1000UL) {
+      if (WiFi.softAPgetStationNum() == 0) {
+        Serial.println("AP timeout — shutting down");
+        WiFi.softAPdisconnect(true);
+        dnsServer.stop();
+        apActive = false;
+        isAPMode = false;
+      }
+    }
+  }
+  if (!isAPMode && WiFi.status() != WL_CONNECTED) {
+    static unsigned long lastReconnect = 0;
+    if (millis() - lastReconnect > 10000) {
+      lastReconnect = millis();
+      Serial.println("WiFi lost, reconnecting...");
+      if (wifiMulti.run(8000) == WL_CONNECTED) {
+        String connectedSSID = WiFi.SSID();
+        for (auto &n : cfg_wifi) {
+          if (n.ssid == connectedSSID && n.staticIp && n.ip.length() > 0) {
+            IPAddress ip, gw, sub;
+            if (ip.fromString(n.ip) && gw.fromString(n.gateway) && sub.fromString(n.subnet)) {
+              IPAddress dnsIp;
+              if (n.dns.length() > 0 && dnsIp.fromString(n.dns)) WiFi.config(ip, gw, sub, dnsIp);
+              else WiFi.config(ip, gw, sub);
+            }
+            break;
+          }
+        }
+        Serial.printf("WiFi reconnected: %s | IP: %s\n", WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
+        NimBLEDevice::startAdvertising();
+      }
+    }
   }
 
   pollVesc();
