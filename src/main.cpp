@@ -480,7 +480,7 @@ applyLang();
 function loadInfo() {
   fetch('/api/info').then(r=>r.json()).then(d=>{
     const de = lang==='de';
-    document.getElementById('statusBar').textContent = d.mode==='ap'?'AP Mode: '+d.ip:'WiFi: '+d.ssid+' ('+d.ip+')';
+    document.getElementById('statusBar').textContent = d.mode==='ap' && !d.ssid ? 'AP Mode: '+d.ip : 'WiFi: '+d.ssid+' ('+d.ip+')';
     document.getElementById('infoContent').innerHTML=`
       <div class="info-row"><span>BLE Name</span><span class="info-val">${d.ble_name}</span></div>
       <div class="info-row"><span>BLE MAC</span><span class="info-val">${d.ble_mac}</span></div>
@@ -794,7 +794,7 @@ void handleApiInfo() {
   json += "\"vesc_temp_motor\":" + String(vescStatus.tempMotor, 1) + ",";
   json += "\"vesc_fault\":" + String(vescStatus.faultCode) + ",";
   json += "\"vesc_fault_str\":\"" + vescFaultToString(vescStatus.faultCode) + "\",";
-  if (isAPMode) {
+  if (isAPMode && WiFi.status() != WL_CONNECTED) {
     json += "\"mode\":\"ap\",";
     json += "\"ip\":\"" + WiFi.softAPIP().toString() + "\"";
   } else {
