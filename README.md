@@ -25,7 +25,8 @@ Download [`firmware_full.bin`](https://github.com/Benni1123/VESCBLE-WiFiBridge/r
 - Passes all VESC Tool commands transparently — zero modification
 - Periodic VESC status polling (voltage, FET temp, motor temp, fault code)
 - Polling only active when web UI is open — no unnecessary UART traffic
-  
+<img width="729" height="814" alt="grafik" src="https://github.com/user-attachments/assets/eb4fab84-3d0a-4ddb-a896-99ac9515304a" />
+
 **Web Interface**
 - Responsive dark/light web UI (auto-detects browser theme, manual toggle)
 - English and German (auto-detects browser language, manual toggle)
@@ -34,6 +35,8 @@ Download [`firmware_full.bin`](https://github.com/Benni1123/VESCBLE-WiFiBridge/r
 - WiFi password show/hide toggle per network
 - OTA Flash tab: server update check with version comparison, manual firmware upload via drag & drop
 - API tab: full API reference, UART debug log with channel filter (BLE / WiFi / Poll)
+<img width="723" height="1075" alt="grafik" src="https://github.com/user-attachments/assets/cb691cb1-f149-42f3-b62f-290eb1a59504" />
+<img width="729" height="1026" alt="grafik" src="https://github.com/user-attachments/assets/612a1403-0988-4144-aa04-1ba9e66d173d" />
 
 **Reliability**
 - Auto reboot configurable: triggers after N seconds with no BLE or WiFi client connected
@@ -48,11 +51,14 @@ Download [`firmware_full.bin`](https://github.com/Benni1123/VESCBLE-WiFiBridge/r
   curl -X POST http://<ip>:8080/update -F "firmware=@firmware.bin"
   ```
 - Build version auto-increments patch number on every compile
+<img width="725" height="763" alt="grafik" src="https://github.com/user-attachments/assets/d0b8e364-2503-4b28-9ad3-debafa0ea0fa" />
 
 **Debug**
 - UART debug log in the web UI — persists across reboots (stored in NVS)
 - Per-channel filter: BLE traffic, WiFi traffic, VESC poll — enable individually
 - Log accessible via `/api/uart/log`, clearable via `/api/uart/clear`
+<img width="725" height="1077" alt="grafik" src="https://github.com/user-attachments/assets/927bbf46-7546-45cd-ad77-6900de262a25" />
+<img width="731" height="961" alt="grafik" src="https://github.com/user-attachments/assets/9548c311-992e-4669-baff-eee9526ae72d" />
 
 ---
 
