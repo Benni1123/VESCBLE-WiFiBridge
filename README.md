@@ -6,13 +6,7 @@ Connects a VESC motor controller via UART and exposes it over both Bluetooth Low
 
 ## Flash Firmware
 
-> **Chrome or Edge required** (Web Serial API)
-
-<esp-web-install-button manifest="https://raw.githubusercontent.com/Benni1123/VESCBLE-WiFiBridge/main/manifest.json">
-  <button slot="activate" style="padding:10px 20px;background:#00bcd4;color:#111;border:none;border-radius:6px;font-size:14px;font-weight:bold;cursor:pointer">⚡ Flash Firmware</button>
-  <span slot="unsupported">Your browser does not support Web Serial. Use Chrome or Edge.</span>
-</esp-web-install-button>
-<script type="module" src="https://unpkg.com/esp-web-tools@10/dist/web/install-button.js"></script>
+Download [`firmware_full.bin`](https://github.com/Benni1123/VESCBLE-WiFiBridge/releases/latest/download/firmware_full.bin) and flash via **[web.esphome.io](https://web.esphome.io/)** — Chrome or Edge required, no software needed.
 
 ---
 
