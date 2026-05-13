@@ -65,7 +65,7 @@ Download [`firmware_full.bin`](https://github.com/Benni1123/VESCBLE-WiFiBridge/r
 | UART TX | GPIO 5 (configurable) |
 | Baud Rate | 115200 |
 
-Wiring: connect UART TX/RX to the VESC COMM port. No level shifter needed — both run at 3.3V.
+Wiring: connect UART TX/RX to the VESC COMM port. No level shifter needed — both run at 3.3V/5V.
 
 **Tested with**
 - Spintend Ubox 85150 (VESC Firmware 6.06) via COMM port
