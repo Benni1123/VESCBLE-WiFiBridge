@@ -425,7 +425,7 @@ function applyTranslations(){
   s('lbl-conn-title',       'Connection',                                   'Verbindung');
   s('lbl-port',             'TCP Port (default: 65101)',                    'TCP Port (Standard: 65101)');
   s('lbl-vesc-poll',        'Read VESC data (voltage, temp, fault)',        'VESC Daten auslesen (Spannung, Temp, Fault)');
-  s('lbl-autoreboot',       'Auto reboot if no client connected',           'Auto-Neustart wenn kein Client');
+  s('lbl-autoreboot',       'Auto reboot if no client connected',           'Auto-Neustart wenn kein Client verbunden');
   s('lbl-autoreboot-time',  'Reboot after (seconds, min 60)',               'Neustart nach (Sekunden, min 60)');
   s('lbl-autoreboot-nowifi','Reboot even when connected to WiFi (no active VESC client needed)', 'Neustart auch wenn im WLAN (ohne aktiven VESC Client)');
   s('lbl-update-title',     'Update Server',                                'Update Server');
