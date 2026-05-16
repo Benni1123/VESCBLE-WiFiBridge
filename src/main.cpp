@@ -425,7 +425,7 @@ function applyTranslations(){
   s('lbl-conn-title',       'Connection',                                   'Verbindung');
   s('lbl-port',             'TCP Port (default: 65101)',                    'TCP Port (Standard: 65101)');
   s('lbl-vesc-poll',        'Read VESC data (voltage, temp, fault)',        'VESC Daten auslesen (Spannung, Temp, Fault)');
-  s('lbl-autoreboot',       'Auto reboot if no client connected',           'Auto-Neustart wenn kein Client verbunden');
+  s('lbl-autoreboot',       'Auto reboot if no client connected',           'Auto-Neustart wenn kein Client');
   s('lbl-autoreboot-time',  'Reboot after (seconds, min 60)',               'Neustart nach (Sekunden, min 60)');
   s('lbl-autoreboot-nowifi','Reboot even when connected to WiFi (no active VESC client needed)', 'Neustart auch wenn im WLAN (ohne aktiven VESC Client)');
   s('lbl-update-title',     'Update Server',                                'Update Server');
@@ -860,6 +860,11 @@ void handleApiConfigPost() {
 
   saveConfig();
   bool doReboot = !(otaServer.hasArg("noreboot") || body.indexOf("\"noreboot\":true") >= 0);
+  if (!doReboot) {
+    // Refresh wifiMulti with new networks without reboot
+    wifiMulti = WiFiMulti();
+    for (auto &n : cfg_wifi) wifiMulti.addAP(n.ssid.c_str(), n.pass.c_str());
+  }
   otaServer.send(200, "text/plain", "OK");
   if (doReboot) { delay(500); ESP.restart(); }
 }
@@ -951,7 +956,7 @@ void setupWebServer() {
   });
 
   otaServer.begin();
-  emergencyServer.begin();
+  // emergencyServer.begin(); // disabled for BLE test
 }
 
 // ── BLE callbacks ─────────────────────────────────────────────────────────────
@@ -1120,16 +1125,21 @@ void setup() {
   if (cfg_ble_name.isEmpty()) cfg_ble_name = DEFAULT_BLE_NAME;
   NimBLEDevice::init(cfg_ble_name.c_str());
   NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+
   pServer = NimBLEDevice::createServer();
   pServer->setCallbacks(new MyServerCallbacks());
+
   BLEService *pService = pServer->createService(VESC_SERVICE_UUID);
   pCharacteristicVescTx = pService->createCharacteristic(VESC_CHARACTERISTIC_UUID_TX, NIMBLE_PROPERTY::NOTIFY | NIMBLE_PROPERTY::READ);
   pCharacteristicVescRx = pService->createCharacteristic(VESC_CHARACTERISTIC_UUID_RX, NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR);
   pCharacteristicVescRx->setCallbacks(new MyCallbacks());
+
   pService->start();
   pServer->start();
-  NimBLEDevice::getAdvertising()->addServiceUUID(VESC_SERVICE_UUID);
-  NimBLEDevice::startAdvertising();
+
+  NimBLEAdvertising *pAdv = NimBLEDevice::getAdvertising();
+  pAdv->addServiceUUID(VESC_SERVICE_UUID);
+  pAdv->start();
   Serial.printf("BLE advertising: %s\n", cfg_ble_name.c_str());
 
   bool wifiOK = setupWiFiClient();
@@ -1164,7 +1174,7 @@ std::string vescBuffer;
 
 void loop() {
   otaServer.handleClient();
-  emergencyServer.handleClient();
+  // emergencyServer.handleClient();
   dnsServer.processNextRequest();
 
   if (apActive && cfg_ap_timeout > 0) {
@@ -1178,24 +1188,36 @@ void loop() {
     }
   }
 
-  if (!isAPMode && WiFi.status() != WL_CONNECTED) {
+  if (WiFi.status() != WL_CONNECTED && !cfg_wifi.empty()) {
     static unsigned long lastReconnect = 0;
     if (millis() - lastReconnect > 10000) {
       lastReconnect = millis();
-      Serial.println("WiFi lost, reconnecting...");
-      if (wifiMulti.run(8000) == WL_CONNECTED) {
-        String csid = WiFi.SSID();
-        for (auto &n : cfg_wifi) {
-          if (n.ssid==csid && n.staticIp && n.ip.length()>0) {
-            IPAddress ip,gw,sub;
-            if (ip.fromString(n.ip)&&gw.fromString(n.gateway)&&sub.fromString(n.subnet)) {
-              IPAddress dns; if (n.dns.length()>0&&dns.fromString(n.dns)) WiFi.config(ip,gw,sub,dns); else WiFi.config(ip,gw,sub);
-            }
-            break;
-          }
+      // Quick scan first — only try connect if known network visible
+      int n = WiFi.scanNetworks(false, true);
+      bool found = false;
+      for (int i = 0; i < n && !found; i++) {
+        for (auto &w : cfg_wifi) {
+          if (WiFi.SSID(i) == w.ssid) { found = true; break; }
         }
-        Serial.printf("WiFi reconnected: %s | IP: %s\n", WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
-        NimBLEDevice::startAdvertising();
+      }
+      WiFi.scanDelete();
+      if (found) {
+        Serial.println("WiFi: known network found, connecting...");
+        if (wifiMulti.run(8000) == WL_CONNECTED) {
+          String csid = WiFi.SSID();
+          for (auto &w : cfg_wifi) {
+            if (w.ssid==csid && w.staticIp && w.ip.length()>0) {
+              IPAddress ip,gw,sub;
+              if (ip.fromString(w.ip)&&gw.fromString(w.gateway)&&sub.fromString(w.subnet)) {
+                IPAddress dns; if (w.dns.length()>0&&dns.fromString(w.dns)) WiFi.config(ip,gw,sub,dns); else WiFi.config(ip,gw,sub);
+              }
+              break;
+            }
+          }
+          isAPMode = false;
+          Serial.printf("WiFi connected: %s | IP: %s\n", WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
+          NimBLEDevice::startAdvertising();
+        }
       }
     }
   }
