@@ -956,7 +956,10 @@ void setupWebServer() {
   });
 
   otaServer.begin();
-  // emergencyServer.begin(); // disabled for BLE test
+  emergencyServer.begin();
+  xTaskCreate([](void*){
+    for(;;) { emergencyServer.handleClient(); vTaskDelay(1); }
+  }, "emergency", 4096, nullptr, 1, nullptr);
 }
 
 // ── BLE callbacks ─────────────────────────────────────────────────────────────
@@ -1174,7 +1177,6 @@ std::string vescBuffer;
 
 void loop() {
   otaServer.handleClient();
-  // emergencyServer.handleClient();
   dnsServer.processNextRequest();
 
   if (apActive && cfg_ap_timeout > 0) {
