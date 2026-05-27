@@ -47,6 +47,9 @@ bool   cfg_autoreboot_no_wifi = false;
 bool   cfg_debug              = false;
 int    cfg_log_size           = 50;
 int    cfg_debug_filter       = 7; // bitmask: 1=BLE 2=WiFi 4=Poll
+bool   cfg_roam_enabled       = false; // RSSI-basiertes Roaming (gleiche SSID, anderer AP)
+int    cfg_roam_threshold     = -75;   // ab diesem RSSI (dBm) wird nach besserem AP gesucht
+int    cfg_roam_hysteresis    = 12;    // neuer AP muss min. so viele dB staerker sein
 
 struct WiFiEntry {
   String ssid, pass;
@@ -74,6 +77,9 @@ void loadConfig() {
   cfg_debug              = prefs.getBool("debug",            false);
   cfg_log_size           = prefs.getInt ("log_size",         50);
   cfg_debug_filter       = prefs.getInt ("debug_filter",     7);
+  cfg_roam_enabled       = prefs.getBool("roam_en",          false);
+  cfg_roam_threshold     = prefs.getInt ("roam_thr",         -75);
+  cfg_roam_hysteresis    = prefs.getInt ("roam_hyst",        12);
   int count = prefs.getInt("wifi_count", 0);
   cfg_wifi.clear();
   for (int i = 0; i < count && i < MAX_WIFI_NETWORKS; i++) {
@@ -97,6 +103,10 @@ void loadConfig() {
   if (cfg_autoreboot_time < 60) cfg_autoreboot_time = 60;
   if (cfg_log_size < 10)  cfg_log_size = 10;
   if (cfg_log_size > 500) cfg_log_size = 500;
+  if (cfg_roam_threshold  > -40) cfg_roam_threshold  = -40;
+  if (cfg_roam_threshold  < -90) cfg_roam_threshold  = -90;
+  if (cfg_roam_hysteresis < 3)   cfg_roam_hysteresis = 3;
+  if (cfg_roam_hysteresis > 30)  cfg_roam_hysteresis = 30;
 }
 
 void saveConfig() {
@@ -118,6 +128,9 @@ void saveConfig() {
   prefs.putBool  ("debug",       cfg_debug);
   prefs.putInt   ("log_size",    cfg_log_size);
   prefs.putInt   ("debug_filter",cfg_debug_filter);
+  prefs.putBool  ("roam_en",     cfg_roam_enabled);
+  prefs.putInt   ("roam_thr",    cfg_roam_threshold);
+  prefs.putInt   ("roam_hyst",   cfg_roam_hysteresis);
   prefs.putInt   ("wifi_count",  cfg_wifi.size());
   for (int i = 0; i < (int)cfg_wifi.size(); i++) {
     prefs.putString(("wssid"  +String(i)).c_str(), cfg_wifi[i].ssid);
@@ -170,6 +183,23 @@ static bool       isAPMode   = false;
 static unsigned long apStartTime = 0;
 static bool       apActive   = false;
 
+// ── AP / WiFi resilience state ────────────────────────────────────────────────
+// apWanted = "der AP SOLL laufen". Wird einmal beim Start gesetzt und bleibt true
+// (AP soll dauerhaft aktiv sein). Der AP-Timeout kann ihn auf false setzen.
+static bool          apWanted          = false;
+static unsigned long lastApEnsure      = 0;
+static unsigned long lastReconnectTry  = 0;
+static bool          scanInProgress    = false;
+static unsigned long scanStartTime     = 0;
+static bool          staWasConnected   = false;
+
+// ── Roaming-State ─────────────────────────────────────────────────────────────
+static unsigned long lastRssiCheck     = 0;
+static unsigned long weakSince         = 0;     // seit wann RSSI unter Schwelle
+static bool          roamScanRunning   = false;
+static unsigned long roamScanStart     = 0;
+static unsigned long lastRoamSwitch    = 0;
+
 const size_t MAX_BUF         = 256;
 const size_t MAX_VESC_BUFFER = 1024;
 uint8_t buf[MAX_BUF];
@@ -182,6 +212,8 @@ static void uartLogAdd(const String &line) {
 }
 
 static String vescFaultToString(int code);
+bool ensureAP(bool force);
+void handleRoaming();
 
 // ── HTML PAGE ─────────────────────────────────────────────────────────────────
 static const char PAGE_HTML[] PROGMEM = R"rawliteral(
@@ -192,27 +224,28 @@ static const char PAGE_HTML[] PROGMEM = R"rawliteral(
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>🛴 VESC BLE/WiFi</title>
   <style>
+    @font-face{font-family:'Ndot47';src:url(data:font/woff2;base64,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) format('woff2');font-display:swap}
     :root{--bg:#000000;--bg2:#111111;--bg3:#1a1a1a;--border:#222222;--border2:#333333;--text:#e0e0e0;--text2:#aaa;--text3:#666;--accent:#00bcd4;--accent2:#00acc1;--ok:#4caf50;--err:#f44336;--ok-bg:#0a1f0d;--err-bg:#1f0a0a}
     [data-theme=light]{--bg:#f5f5f5;--bg2:#ffffff;--bg3:#ebebeb;--border:#dddddd;--border2:#cccccc;--text:#111111;--text2:#555555;--text3:#999999;--accent:#0288d1;--accent2:#0277bd;--ok:#388e3c;--err:#c62828;--ok-bg:#e8f5e9;--err-bg:#ffebee}
     @media(prefers-color-scheme:light){:root:not([data-theme=dark]){--bg:#f5f5f5;--bg2:#ffffff;--bg3:#ebebeb;--border:#dddddd;--border2:#cccccc;--text:#111111;--text2:#555555;--text3:#999999;--accent:#0288d1;--accent2:#0277bd;--ok:#388e3c;--err:#c62828;--ok-bg:#e8f5e9;--err-bg:#ffebee}}
     *{box-sizing:border-box;margin:0;padding:0}
-    body{font-family:monospace;background:var(--bg);color:var(--text);min-height:100vh;padding:16px}
+    body{font-family:'Ndot47',monospace;background:var(--bg);color:var(--text);min-height:100vh;padding:16px}
     .wrap{max-width:600px;margin:0 auto;padding:0 16px}
     h1{color:var(--accent);font-size:18px;margin-bottom:4px}
     .sub{color:var(--text3);font-size:12px;margin-bottom:24px}
     .tabs{display:flex;gap:4px;margin-bottom:16px;flex-wrap:wrap}
-    .tab{padding:8px 16px;background:var(--bg2);border:1px solid var(--border);border-radius:6px;cursor:pointer;font-family:monospace;font-size:13px;color:var(--text2)}
+    .tab{padding:8px 16px;background:var(--bg2);border:1px solid var(--border);border-radius:6px;cursor:pointer;font-family:'Ndot47',monospace;font-size:13px;color:var(--text2)}
     .tab.active{background:var(--accent);color:#111;border-color:var(--accent)}
     .panel{display:none}.panel.active{display:block}
     .section{background:var(--bg2);border:1px solid var(--border2);border-radius:8px;padding:20px;margin-bottom:12px}
     .section h3{color:var(--accent);font-size:13px;margin-bottom:14px;text-transform:uppercase;letter-spacing:1px}
     label{display:block;font-size:12px;color:var(--text2);margin-bottom:4px;margin-top:10px}
     label:first-of-type{margin-top:0}
-    input[type=text],input[type=password]{width:100%;padding:8px 10px;background:var(--bg3);border:1px solid var(--border);border-radius:4px;color:var(--text);font-family:monospace;font-size:13px}
+    input[type=text],input[type=password]{width:100%;padding:8px 10px;background:var(--bg3);border:1px solid var(--border);border-radius:4px;color:var(--text);font-family:'Ndot47',monospace;font-size:13px}
     input:focus{outline:none;border-color:var(--accent)}
     .checkbox-row{display:flex;align-items:center;gap:10px;margin-top:12px;font-size:13px;color:var(--text2);cursor:pointer}
     .checkbox-row input[type=checkbox]{width:16px;height:16px;accent-color:var(--accent);cursor:pointer}
-    .btn{width:100%;padding:11px;background:var(--accent);color:#111;border:none;border-radius:6px;font-family:monospace;font-size:14px;font-weight:bold;cursor:pointer;margin-top:14px}
+    .btn{width:100%;padding:11px;background:var(--accent);color:#111;border:none;border-radius:6px;font-family:'Ndot47',monospace;font-size:14px;font-weight:bold;cursor:pointer;margin-top:14px}
     .btn:hover{background:var(--accent2)}.btn.sm{padding:6px 12px;font-size:12px;width:auto;margin-top:0}
     .btn.red{background:var(--err);color:#fff}.btn.red:hover{opacity:0.85}
     .btn.green{background:var(--ok);color:#111}.btn.green:hover{opacity:0.85}
@@ -237,9 +270,9 @@ static const char PAGE_HTML[] PROGMEM = R"rawliteral(
     .info-row{display:flex;justify-content:space-between;font-size:12px;padding:4px 0;border-bottom:1px solid var(--border2)}
     .info-row:last-child{border:none}
     .info-val{color:var(--accent)}
-    .lang-btn{position:fixed;top:12px;right:12px;padding:4px 10px;background:var(--bg2);border:1px solid var(--border);border-radius:4px;color:var(--text2);font-family:monospace;font-size:12px;cursor:pointer}
+    .lang-btn{position:fixed;top:12px;right:12px;padding:4px 10px;background:var(--bg2);border:1px solid var(--border);border-radius:4px;color:var(--text2);font-family:'Ndot47',monospace;font-size:12px;cursor:pointer}
     .lang-btn:hover{border-color:var(--accent);color:var(--accent)}
-    .theme-btn{position:fixed;top:12px;right:56px;padding:4px 10px;background:var(--bg2);border:1px solid var(--border);border-radius:4px;color:var(--text2);font-family:monospace;font-size:12px;cursor:pointer}
+    .theme-btn{position:fixed;top:12px;right:56px;padding:4px 10px;background:var(--bg2);border:1px solid var(--border);border-radius:4px;color:var(--text2);font-family:'Ndot47',monospace;font-size:12px;cursor:pointer}
     .theme-btn:hover{border-color:var(--accent);color:var(--accent)}
     .ep{margin-bottom:10px;padding:10px;background:var(--bg3);border-radius:6px;font-size:12px}
     .method{display:inline-block;padding:2px 6px;border-radius:3px;font-weight:bold;margin-right:6px;font-size:11px}
@@ -312,6 +345,19 @@ static const char PAGE_HTML[] PROGMEM = R"rawliteral(
           <input type="checkbox" id="autoreboot_no_wifi">
           <span id="lbl-autoreboot-nowifi">Reboot even when connected to WiFi (no active VESC client needed)</span>
         </label>
+      </div>
+    </div>
+    <div class="section">
+      <h3 id="lbl-roam-title">WiFi Roaming</h3>
+      <label class="checkbox-row" style="margin-top:0">
+        <input type="checkbox" id="roam_enabled" onchange="document.getElementById('roam_opts').style.display=this.checked?'':'none'">
+        <span id="lbl-roam-enabled">Switch to stronger AP with same SSID</span>
+      </label>
+      <div id="roam_opts" style="display:none;margin-top:8px">
+        <label id="lbl-roam-thr">Search threshold (dBm, e.g. -75 — weaker = roam search starts)</label>
+        <input type="text" id="roam_threshold" maxlength="4" placeholder="-75">
+        <label id="lbl-roam-hyst">Min. improvement (dB) to actually switch</label>
+        <input type="text" id="roam_hysteresis" maxlength="3" placeholder="12">
       </div>
     </div>
     <div class="section">
@@ -428,6 +474,10 @@ function applyTranslations(){
   s('lbl-autoreboot',       'Auto reboot if no client connected',           'Auto-Neustart wenn kein Client verbunden');
   s('lbl-autoreboot-time',  'Reboot after (seconds, min 60)',               'Neustart nach (Sekunden, min 60)');
   s('lbl-autoreboot-nowifi','Reboot even when connected to WiFi (no active VESC client needed)', 'Neustart auch wenn im WLAN (ohne aktiven VESC Client)');
+  s('lbl-roam-title',       'WiFi Roaming',                                 'WiFi Roaming');
+  s('lbl-roam-enabled',     'Switch to stronger AP with same SSID',         'Zu st\u00e4rkerem AP mit gleicher SSID wechseln');
+  s('lbl-roam-thr',         'Search threshold (dBm, e.g. -75 \u2014 weaker = roam search starts)', 'Suchschwelle (dBm, z.B. -75 \u2014 schw\u00e4cher = Roam-Suche startet)');
+  s('lbl-roam-hyst',        'Min. improvement (dB) to actually switch',     'Min. Verbesserung (dB) f\u00fcr Wechsel');
   s('lbl-update-title',     'Update Server',                                'Update Server');
   s('lbl-version-url',      'Version URL (version.txt)',                    'Version URL (version.txt)');
   s('lbl-firmware-url',     'Firmware URL (firmware.bin)',                  'Firmware URL (firmware.bin)');
@@ -588,6 +638,10 @@ function loadConfig(){
     document.getElementById('autoreboot_time').value = d.autoreboot_time||300;
     document.getElementById('autoreboot_no_wifi').checked = d.autoreboot_no_wifi===true;
     document.getElementById('autoreboot_opts').style.display = d.autoreboot?'':'none';
+    document.getElementById('roam_enabled').checked = d.roam_enabled===true;
+    document.getElementById('roam_threshold').value = d.roam_threshold||-75;
+    document.getElementById('roam_hysteresis').value = d.roam_hysteresis||12;
+    document.getElementById('roam_opts').style.display = d.roam_enabled?'':'none';
     document.getElementById('version_url').value = d.version_url||'';
     document.getElementById('update_url').value  = d.update_url||'';
     wifiNetworks=(d.wifi||[]).map(function(n){return{ssid:n.ssid||'',pass:n.pass||'',static:n.static||false,ip:n.ip||'',gateway:n.gateway||'',subnet:n.subnet||'255.255.255.0',dns:n.dns||''};});
@@ -598,7 +652,7 @@ function loadConfig(){
 
 function showToast(msg, ok, duration){
   var t=document.getElementById('toast');
-  if(!t){t=document.createElement('div');t.id='toast';t.style.cssText='position:fixed;top:12px;left:50%;transform:translateX(-50%);padding:10px 18px;border-radius:6px;font-family:monospace;font-size:13px;z-index:9999;transition:opacity .3s;pointer-events:none';document.body.appendChild(t);}
+  if(!t){t=document.createElement('div');t.id='toast';t.style.cssText='position:fixed;top:12px;left:50%;transform:translateX(-50%);padding:10px 18px;border-radius:6px;font-family:Ndot47,monospace;font-size:13px;z-index:9999;transition:opacity .3s;pointer-events:none';document.body.appendChild(t);}
   t.textContent=msg;
   t.style.background=ok?'var(--ok)':'var(--err)';
   t.style.color=ok?'#111':'#fff';
@@ -638,6 +692,9 @@ function saveConfig(){
     autoreboot:      document.getElementById('autoreboot').checked,
     autoreboot_time: parseInt(document.getElementById('autoreboot_time').value)||300,
     autoreboot_no_wifi: document.getElementById('autoreboot_no_wifi').checked,
+    roam_enabled:    document.getElementById('roam_enabled').checked,
+    roam_threshold:  parseInt(document.getElementById('roam_threshold').value)||-75,
+    roam_hysteresis: parseInt(document.getElementById('roam_hysteresis').value)||12,
     version_url: document.getElementById('version_url').value,
     update_url:  document.getElementById('update_url').value,
     wifi: wifi
@@ -762,7 +819,7 @@ void handleApiInfo() {
   json += "\"vesc_temp_motor\":"+String(vescStatus.tempMotor,1)+",";
   json += "\"vesc_fault\":"+String(vescStatus.faultCode)+",";
   json += "\"vesc_fault_str\":\""+vescFaultToString(vescStatus.faultCode)+"\",";
-  if (isAPMode && WiFi.status() != WL_CONNECTED) {
+  if (WiFi.status() != WL_CONNECTED) {
     json += "\"mode\":\"ap\",\"ip\":\""+WiFi.softAPIP().toString()+"\"";
   } else {
     json += "\"mode\":\"client\",\"ip\":\""+WiFi.localIP().toString()+"\",";
@@ -785,6 +842,9 @@ void handleApiConfigGet() {
   json += "\"autoreboot\":"+String(cfg_autoreboot?"true":"false")+",";
   json += "\"autoreboot_time\":"+String(cfg_autoreboot_time)+",";
   json += "\"autoreboot_no_wifi\":"+String(cfg_autoreboot_no_wifi?"true":"false")+",";
+  json += "\"roam_enabled\":"+String(cfg_roam_enabled?"true":"false")+",";
+  json += "\"roam_threshold\":"+String(cfg_roam_threshold)+",";
+  json += "\"roam_hysteresis\":"+String(cfg_roam_hysteresis)+",";
   json += "\"update_url\":\""+cfg_update_url+"\",";
   json += "\"version_url\":\""+cfg_version_url+"\",";
   json += "\"wifi\":[";
@@ -830,6 +890,13 @@ void handleApiConfigPost() {
   cfg_autoreboot_no_wifi = (body.indexOf("\"autoreboot_no_wifi\":true") >= 0);
   cfg_autoreboot_time    = parseInt2("autoreboot_time", 300);
   if (cfg_autoreboot_time < 60) cfg_autoreboot_time = 60;
+  cfg_roam_enabled    = (body.indexOf("\"roam_enabled\":true") >= 0);
+  cfg_roam_threshold  = parseInt2("roam_threshold", -75);
+  cfg_roam_hysteresis = parseInt2("roam_hysteresis", 12);
+  if (cfg_roam_threshold  > -40) cfg_roam_threshold  = -40;
+  if (cfg_roam_threshold  < -90) cfg_roam_threshold  = -90;
+  if (cfg_roam_hysteresis < 3)   cfg_roam_hysteresis = 3;
+  if (cfg_roam_hysteresis > 30)  cfg_roam_hysteresis = 30;
 
   if (cfg_ble_name.isEmpty()) cfg_ble_name = DEFAULT_BLE_NAME;
   if (cfg_ap_ssid.isEmpty())  cfg_ap_ssid  = DEFAULT_AP_SSID;
@@ -989,6 +1056,111 @@ class MyCallbacks : public BLECharacteristicCallbacks {
   }
 };
 
+// ── WiFi Event Handler ────────────────────────────────────────────────────────
+// Fängt alle relevanten WiFi-Events ab. Der entscheidende Punkt für deinen Bug:
+// bei STA_DISCONNECTED darf der AP NICHT mitsterben. Wir setzen den Mode hart
+// zurück und ziehen den AP sofort wieder hoch, falls er gefallen ist.
+void onWiFiEvent(WiFiEvent_t event) {
+  switch (event) {
+    case ARDUINO_EVENT_WIFI_STA_CONNECTED:
+      Serial.println("[evt] STA connected");
+      break;
+
+    case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+      Serial.printf("[evt] STA got IP: %s\n", WiFi.localIP().toString().c_str());
+      staWasConnected = true;
+      // Nach erfolgreichem STA-Connect: AP läuft jetzt zwangsweise auf STA-Channel.
+      // Sicherstellen, dass der AP-Mode-Bit noch gesetzt ist.
+      ensureAP(false);
+      break;
+
+    case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
+      // *** Das ist der kritische Pfad deines Bugs. ***
+      // STA hat die Verbindung verloren. Die IDF räumt intern auf — dabei darf
+      // der AP NICHT verschwinden. Mode hart auf AP_STA halten und AP prüfen.
+      Serial.println("[evt] STA disconnected — protecting AP");
+      if (WiFi.getMode() != WIFI_AP_STA) {
+        WiFi.mode(WIFI_AP_STA);
+      }
+      ensureAP(true);   // AP forciert wiederherstellen falls nötig
+      staWasConnected = false;
+      break;
+
+    case ARDUINO_EVENT_WIFI_AP_START:
+      Serial.println("[evt] AP started");
+      break;
+
+    case ARDUINO_EVENT_WIFI_AP_STOP:
+      // AP wurde gestoppt — wenn wir ihn eigentlich wollen, sofort neu starten.
+      Serial.println("[evt] AP stopped");
+      if (apWanted) {
+        Serial.println("[evt] AP unexpectedly stopped — restarting");
+        ensureAP(true);
+      }
+      break;
+
+    case ARDUINO_EVENT_WIFI_AP_STACONNECTED:
+      Serial.println("[evt] AP: station connected");
+      break;
+
+    case ARDUINO_EVENT_WIFI_AP_STADISCONNECTED:
+      Serial.println("[evt] AP: station disconnected");
+      break;
+
+    default:
+      break;
+  }
+}
+
+// ── AP / WiFi helpers ─────────────────────────────────────────────────────────
+// ensureAP: garantiert, dass der AP läuft (sofern apWanted == true).
+// force == true  -> AP wird in jedem Fall neu konfiguriert (softAP erneut)
+// force == false -> AP wird nur (neu) gestartet, wenn er aktuell nicht läuft
+bool ensureAP(bool force) {
+  if (!apWanted) return false;
+
+  wifi_mode_t mode = WiFi.getMode();
+  bool apBitSet  = (mode == WIFI_AP || mode == WIFI_AP_STA);
+  bool apIpValid = (WiFi.softAPIP() != IPAddress(0,0,0,0));
+  bool apLooksUp = apBitSet && apIpValid;
+
+  if (apLooksUp && !force) {
+    apActive = true;
+    return true;
+  }
+
+  // Mode sicherstellen — niemals AP-Bit verlieren
+  if (mode != WIFI_AP_STA) {
+    WiFi.mode(WIFI_AP_STA);
+    delay(20);
+  }
+
+  const char *pass = cfg_ap_pass.length() > 0 ? cfg_ap_pass.c_str() : nullptr;
+  // Channel: wenn STA verbunden ist, MUSS der AP auf dessen Channel (HW-Zwang).
+  // Sonst Channel 1 als fester Default.
+  int ch = (WiFi.status() == WL_CONNECTED) ? WiFi.channel() : 1;
+  if (ch < 1 || ch > 13) ch = 1;
+
+  bool ok = WiFi.softAP(cfg_ap_ssid.c_str(), pass, ch, 0, 4);
+  if (ok) {
+    isAPMode    = true;
+    apActive    = true;
+    apStartTime = millis();
+    Serial.printf("AP (re)started: %s ch=%d ip=%s\n",
+                  cfg_ap_ssid.c_str(), ch, WiFi.softAPIP().toString().c_str());
+  } else {
+    Serial.println("AP start FAILED!");
+  }
+  return ok;
+}
+
+bool setupAccessPoint() {
+  Serial.printf("AP: %s\n", cfg_ap_ssid.c_str());
+  apWanted = true;            // AP soll dauerhaft laufen
+  bool ok = ensureAP(true);   // initial forciert starten
+  return ok;
+}
+
 // ── WiFi setup ────────────────────────────────────────────────────────────────
 bool setupWiFiClient() {
   if (cfg_wifi.empty()) { Serial.println("WiFi: no networks configured"); return false; }
@@ -998,7 +1170,13 @@ bool setupWiFiClient() {
   for (auto &n : cfg_wifi) { wifiMulti.addAP(n.ssid.c_str(), n.pass.c_str()); Serial.printf("  + %s\n", n.ssid.c_str()); }
   unsigned long start = millis();
   while (wifiMulti.run(15000) != WL_CONNECTED) {
-    if (millis()-start > 17000) { Serial.println("WiFi: failed!"); WiFi.disconnect(); return false; }
+    if (millis()-start > 17000) {
+      Serial.println("WiFi: failed!");
+      // WICHTIG: disconnect(false,false) -> Funk bleibt an, Mode bleibt erhalten.
+      // Ein nacktes WiFi.disconnect() würde im AP_STA-Modus den AP mitkillen.
+      WiFi.disconnect(false, false);
+      return false;
+    }
     delay(500); Serial.print(".");
   }
   String csid = WiFi.SSID();
@@ -1013,15 +1191,6 @@ bool setupWiFiClient() {
   }
   Serial.printf("\nWiFi: %s | IP: %s | RSSI: %d dBm\n", WiFi.SSID().c_str(), WiFi.localIP().toString().c_str(), WiFi.RSSI());
   return true;
-}
-
-bool setupAccessPoint() {
-  Serial.printf("AP: %s\n", cfg_ap_ssid.c_str());
-  const char *pass = cfg_ap_pass.length()>0 ? cfg_ap_pass.c_str() : nullptr;
-  bool ok = WiFi.softAP(cfg_ap_ssid.c_str(), pass, 6, 0, 4);
-  if (ok) { isAPMode=true; apActive=true; apStartTime=millis(); Serial.printf("AP IP: %s\n", WiFi.softAPIP().toString().c_str()); }
-  else Serial.println("AP start failed!");
-  return ok;
 }
 
 // ── VESC parsing ──────────────────────────────────────────────────────────────
@@ -1040,9 +1209,9 @@ static String vescFaultToString(int code) {
     case 5:  return "OVER_TEMP_FET";
     case 6:  return "OVER_TEMP_MOTOR";
     case 7:  return "GATE_DRIVER_OVER_VOLTAGE";
-    case 8:  return "GATE_DRIVER_UNDER_VOLTAGE";
-    case 9:  return "MCU_UNDER_VOLTAGE";
-    case 10: return "BOOTING_FROM_WATCHDOG_RESET";
+    case 8:  return "MCU_UNDER_VOLTAGE";
+    case 9:  return "BOOTING_FROM_WATCHDOG_RESET";
+    case 10: return "GATE_DRIVER_UNDER_VOLTAGE";
     case 11: return "ENCODER_SPI_FAULT";
     case 12: return "ENCODER_SINCOS_BELOW_MIN_AMPLITUDE";
     case 13: return "ENCODER_SINCOS_ABOVE_MAX_AMPLITUDE";
@@ -1051,7 +1220,18 @@ static String vescFaultToString(int code) {
     case 16: return "HIGH_OFFSET_CURRENT_SENSOR_2";
     case 17: return "HIGH_OFFSET_CURRENT_SENSOR_3";
     case 18: return "UNBALANCED_CURRENTS";
-    default: return "UNKNOWN_"+String(code);
+    case 19: return "BRK";
+    case 20: return "RESOLVER_LOT";
+    case 21: return "RESOLVER_DOS";
+    case 22: return "RESOLVER_LOS";
+    case 23: return "FLASH_CORRUPTION_APP_CFG";
+    case 24: return "FLASH_CORRUPTION_MC_CFG";
+    case 25: return "ENCODER_NO_MAGNET";
+    case 26: return "ENCODER_MAGNET_TOO_STRONG";
+    case 27: return "PHASE_FILTER";
+    case 28: return "ENCODER_FAULT";
+    case 29: return "LV_OUTPUT_FAULT";
+    default: return "UNKNOWN_" + String(code);
   }
 }
 
@@ -1110,6 +1290,228 @@ void pollVesc() {
   }
 }
 
+// ── WiFi Roaming (gleiche SSID, anderer/staerkerer AP) ────────────────────────
+// Prueft periodisch den RSSI der aktuellen Verbindung. Faellt er laenger unter
+// die Schwelle, wird ASYNC gescannt; ist ein bekannter AP mit GLEICHER SSID
+// deutlich (Hysterese) staerker, wird gezielt auf dessen BSSID umverbunden.
+// Komplett non-blocking — friert den Loop nicht ein, AP bleibt aktiv.
+void handleRoaming() {
+  if (!cfg_roam_enabled) return;
+  if (WiFi.status() != WL_CONNECTED) return;
+  // Waehrend der normale Reconnect-Scan laeuft, nicht dazwischenfunken.
+  if (scanInProgress) return;
+  // Nach einem Wechsel 20s Ruhe, damit sich die Verbindung stabilisiert.
+  if (lastRoamSwitch != 0 && millis() - lastRoamSwitch < 20000) return;
+
+  unsigned long now = millis();
+
+  // ── Phase A: RSSI ueberwachen ──
+  if (!roamScanRunning) {
+    if (now - lastRssiCheck < 3000) return;   // alle 3s pruefen
+    lastRssiCheck = now;
+
+    int rssi = WiFi.RSSI();
+    if (rssi >= cfg_roam_threshold || rssi == 0) {
+      // Signal ok (oder ungueltig) -> Timer zuruecksetzen
+      weakSince = 0;
+      return;
+    }
+    // Signal zu schwach
+    if (weakSince == 0) { weakSince = now; return; }
+    if (now - weakSince < 15000) return;      // erst nach 15s anhaltender Schwaeche
+
+    // Schwelle laenger unterschritten -> Roam-Scan anstossen (ASYNC)
+    if (cfg_debug && (cfg_debug_filter & 2))
+      uartLogAdd("ROAM: RSSI "+String(rssi)+" dBm low -> scanning");
+    Serial.printf("ROAM: weak signal %d dBm, scanning for better AP\n", rssi);
+    WiFi.scanNetworks(true, false);           // async, sichtbare Netze
+    roamScanRunning = true;
+    roamScanStart   = now;
+    return;
+  }
+
+  // ── Phase B: Roam-Scan-Ergebnis auswerten ──
+  int16_t res = WiFi.scanComplete();
+  if (res == WIFI_SCAN_RUNNING) {
+    if (now - roamScanStart > 15000) {        // Timeout
+      WiFi.scanDelete();
+      roamScanRunning = false;
+    }
+    return;
+  }
+
+  // Scan fertig
+  String   curSsid  = WiFi.SSID();
+  int      curRssi  = WiFi.RSSI();
+  uint8_t *curBssid = WiFi.BSSID();           // MAC des aktuell verbundenen AP
+
+  int     bestIdx   = -1;
+  int     bestRssi  = -127;
+  if (res > 0) {
+    for (int i = 0; i < res; i++) {
+      if (WiFi.SSID(i) != curSsid) continue;  // nur gleiche SSID
+      uint8_t *b = WiFi.BSSID(i);
+      bool sameAsCurrent = (curBssid && b &&
+        memcmp(b, curBssid, 6) == 0);
+      if (sameAsCurrent) continue;            // aktueller AP -> ignorieren
+      if (WiFi.RSSI(i) > bestRssi) {
+        bestRssi = WiFi.RSSI(i);
+        bestIdx  = i;
+      }
+    }
+  }
+
+  bool doSwitch = false;
+  uint8_t targetBssid[6];
+  int     targetChannel = 0;
+  if (bestIdx >= 0) {
+    // Nur wechseln, wenn der andere AP DEUTLICH staerker ist (Hysterese).
+    if (bestRssi - curRssi >= cfg_roam_hysteresis) {
+      uint8_t *b = WiFi.BSSID(bestIdx);
+      if (b) { memcpy(targetBssid, b, 6); targetChannel = WiFi.channel(bestIdx); doSwitch = true; }
+    }
+  }
+
+  if (doSwitch) {
+    Serial.printf("ROAM: switching AP  cur=%d dBm -> new=%d dBm  (ch %d)\n",
+                  curRssi, bestRssi, targetChannel);
+    if (cfg_debug && (cfg_debug_filter & 2)) {
+      char m[32];
+      snprintf(m, sizeof(m), "%02X:%02X:%02X:%02X:%02X:%02X",
+               targetBssid[0],targetBssid[1],targetBssid[2],
+               targetBssid[3],targetBssid[4],targetBssid[5]);
+      uartLogAdd("ROAM: -> "+String(m)+" "+String(bestRssi)+" dBm");
+    }
+    WiFi.scanDelete();
+    roamScanRunning = false;
+    weakSince       = 0;
+
+    // Passwort der aktuellen SSID aus der Config holen.
+    String pw = "";
+    for (auto &w : cfg_wifi) { if (w.ssid == curSsid) { pw = w.pass; break; } }
+
+    // Mode sichern — der AP darf beim Umverbinden nicht fallen.
+    if (WiFi.getMode() != WIFI_AP_STA) WiFi.mode(WIFI_AP_STA);
+
+    // Gezielt auf die bessere BSSID verbinden.
+    WiFi.disconnect(false, false);            // Funk an, Config behalten
+    delay(20);
+    WiFi.begin(curSsid.c_str(), pw.c_str(), targetChannel, targetBssid, true);
+
+    unsigned long t0 = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 8000) {
+      delay(100);
+    }
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.printf("ROAM: connected to better AP, %d dBm\n", WiFi.RSSI());
+      // statische IP ggf. erneut setzen
+      for (auto &w : cfg_wifi) {
+        if (w.ssid == curSsid && w.staticIp && w.ip.length() > 0) {
+          IPAddress ip,gw,sub;
+          if (ip.fromString(w.ip)&&gw.fromString(w.gateway)&&sub.fromString(w.subnet)) {
+            IPAddress dns;
+            if (w.dns.length()>0&&dns.fromString(w.dns)) WiFi.config(ip,gw,sub,dns);
+            else WiFi.config(ip,gw,sub);
+          }
+          break;
+        }
+      }
+    } else {
+      Serial.println("ROAM: switch failed — falling back to wifiMulti");
+      wifiMulti.run(8000);                    // Notfall: irgendeinen AP nehmen
+    }
+    lastRoamSwitch = millis();
+    ensureAP(false);                          // AP nach dem Wechsel absichern
+    NimBLEDevice::startAdvertising();
+  } else {
+    // Kein lohnender Wechsel gefunden.
+    if (cfg_debug && (cfg_debug_filter & 2))
+      uartLogAdd("ROAM: no better AP found");
+    WiFi.scanDelete();
+    roamScanRunning = false;
+    // weakSince NICHT zuruecksetzen: bei weiterhin schwachem Signal soll in
+    // 15s erneut gesucht werden (vielleicht ist man dann naeher am 2. AP).
+    weakSince = millis() - 15000 + 8000;      // naechster Versuch in ~8s
+  }
+}
+
+// ── WiFi reconnect (non-blocking) ─────────────────────────────────────────────
+// Ersetzt den alten blockierenden Reconnect-Block. Der Scan bleibt erhalten
+// (du willst ihn behalten), läuft aber ASYNC: scanNetworks(true,...) blockiert
+// den Loop nicht mehr -> AP sendet durchgehend Beacons.
+void handleWiFiReconnect() {
+  if (cfg_wifi.empty()) return;
+  if (WiFi.status() == WL_CONNECTED) {
+    // verbunden -> evtl. laufenden Scan aufräumen
+    if (scanInProgress) {
+      int16_t r = WiFi.scanComplete();
+      if (r != WIFI_SCAN_RUNNING) { WiFi.scanDelete(); scanInProgress = false; }
+    }
+    return;
+  }
+
+  unsigned long now = millis();
+
+  // Phase 1: kein Scan läuft -> alle 10s einen ASYNC-Scan anstoßen
+  if (!scanInProgress) {
+    if (now - lastReconnectTry < 10000) return;
+    lastReconnectTry = now;
+    // async = true, hidden = true. Blockiert NICHT.
+    WiFi.scanNetworks(true, true);
+    scanInProgress = true;
+    scanStartTime  = now;
+    return;
+  }
+
+  // Phase 2: Scan läuft -> Ergebnis pollen (ohne zu blockieren)
+  int16_t res = WiFi.scanComplete();
+
+  if (res == WIFI_SCAN_RUNNING) {
+    // noch nicht fertig — Sicherheits-Timeout 15s
+    if (now - scanStartTime > 15000) {
+      WiFi.scanDelete();
+      scanInProgress = false;
+    }
+    return;
+  }
+
+  // Scan fertig (res >= 0) oder Fehler (res == WIFI_SCAN_FAILED)
+  bool found = false;
+  if (res > 0) {
+    for (int i = 0; i < res && !found; i++) {
+      for (auto &w : cfg_wifi) {
+        if (WiFi.SSID(i) == w.ssid) { found = true; break; }
+      }
+    }
+  }
+  WiFi.scanDelete();
+  scanInProgress = false;
+
+  if (found) {
+    Serial.println("WiFi: known network found, connecting...");
+    // Mode sicherstellen — Connect darf den AP nicht abwerfen
+    if (WiFi.getMode() != WIFI_AP_STA) WiFi.mode(WIFI_AP_STA);
+    // wifiMulti.run() macht intern ein disconnect+connect. Der AP überlebt das,
+    // weil wir den Mode danach im Event-Handler / per ensureAP() schützen.
+    if (wifiMulti.run(8000) == WL_CONNECTED) {
+      String csid = WiFi.SSID();
+      for (auto &w : cfg_wifi) {
+        if (w.ssid==csid && w.staticIp && w.ip.length()>0) {
+          IPAddress ip,gw,sub;
+          if (ip.fromString(w.ip)&&gw.fromString(w.gateway)&&sub.fromString(w.subnet)) {
+            IPAddress dns; if (w.dns.length()>0&&dns.fromString(w.dns)) WiFi.config(ip,gw,sub,dns); else WiFi.config(ip,gw,sub);
+          }
+          break;
+        }
+      }
+      Serial.printf("WiFi connected: %s | IP: %s\n", WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
+      NimBLEDevice::startAdvertising();
+    }
+    // Egal ob connect geklappt hat: AP-Zustand wiederherstellen.
+    ensureAP(false);
+  }
+}
+
 // ── Setup ─────────────────────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
@@ -1145,27 +1547,37 @@ void setup() {
   pAdv->start();
   Serial.printf("BLE advertising: %s\n", cfg_ble_name.c_str());
 
-  bool wifiOK = setupWiFiClient();
-  if (wifiOK) {
-    setupAccessPoint();
-  } else {
-    wifiOK = setupAccessPoint();
-  }
+  // WiFi-Event-Handler registrieren BEVOR WiFi gestartet wird.
+  WiFi.onEvent(onWiFiEvent);
+  // Auto-Reconnect der IDF ausschalten — wir steuern Reconnect selbst und
+  // kontrolliert, damit der AP dabei nie unbeabsichtigt fällt.
+  WiFi.setAutoReconnect(false);
+  // Mode von Anfang an AP_STA, damit AP und STA koexistieren.
+  WiFi.mode(WIFI_AP_STA);
 
-  if (wifiOK) {
-    IPAddress myIP = (isAPMode && !WiFi.isConnected()) ? WiFi.softAPIP() : WiFi.localIP();
-    setupWebServer();
-    Serial.printf("Web: http://%s/\n", myIP.toString().c_str());
-    if (WiFi.localIP()[0] != 0) Serial.printf("Web (AP): http://%s/\n", WiFi.softAPIP().toString().c_str());
-    dnsServer.setErrorReplyCode(DNSReplyCode::NoError);
-    dnsServer.start(53, "*", WiFi.softAPIP());
-    server = WiFiServer(cfg_port);
-    server.begin();
-    server.setNoDelay(true);
-    Serial.printf("VESC TCP: %s:%d\n", myIP.toString().c_str(), cfg_port);
-  } else {
-    Serial.println("WiFi failed — BLE only");
-  }
+  // AP IMMER zuerst starten — er soll dauerhaft laufen, unabhängig von STA.
+  setupAccessPoint();
+
+  // Danach STA verbinden (blockierend beim Boot, das ist ok).
+  bool staOK = setupWiFiClient();
+  (void)staOK;
+
+  // AP nach STA-Connect nochmal absichern (STA-Connect kann Channel ändern).
+  ensureAP(false);
+
+  setupWebServer();
+  IPAddress apIP  = WiFi.softAPIP();
+  IPAddress staIP = WiFi.localIP();
+  Serial.printf("Web (AP):  http://%s/\n", apIP.toString().c_str());
+  if (staIP[0] != 0) Serial.printf("Web (STA): http://%s/\n", staIP.toString().c_str());
+
+  dnsServer.setErrorReplyCode(DNSReplyCode::NoError);
+  dnsServer.start(53, "*", WiFi.softAPIP());
+
+  server = WiFiServer(cfg_port);
+  server.begin();
+  server.setNoDelay(true);
+  Serial.printf("VESC TCP: port %d\n", cfg_port);
 
   NimBLEDevice::startAdvertising();
   Serial.printf("Free heap after init: %d bytes\n", ESP.getFreeHeap());
@@ -1179,50 +1591,40 @@ void loop() {
   otaServer.handleClient();
   dnsServer.processNextRequest();
 
+  // AP-Timeout: schaltet den AP gezielt ab (apWanted = false), wenn konfiguriert
+  // und niemand am AP hängt. Danach hält der Watchdog ihn NICHT mehr am Leben.
   if (apActive && cfg_ap_timeout > 0) {
     if (millis() - apStartTime > (unsigned long)cfg_ap_timeout * 1000UL) {
       if (WiFi.softAPgetStationNum() == 0) {
         Serial.println("AP timeout — shutting down");
-        WiFi.softAPdisconnect(true);
+        apWanted = false;
+        WiFi.softAPdisconnect(false);   // false -> Funk/STA bleibt an
         apActive = false;
         isAPMode = false;
       }
     }
   }
 
-  if (WiFi.status() != WL_CONNECTED && !cfg_wifi.empty()) {
-    static unsigned long lastReconnect = 0;
-    if (millis() - lastReconnect > 10000) {
-      lastReconnect = millis();
-      // Quick scan first — only try connect if known network visible
-      int n = WiFi.scanNetworks(false, true);
-      bool found = false;
-      for (int i = 0; i < n && !found; i++) {
-        for (auto &w : cfg_wifi) {
-          if (WiFi.SSID(i) == w.ssid) { found = true; break; }
-        }
-      }
-      WiFi.scanDelete();
-      if (found) {
-        Serial.println("WiFi: known network found, connecting...");
-        if (wifiMulti.run(8000) == WL_CONNECTED) {
-          String csid = WiFi.SSID();
-          for (auto &w : cfg_wifi) {
-            if (w.ssid==csid && w.staticIp && w.ip.length()>0) {
-              IPAddress ip,gw,sub;
-              if (ip.fromString(w.ip)&&gw.fromString(w.gateway)&&sub.fromString(w.subnet)) {
-                IPAddress dns; if (w.dns.length()>0&&dns.fromString(w.dns)) WiFi.config(ip,gw,sub,dns); else WiFi.config(ip,gw,sub);
-              }
-              break;
-            }
-          }
-          isAPMode = false;
-          Serial.printf("WiFi connected: %s | IP: %s\n", WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
-          NimBLEDevice::startAdvertising();
-        }
-      }
+  // AP-Watchdog: prüft regelmäßig, ob der AP noch lebt, und zieht ihn bei
+  // Bedarf wieder hoch. Greift nur, solange apWanted == true.
+  if (apWanted && millis() - lastApEnsure > 5000) {
+    lastApEnsure = millis();
+    wifi_mode_t mode = WiFi.getMode();
+    bool apBitSet  = (mode == WIFI_AP || mode == WIFI_AP_STA);
+    bool apIpValid = (WiFi.softAPIP() != IPAddress(0,0,0,0));
+    if (!apBitSet || !apIpValid) {
+      Serial.println("AP watchdog: AP down — restoring");
+      ensureAP(true);
+    } else {
+      apActive = true;
     }
   }
+
+  // Non-blocking WiFi-Reconnect (async Scan, friert den Loop nicht ein)
+  handleWiFiReconnect();
+
+  // RSSI-basiertes Roaming: zu staerkerem AP gleicher SSID wechseln
+  handleRoaming();
 
   // Auto reboot
   if (cfg_autoreboot && cfg_autoreboot_time > 0) {
