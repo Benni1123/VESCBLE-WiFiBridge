@@ -50,6 +50,13 @@ int    cfg_debug_filter       = 7; // bitmask: 1=BLE 2=WiFi 4=Poll
 bool   cfg_roam_enabled       = false; // RSSI-basiertes Roaming (gleiche SSID, anderer AP)
 int    cfg_roam_threshold     = -75;   // ab diesem RSSI (dBm) wird nach besserem AP gesucht
 int    cfg_roam_hysteresis    = 12;    // neuer AP muss min. so viele dB staerker sein
+// Auto-Poll: pollt VESC unabhaengig von Web-UI
+bool   cfg_autopoll_enabled   = false;
+int    cfg_autopoll_interval  = 5;     // Sekunden zwischen Polls (1-60)
+// BLE-Modus: 0=Aus, 1=An, 2=Auto (an bei Bewegung, aus nach Timeout)
+int    cfg_ble_mode           = 1;     // Default: An (Verhalten wie bisher)
+int    cfg_ble_auto_erpm_on   = 200;   // |ERPM| > diesem Wert -> BLE an, Timer reset
+int    cfg_ble_auto_off_sec   = 120;   // nach X Sekunden ohne Bewegung & Client -> BLE aus
 
 struct WiFiEntry {
   String ssid, pass;
@@ -80,6 +87,11 @@ void loadConfig() {
   cfg_roam_enabled       = prefs.getBool("roam_en",          false);
   cfg_roam_threshold     = prefs.getInt ("roam_thr",         -75);
   cfg_roam_hysteresis    = prefs.getInt ("roam_hyst",        12);
+  cfg_autopoll_enabled   = prefs.getBool("autopoll_en",      false);
+  cfg_autopoll_interval  = prefs.getInt ("autopoll_int",     5);
+  cfg_ble_mode           = prefs.getInt ("ble_mode",         1);
+  cfg_ble_auto_erpm_on   = prefs.getInt ("ble_erpm_on",      200);
+  cfg_ble_auto_off_sec   = prefs.getInt ("ble_off_sec",      120);
   int count = prefs.getInt("wifi_count", 0);
   cfg_wifi.clear();
   for (int i = 0; i < count && i < MAX_WIFI_NETWORKS; i++) {
@@ -107,6 +119,13 @@ void loadConfig() {
   if (cfg_roam_threshold  < -90) cfg_roam_threshold  = -90;
   if (cfg_roam_hysteresis < 3)   cfg_roam_hysteresis = 3;
   if (cfg_roam_hysteresis > 30)  cfg_roam_hysteresis = 30;
+  if (cfg_autopoll_interval < 1)   cfg_autopoll_interval = 1;
+  if (cfg_autopoll_interval > 60)  cfg_autopoll_interval = 60;
+  if (cfg_ble_mode < 0 || cfg_ble_mode > 2) cfg_ble_mode = 1;
+  if (cfg_ble_auto_erpm_on < 10)    cfg_ble_auto_erpm_on = 10;
+  if (cfg_ble_auto_erpm_on > 50000) cfg_ble_auto_erpm_on = 50000;
+  if (cfg_ble_auto_off_sec < 5)     cfg_ble_auto_off_sec = 5;
+  if (cfg_ble_auto_off_sec > 3600)  cfg_ble_auto_off_sec = 3600;
 }
 
 void saveConfig() {
@@ -131,6 +150,11 @@ void saveConfig() {
   prefs.putBool  ("roam_en",     cfg_roam_enabled);
   prefs.putInt   ("roam_thr",    cfg_roam_threshold);
   prefs.putInt   ("roam_hyst",   cfg_roam_hysteresis);
+  prefs.putBool  ("autopoll_en", cfg_autopoll_enabled);
+  prefs.putInt   ("autopoll_int",cfg_autopoll_interval);
+  prefs.putInt   ("ble_mode",    cfg_ble_mode);
+  prefs.putInt   ("ble_erpm_on", cfg_ble_auto_erpm_on);
+  prefs.putInt   ("ble_off_sec", cfg_ble_auto_off_sec);
   prefs.putInt   ("wifi_count",  cfg_wifi.size());
   for (int i = 0; i < (int)cfg_wifi.size(); i++) {
     prefs.putString(("wssid"  +String(i)).c_str(), cfg_wifi[i].ssid);
@@ -162,6 +186,7 @@ struct VescStatus {
   float   tempFet    = 0.0;
   float   tempMotor  = 0.0;
   int     faultCode  = 0;
+  int32_t erpm       = 0;   // electrical RPM (signed, roh, kein Skalierungsfaktor)
   unsigned long lastUpdate = 0;
 } vescStatus;
 
@@ -214,6 +239,7 @@ static void uartLogAdd(const String &line) {
 static String vescFaultToString(int code);
 bool ensureAP(bool force);
 void handleRoaming();
+void handleBleMode();
 
 // ── HTML PAGE ─────────────────────────────────────────────────────────────────
 static const char PAGE_HTML[] PROGMEM = R"rawliteral(
@@ -361,6 +387,35 @@ static const char PAGE_HTML[] PROGMEM = R"rawliteral(
       </div>
     </div>
     <div class="section">
+      <h3 id="lbl-autopoll-title">VESC Auto-Poll</h3>
+      <label class="checkbox-row" style="margin-top:0">
+        <input type="checkbox" id="autopoll_enabled" onchange="document.getElementById('autopoll_opts').style.display=this.checked?'':'none'">
+        <span id="lbl-autopoll-enabled">Poll VESC even when Web-UI is closed</span>
+      </label>
+      <div id="autopoll_opts" style="display:none;margin-top:8px">
+        <label id="lbl-autopoll-int">Poll interval (seconds, 1-60)</label>
+        <input type="text" id="autopoll_interval" maxlength="3" placeholder="5">
+      </div>
+    </div>
+    <div class="section">
+      <h3 id="lbl-blemode-title">BLE Mode</h3>
+      <label id="lbl-blemode-sel">Mode</label>
+      <select id="ble_mode" onchange="document.getElementById('blemode_auto').style.display=this.value==2?'':'none'" style="width:100%;padding:8px 10px;background:var(--bg3);border:1px solid var(--border);border-radius:4px;color:var(--text);font-family:'Ndot47',monospace;font-size:13px">
+        <option value="1" id="opt-mode-on">On (always advertise)</option>
+        <option value="0" id="opt-mode-off">Off (no BLE)</option>
+        <option value="2" id="opt-mode-auto">Auto (on when moving)</option>
+      </select>
+      <div id="blemode_auto" style="display:none;margin-top:10px">
+        <label id="lbl-blemode-erpm">Movement threshold (|ERPM| above this turns BLE on)</label>
+        <input type="text" id="ble_auto_erpm_on" maxlength="6" placeholder="200">
+        <label id="lbl-blemode-off">Idle timeout (seconds, BLE off after no movement and no client)</label>
+        <input type="text" id="ble_auto_off_sec" maxlength="5" placeholder="120">
+        <div style="font-size:11px;color:var(--text3);margin-top:6px" id="lbl-blemode-hint">
+          Boot default: BLE on. Movement above threshold resets the idle timer. Active connection (BLE/TCP/Web-UI) pauses the timer.
+        </div>
+      </div>
+    </div>
+    <div class="section">
       <h3 id="lbl-update-title">Update Server</h3>
       <label id="lbl-version-url">Version URL (version.txt)</label>
       <input type="text" id="version_url" placeholder="https://...">
@@ -478,6 +533,17 @@ function applyTranslations(){
   s('lbl-roam-enabled',     'Switch to stronger AP with same SSID',         'Zu st\u00e4rkerem AP mit gleicher SSID wechseln');
   s('lbl-roam-thr',         'Search threshold (dBm, e.g. -75 \u2014 weaker = roam search starts)', 'Suchschwelle (dBm, z.B. -75 \u2014 schw\u00e4cher = Roam-Suche startet)');
   s('lbl-roam-hyst',        'Min. improvement (dB) to actually switch',     'Min. Verbesserung (dB) f\u00fcr Wechsel');
+  s('lbl-autopoll-title',   'VESC Auto-Poll',                                'VESC Auto-Polling');
+  s('lbl-autopoll-enabled', 'Poll VESC even when Web-UI is closed',          'VESC pollen auch wenn Web-UI geschlossen');
+  s('lbl-autopoll-int',     'Poll interval (seconds, 1-60)',                 'Poll-Intervall (Sekunden, 1-60)');
+  s('lbl-blemode-title',    'BLE Mode',                                      'BLE Modus');
+  s('lbl-blemode-sel',      'Mode',                                          'Modus');
+  s('opt-mode-on',          'On (always advertise)',                         'An (immer advertisen)');
+  s('opt-mode-off',         'Off (no BLE)',                                  'Aus (kein BLE)');
+  s('opt-mode-auto',        'Auto (on when moving)',                         'Auto (an bei Bewegung)');
+  s('lbl-blemode-erpm',     'Movement threshold (|ERPM| above this turns BLE on)', 'Bewegungs-Schwelle (|ERPM| dar\u00fcber schaltet BLE an)');
+  s('lbl-blemode-off',      'Idle timeout (seconds, BLE off after no movement and no client)', 'Inaktivit\u00e4ts-Timeout (Sek., BLE aus nach Stillstand ohne Client)');
+  s('lbl-blemode-hint',     'Boot default: BLE on. Movement above threshold resets the idle timer. Active connection (BLE/TCP/Web-UI) pauses the timer.', 'Boot-Default: BLE an. Bewegung \u00fcber der Schwelle setzt den Timer zur\u00fcck. Aktive Verbindung (BLE/TCP/Web-UI) pausiert den Timer.');
   s('lbl-update-title',     'Update Server',                                'Update Server');
   s('lbl-version-url',      'Version URL (version.txt)',                    'Version URL (version.txt)');
   s('lbl-firmware-url',     'Firmware URL (firmware.bin)',                  'Firmware URL (firmware.bin)');
@@ -537,6 +603,7 @@ function loadInfo(){
       '<div class="info-row" style="'+(d.vesc_connected?'':'opacity:0.4')+'"><span>Temp FET</span><span class="info-val">'+d.vesc_temp_fet+' °C</span></div>'+
       '<div class="info-row" style="'+(d.vesc_connected?'':'opacity:0.4')+'"><span>Temp Motor</span><span class="info-val">'+d.vesc_temp_motor+' °C</span></div>'+
       '<div class="info-row" style="'+(d.vesc_connected?'':'opacity:0.4')+'"><span>'+(de()?'Fehlercode':'Fault')+'</span><span class="info-val" style="color:'+(d.vesc_fault===0?'#81c784':'#e57373')+'">'+(d.vesc_fault_str||'OK')+'</span></div>'+
+      '<div class="info-row" style="'+(d.vesc_connected?'':'opacity:0.4')+'"><span>ERPM</span><span class="info-val">'+d.vesc_erpm+'</span></div>'+
       '<div class="info-row"><span>Uptime</span><span class="info-val">'+d.uptime+'</span></div>'+
       '<div class="info-row"><span>Build</span><span class="info-val">'+d.build+'</span></div>';
   }).catch(function(){document.getElementById('infoContent').innerHTML='<div style="color:#e57373;font-size:13px">'+(de()?'Fehler':'Error')+'</div>';});
@@ -642,6 +709,13 @@ function loadConfig(){
     document.getElementById('roam_threshold').value = d.roam_threshold||-75;
     document.getElementById('roam_hysteresis').value = d.roam_hysteresis||12;
     document.getElementById('roam_opts').style.display = d.roam_enabled?'':'none';
+    document.getElementById('autopoll_enabled').checked = d.autopoll_enabled===true;
+    document.getElementById('autopoll_interval').value = d.autopoll_interval||5;
+    document.getElementById('autopoll_opts').style.display = d.autopoll_enabled?'':'none';
+    document.getElementById('ble_mode').value = (d.ble_mode!==undefined)?d.ble_mode:1;
+    document.getElementById('ble_auto_erpm_on').value = d.ble_auto_erpm_on||200;
+    document.getElementById('ble_auto_off_sec').value = d.ble_auto_off_sec||120;
+    document.getElementById('blemode_auto').style.display = d.ble_mode==2?'':'none';
     document.getElementById('version_url').value = d.version_url||'';
     document.getElementById('update_url').value  = d.update_url||'';
     wifiNetworks=(d.wifi||[]).map(function(n){return{ssid:n.ssid||'',pass:n.pass||'',static:n.static||false,ip:n.ip||'',gateway:n.gateway||'',subnet:n.subnet||'255.255.255.0',dns:n.dns||''};});
@@ -695,6 +769,11 @@ function saveConfig(){
     roam_enabled:    document.getElementById('roam_enabled').checked,
     roam_threshold:  parseInt(document.getElementById('roam_threshold').value)||-75,
     roam_hysteresis: parseInt(document.getElementById('roam_hysteresis').value)||12,
+    autopoll_enabled:  document.getElementById('autopoll_enabled').checked,
+    autopoll_interval: parseInt(document.getElementById('autopoll_interval').value)||5,
+    ble_mode:          parseInt(document.getElementById('ble_mode').value),
+    ble_auto_erpm_on:  parseInt(document.getElementById('ble_auto_erpm_on').value)||200,
+    ble_auto_off_sec:  parseInt(document.getElementById('ble_auto_off_sec').value)||120,
     version_url: document.getElementById('version_url').value,
     update_url:  document.getElementById('update_url').value,
     wifi: wifi
@@ -818,6 +897,7 @@ void handleApiInfo() {
   json += "\"vesc_temp_fet\":"+String(vescStatus.tempFet,1)+",";
   json += "\"vesc_temp_motor\":"+String(vescStatus.tempMotor,1)+",";
   json += "\"vesc_fault\":"+String(vescStatus.faultCode)+",";
+  json += "\"vesc_erpm\":"+String(vescStatus.erpm)+",";
   json += "\"vesc_fault_str\":\""+vescFaultToString(vescStatus.faultCode)+"\",";
   if (WiFi.status() != WL_CONNECTED) {
     json += "\"mode\":\"ap\",\"ip\":\""+WiFi.softAPIP().toString()+"\"";
@@ -845,6 +925,11 @@ void handleApiConfigGet() {
   json += "\"roam_enabled\":"+String(cfg_roam_enabled?"true":"false")+",";
   json += "\"roam_threshold\":"+String(cfg_roam_threshold)+",";
   json += "\"roam_hysteresis\":"+String(cfg_roam_hysteresis)+",";
+  json += "\"autopoll_enabled\":"+String(cfg_autopoll_enabled?"true":"false")+",";
+  json += "\"autopoll_interval\":"+String(cfg_autopoll_interval)+",";
+  json += "\"ble_mode\":"+String(cfg_ble_mode)+",";
+  json += "\"ble_auto_erpm_on\":"+String(cfg_ble_auto_erpm_on)+",";
+  json += "\"ble_auto_off_sec\":"+String(cfg_ble_auto_off_sec)+",";
   json += "\"update_url\":\""+cfg_update_url+"\",";
   json += "\"version_url\":\""+cfg_version_url+"\",";
   json += "\"wifi\":[";
@@ -897,6 +982,18 @@ void handleApiConfigPost() {
   if (cfg_roam_threshold  < -90) cfg_roam_threshold  = -90;
   if (cfg_roam_hysteresis < 3)   cfg_roam_hysteresis = 3;
   if (cfg_roam_hysteresis > 30)  cfg_roam_hysteresis = 30;
+  cfg_autopoll_enabled  = (body.indexOf("\"autopoll_enabled\":true") >= 0);
+  cfg_autopoll_interval = parseInt2("autopoll_interval", 5);
+  cfg_ble_mode          = parseInt2("ble_mode", 1);
+  cfg_ble_auto_erpm_on  = parseInt2("ble_auto_erpm_on", 200);
+  cfg_ble_auto_off_sec  = parseInt2("ble_auto_off_sec", 120);
+  if (cfg_autopoll_interval < 1)   cfg_autopoll_interval = 1;
+  if (cfg_autopoll_interval > 60)  cfg_autopoll_interval = 60;
+  if (cfg_ble_mode < 0 || cfg_ble_mode > 2) cfg_ble_mode = 1;
+  if (cfg_ble_auto_erpm_on < 10)    cfg_ble_auto_erpm_on = 10;
+  if (cfg_ble_auto_erpm_on > 50000) cfg_ble_auto_erpm_on = 50000;
+  if (cfg_ble_auto_off_sec < 5)     cfg_ble_auto_off_sec = 5;
+  if (cfg_ble_auto_off_sec > 3600)  cfg_ble_auto_off_sec = 3600;
 
   if (cfg_ble_name.isEmpty()) cfg_ble_name = DEFAULT_BLE_NAME;
   if (cfg_ap_ssid.isEmpty())  cfg_ap_ssid  = DEFAULT_AP_SSID;
@@ -1030,16 +1127,27 @@ void setupWebServer() {
 }
 
 // ── BLE callbacks ─────────────────────────────────────────────────────────────
+// Forward state fuer BLE-Mode-Logik (handleBleMode definiert weiter unten,
+// aber die Callbacks unten brauchen bleIsAdvertising schon hier).
+static bool          bleIsAdvertising  = true;
+static unsigned long lastMovementTime  = 0;
+
 class MyServerCallbacks : public BLEServerCallbacks {
   void onConnect(NimBLEServer *pServer, ble_gap_conn_desc *desc) {
     Serial.printf("BLE connected: %s\n", NimBLEAddress(desc->peer_ota_addr).toString().c_str());
     deviceConnected = true;
-    NimBLEDevice::startAdvertising();
+    // Im Auto-Modus: aktive Verbindung haelt Timer pausiert, nicht erneut advertisen.
+    // Bei "An"-Modus: weiter advertisen (so dass weitere Clients sich verbinden koennen).
+    if (cfg_ble_mode == 1) NimBLEDevice::startAdvertising();
   }
   void onDisconnect(NimBLEServer *pServer) {
     Serial.println("BLE disconnected");
     deviceConnected = false;
-    NimBLEDevice::startAdvertising();
+    // Nur erneut advertisen, wenn der Modus das zulaesst und wir laut Zustand
+    // gerade advertisen sollen. Sonst greift handleBleMode() im Loop nach.
+    if (cfg_ble_mode == 1 || (cfg_ble_mode == 2 && bleIsAdvertising)) {
+      NimBLEDevice::startAdvertising();
+    }
   }
   void onMTUChange(uint16_t MTU, ble_gap_conn_desc *desc) {
     MTU_SIZE = MTU; PACKET_SIZE = MTU_SIZE - 3;
@@ -1199,6 +1307,10 @@ static float readFloat16(const uint8_t *buf, float scale) {
   return val / scale;
 }
 
+static int32_t readInt32(const uint8_t *buf) {
+  return ((int32_t)buf[0]<<24) | ((int32_t)buf[1]<<16) | ((int32_t)buf[2]<<8) | (int32_t)buf[3];
+}
+
 static String vescFaultToString(int code) {
   switch(code) {
     case 0:  return "OK";
@@ -1240,6 +1352,7 @@ static void parseGetValues(const uint8_t *payload, size_t len) {
   if (payload[0] != 0x04) return;
   vescStatus.tempFet   = readFloat16(payload + 1,  10.0f);
   vescStatus.tempMotor = readFloat16(payload + 3,  10.0f);
+  vescStatus.erpm      = readInt32 (payload + 23);          // ERPM int32 big-endian
   vescStatus.voltage   = readFloat16(payload + 27, 10.0f);
   vescStatus.faultCode = payload[37];
   vescStatus.connected  = true;
@@ -1259,8 +1372,13 @@ void pollVesc() {
   if (wifiClient && wifiClient.connected()) return;
   if (deviceConnected) return;
   if (!cfg_vesc_poll) return;
-  if (!webUiActive()) return;
-  if (now - lastVescPoll < 3000) return;
+  // Polling laeuft wenn Web-UI offen ODER Auto-Poll aktiviert.
+  bool autoPollActive = cfg_autopoll_enabled;
+  bool uiActive       = webUiActive();
+  if (!uiActive && !autoPollActive) return;
+  // Intervall: bei aktiver UI fest 3s, sonst Auto-Poll-Intervall.
+  unsigned long pollInterval = uiActive ? 3000UL : (unsigned long)cfg_autopoll_interval * 1000UL;
+  if (now - lastVescPoll < pollInterval) return;
   lastVescPoll = now;
 
   Serial1.write(VESC_GET_VALUES_PKT, sizeof(VESC_GET_VALUES_PKT));
@@ -1286,6 +1404,90 @@ void pollVesc() {
     if (cfg_debug && (cfg_debug_filter & 4)) uartLogAdd("POLL<=VESC: no response ("+String(vescPollBuffer.size())+" bytes)");
     if (now - vescStatus.lastUpdate > 6000) {
       vescStatus.connected = false;
+    }
+  }
+}
+
+// ── BLE Mode Handler (An / Aus / Auto) ────────────────────────────────────────
+// Steuert das BLE-Advertising abhaengig vom Modus:
+//   0 = Aus  : Advertising permanent abgeschaltet
+//   1 = An   : Advertising permanent an (Default, klassisches Verhalten)
+//   2 = Auto : Boot-Default an; |ERPM| > Schwelle setzt Timer zurueck;
+//              nach off_sec ohne Bewegung und ohne Client -> aus;
+//              bei naechster Bewegung wieder an.
+// Eine aktive Verbindung (BLE / TCP / Web-UI) haelt den Timer pausiert.
+// (bleIsAdvertising und lastMovementTime sind weiter oben deklariert, weil
+//  MyServerCallbacks bereits auf bleIsAdvertising zugreift.)
+
+void handleBleMode() {
+  static int lastMode = -1;
+  static unsigned long lastCheck = 0;
+
+  // Reagiere sofort auf Mode-Wechsel (z.B. durch Config-Speichern)
+  if (cfg_ble_mode != lastMode) {
+    lastMode = cfg_ble_mode;
+    if (cfg_ble_mode == 0) {
+      // Aus
+      if (pServer && pServer->getConnectedCount() > 0) { pServer->disconnect(0); delay(50); }
+      NimBLEDevice::stopAdvertising();
+      bleIsAdvertising = false;
+      Serial.println("BLE mode: OFF");
+    } else if (cfg_ble_mode == 1) {
+      // An
+      NimBLEDevice::startAdvertising();
+      bleIsAdvertising = true;
+      Serial.println("BLE mode: ON");
+    } else {
+      // Auto: Default beim Boot/Wechsel -> an, Timer startet
+      NimBLEDevice::startAdvertising();
+      bleIsAdvertising = true;
+      lastMovementTime = millis();
+      Serial.println("BLE mode: AUTO (starting ON)");
+    }
+  }
+
+  // Nur Auto-Modus braucht laufende Logik
+  if (cfg_ble_mode != 2) return;
+
+  if (millis() - lastCheck < 1000) return;
+  lastCheck = millis();
+
+  // Bewegung erkennen (absoluter ERPM-Wert ueber Schwelle)
+  int32_t absErpm = vescStatus.erpm < 0 ? -vescStatus.erpm : vescStatus.erpm;
+  if (vescStatus.connected && absErpm > cfg_ble_auto_erpm_on) {
+    lastMovementTime = millis();
+    // Falls BLE gerade aus war, wieder an
+    if (!bleIsAdvertising) {
+      NimBLEDevice::startAdvertising();
+      bleIsAdvertising = true;
+      Serial.printf("BLE auto: movement (erpm=%d) -> ON\n", (int)vescStatus.erpm);
+    }
+    return;
+  }
+
+  // Aktive Verbindung haelt Timer pausiert UND weckt BLE auf falls es aus war.
+  // (Web-UI/TCP laufen ueber WiFi, funktionieren auch bei ausgeschaltetem BLE.
+  //  Wenn der Nutzer wieder am Geraet arbeitet, soll BLE erreichbar werden.)
+  bool anyClient = deviceConnected
+                || (wifiClient && wifiClient.connected())
+                || webUiActive();
+  if (anyClient) {
+    lastMovementTime = millis();
+    if (!bleIsAdvertising) {
+      NimBLEDevice::startAdvertising();
+      bleIsAdvertising = true;
+      Serial.println("BLE auto: client active -> ON");
+    }
+    return;
+  }
+
+  // Keine Bewegung, keine Verbindung -> Timer pruefen
+  if (bleIsAdvertising) {
+    unsigned long idleMs = millis() - lastMovementTime;
+    if (idleMs >= (unsigned long)cfg_ble_auto_off_sec * 1000UL) {
+      Serial.printf("BLE auto: idle %lus, no client -> OFF\n", idleMs/1000);
+      NimBLEDevice::stopAdvertising();
+      bleIsAdvertising = false;
     }
   }
 }
@@ -1422,7 +1624,9 @@ void handleRoaming() {
     }
     lastRoamSwitch = millis();
     ensureAP(false);                          // AP nach dem Wechsel absichern
-    NimBLEDevice::startAdvertising();
+    if (cfg_ble_mode == 1 || (cfg_ble_mode == 2 && bleIsAdvertising)) {
+      NimBLEDevice::startAdvertising();
+    }
   } else {
     // Kein lohnender Wechsel gefunden.
     if (cfg_debug && (cfg_debug_filter & 2))
@@ -1505,7 +1709,9 @@ void handleWiFiReconnect() {
         }
       }
       Serial.printf("WiFi connected: %s | IP: %s\n", WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
-      NimBLEDevice::startAdvertising();
+      if (cfg_ble_mode == 1 || (cfg_ble_mode == 2 && bleIsAdvertising)) {
+        NimBLEDevice::startAdvertising();
+      }
     }
     // Egal ob connect geklappt hat: AP-Zustand wiederherstellen.
     ensureAP(false);
@@ -1544,8 +1750,18 @@ void setup() {
 
   NimBLEAdvertising *pAdv = NimBLEDevice::getAdvertising();
   pAdv->addServiceUUID(VESC_SERVICE_UUID);
-  pAdv->start();
-  Serial.printf("BLE advertising: %s\n", cfg_ble_name.c_str());
+  // Beim Boot Advertising nur starten wenn Modus nicht "Aus" ist.
+  // Auto-Modus startet ebenfalls AN (laut Konfig-Wunsch).
+  if (cfg_ble_mode != 0) {
+    pAdv->start();
+    bleIsAdvertising = true;
+    Serial.printf("BLE advertising: %s\n", cfg_ble_name.c_str());
+  } else {
+    bleIsAdvertising = false;
+    Serial.println("BLE mode: OFF (no advertising at boot)");
+  }
+  // Initialer Bewegungs-Zeitstempel fuer Auto-Modus
+  lastMovementTime = millis();
 
   // WiFi-Event-Handler registrieren BEVOR WiFi gestartet wird.
   WiFi.onEvent(onWiFiEvent);
@@ -1579,7 +1795,8 @@ void setup() {
   server.setNoDelay(true);
   Serial.printf("VESC TCP: port %d\n", cfg_port);
 
-  NimBLEDevice::startAdvertising();
+  // Advertising nur (re-)starten wenn der Modus es zulaesst
+  if (cfg_ble_mode != 0) NimBLEDevice::startAdvertising();
   Serial.printf("Free heap after init: %d bytes\n", ESP.getFreeHeap());
   Serial.println("=== Ready ===\n");
 }
@@ -1625,6 +1842,9 @@ void loop() {
 
   // RSSI-basiertes Roaming: zu staerkerem AP gleicher SSID wechseln
   handleRoaming();
+
+  // BLE-Modus (Aus / An / Auto)
+  handleBleMode();
 
   // Auto reboot
   if (cfg_autoreboot && cfg_autoreboot_time > 0) {
@@ -1704,8 +1924,10 @@ void loop() {
 
   if (!deviceConnected && oldDeviceConnected) {
     delay(500);
-    pServer->startAdvertising();
-    Serial.println("BLE advertising restarted");
+    if (cfg_ble_mode == 1 || (cfg_ble_mode == 2 && bleIsAdvertising)) {
+      pServer->startAdvertising();
+      Serial.println("BLE advertising restarted");
+    }
     oldDeviceConnected = false;
   }
   if (deviceConnected && !oldDeviceConnected) oldDeviceConnected = true;
