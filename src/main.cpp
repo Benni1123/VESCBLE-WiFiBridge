@@ -56,6 +56,7 @@ int    cfg_autopoll_interval  = 5;     // Sekunden zwischen Polls (1-60)
 // BLE-Modus: 0=Aus, 1=An, 2=Auto (an bei Bewegung, aus nach Timeout)
 int    cfg_ble_mode           = 1;     // Default: An (Verhalten wie bisher)
 int    cfg_ble_auto_erpm_on   = 200;   // |ERPM| > diesem Wert -> BLE an, Timer reset
+bool   cfg_ap_wake_on_move    = false; // AP nach Timeout bei Bewegung (ERPM) wieder anschalten
 int    cfg_ble_auto_off_sec   = 120;   // nach X Sekunden ohne Bewegung & Client -> BLE aus
 
 struct WiFiEntry {
@@ -91,6 +92,7 @@ void loadConfig() {
   cfg_autopoll_interval  = prefs.getInt ("autopoll_int",     5);
   cfg_ble_mode           = prefs.getInt ("ble_mode",         1);
   cfg_ble_auto_erpm_on   = prefs.getInt ("ble_erpm_on",      200);
+  cfg_ap_wake_on_move    = prefs.getBool("ap_wake_move",     false);
   cfg_ble_auto_off_sec   = prefs.getInt ("ble_off_sec",      120);
   int count = prefs.getInt("wifi_count", 0);
   cfg_wifi.clear();
@@ -154,6 +156,7 @@ void saveConfig() {
   prefs.putInt   ("autopoll_int",cfg_autopoll_interval);
   prefs.putInt   ("ble_mode",    cfg_ble_mode);
   prefs.putInt   ("ble_erpm_on", cfg_ble_auto_erpm_on);
+  prefs.putBool  ("ap_wake_move",cfg_ap_wake_on_move);
   prefs.putInt   ("ble_off_sec", cfg_ble_auto_off_sec);
   prefs.putInt   ("wifi_count",  cfg_wifi.size());
   for (int i = 0; i < (int)cfg_wifi.size(); i++) {
@@ -206,6 +209,9 @@ static WebServer  emergencyServer(8080);
 static DNSServer  dnsServer;
 static bool       isAPMode   = false;
 static unsigned long apStartTime = 0;
+static unsigned long apLastClientGone = 0;   // Zeitpunkt an dem das letzte Geraet sich vom AP trennte
+static int           apLastStationNum = 0;   // letzte bekannte Anzahl AP-Clients
+static bool          apOffByTimeout   = false; // AP wurde durch Timeout abgeschaltet (fuer Wake-on-Move)
 static bool       apActive   = false;
 
 // ── AP / WiFi resilience state ────────────────────────────────────────────────
@@ -241,37 +247,30 @@ bool ensureAP(bool force);
 void handleRoaming();
 void handleBleMode();
 
-// ── HTML PAGE ─────────────────────────────────────────────────────────────────
-static const char PAGE_HTML[] PROGMEM = R"rawliteral(
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>🛴 VESC BLE/WiFi</title>
-  <style>
-    @font-face{font-family:'Ndot47';src:url(data:font/woff2;base64,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) format('woff2');font-display:swap}
+// ── Static assets (Font + CSS, ausgelagert fuer Mehrfachnutzung) ──────────────
+
+static const char STYLE_CSS[] PROGMEM = R"csslit(
     :root{--bg:#000000;--bg2:#111111;--bg3:#1a1a1a;--border:#222222;--border2:#333333;--text:#e0e0e0;--text2:#aaa;--text3:#666;--accent:#00bcd4;--accent2:#00acc1;--ok:#4caf50;--err:#f44336;--ok-bg:#0a1f0d;--err-bg:#1f0a0a}
     [data-theme=light]{--bg:#f5f5f5;--bg2:#ffffff;--bg3:#ebebeb;--border:#dddddd;--border2:#cccccc;--text:#111111;--text2:#555555;--text3:#999999;--accent:#0288d1;--accent2:#0277bd;--ok:#388e3c;--err:#c62828;--ok-bg:#e8f5e9;--err-bg:#ffebee}
     @media(prefers-color-scheme:light){:root:not([data-theme=dark]){--bg:#f5f5f5;--bg2:#ffffff;--bg3:#ebebeb;--border:#dddddd;--border2:#cccccc;--text:#111111;--text2:#555555;--text3:#999999;--accent:#0288d1;--accent2:#0277bd;--ok:#388e3c;--err:#c62828;--ok-bg:#e8f5e9;--err-bg:#ffebee}}
     *{box-sizing:border-box;margin:0;padding:0}
-    body{font-family:'Ndot47',monospace;background:var(--bg);color:var(--text);min-height:100vh;padding:16px}
+    body{font-family:system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;background:var(--bg);color:var(--text);min-height:100vh;padding:16px}
     .wrap{max-width:600px;margin:0 auto;padding:0 16px}
     h1{color:var(--accent);font-size:18px;margin-bottom:4px}
     .sub{color:var(--text3);font-size:12px;margin-bottom:24px}
     .tabs{display:flex;gap:4px;margin-bottom:16px;flex-wrap:wrap}
-    .tab{padding:8px 16px;background:var(--bg2);border:1px solid var(--border);border-radius:6px;cursor:pointer;font-family:'Ndot47',monospace;font-size:13px;color:var(--text2)}
+    .tab{padding:8px 16px;background:var(--bg2);border:1px solid var(--border);border-radius:6px;cursor:pointer;font-family:system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;font-size:13px;color:var(--text2)}
     .tab.active{background:var(--accent);color:#111;border-color:var(--accent)}
     .panel{display:none}.panel.active{display:block}
     .section{background:var(--bg2);border:1px solid var(--border2);border-radius:8px;padding:20px;margin-bottom:12px}
     .section h3{color:var(--accent);font-size:13px;margin-bottom:14px;text-transform:uppercase;letter-spacing:1px}
     label{display:block;font-size:12px;color:var(--text2);margin-bottom:4px;margin-top:10px}
     label:first-of-type{margin-top:0}
-    input[type=text],input[type=password]{width:100%;padding:8px 10px;background:var(--bg3);border:1px solid var(--border);border-radius:4px;color:var(--text);font-family:'Ndot47',monospace;font-size:13px}
+    input[type=text],input[type=password]{width:100%;padding:8px 10px;background:var(--bg3);border:1px solid var(--border);border-radius:4px;color:var(--text);font-family:system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;font-size:13px}
     input:focus{outline:none;border-color:var(--accent)}
     .checkbox-row{display:flex;align-items:center;gap:10px;margin-top:12px;font-size:13px;color:var(--text2);cursor:pointer}
     .checkbox-row input[type=checkbox]{width:16px;height:16px;accent-color:var(--accent);cursor:pointer}
-    .btn{width:100%;padding:11px;background:var(--accent);color:#111;border:none;border-radius:6px;font-family:'Ndot47',monospace;font-size:14px;font-weight:bold;cursor:pointer;margin-top:14px}
+    .btn{width:100%;padding:11px;background:var(--accent);color:#111;border:none;border-radius:6px;font-family:system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;font-size:14px;font-weight:bold;cursor:pointer;margin-top:14px}
     .btn:hover{background:var(--accent2)}.btn.sm{padding:6px 12px;font-size:12px;width:auto;margin-top:0}
     .btn.red{background:var(--err);color:#fff}.btn.red:hover{opacity:0.85}
     .btn.green{background:var(--ok);color:#111}.btn.green:hover{opacity:0.85}
@@ -296,9 +295,9 @@ static const char PAGE_HTML[] PROGMEM = R"rawliteral(
     .info-row{display:flex;justify-content:space-between;font-size:12px;padding:4px 0;border-bottom:1px solid var(--border2)}
     .info-row:last-child{border:none}
     .info-val{color:var(--accent)}
-    .lang-btn{position:fixed;top:12px;right:12px;padding:4px 10px;background:var(--bg2);border:1px solid var(--border);border-radius:4px;color:var(--text2);font-family:'Ndot47',monospace;font-size:12px;cursor:pointer}
+    .lang-btn{position:fixed;top:12px;right:12px;padding:4px 10px;background:var(--bg2);border:1px solid var(--border);border-radius:4px;color:var(--text2);font-family:system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;font-size:12px;cursor:pointer}
     .lang-btn:hover{border-color:var(--accent);color:var(--accent)}
-    .theme-btn{position:fixed;top:12px;right:56px;padding:4px 10px;background:var(--bg2);border:1px solid var(--border);border-radius:4px;color:var(--text2);font-family:'Ndot47',monospace;font-size:12px;cursor:pointer}
+    .theme-btn{position:fixed;top:12px;right:56px;padding:4px 10px;background:var(--bg2);border:1px solid var(--border);border-radius:4px;color:var(--text2);font-family:system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;font-size:12px;cursor:pointer}
     .theme-btn:hover{border-color:var(--accent);color:var(--accent)}
     .ep{margin-bottom:10px;padding:10px;background:var(--bg3);border-radius:6px;font-size:12px}
     .method{display:inline-block;padding:2px 6px;border-radius:3px;font-weight:bold;margin-right:6px;font-size:11px}
@@ -309,7 +308,17 @@ static const char PAGE_HTML[] PROGMEM = R"rawliteral(
     .ep .desc{color:var(--text2);margin-top:4px}
     .ep .fields{margin-top:4px;color:var(--text3);font-size:11px}
     .api-h2{color:var(--text2);font-size:12px;margin:14px 0 8px;text-transform:uppercase;letter-spacing:1px}
-  </style>
+)csslit";
+
+// ── HTML PAGE ─────────────────────────────────────────────────────────────────
+static const char PAGE_HTML[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>🛴 VESC BLE/WiFi</title>
+  <link rel="stylesheet" href="/style.css">
 </head>
 <body>
 <button class="theme-btn" onclick="toggleTheme()" id="themeBtn">☀️</button>
@@ -347,6 +356,34 @@ static const char PAGE_HTML[] PROGMEM = R"rawliteral(
       <input type="password" id="ap_pass" maxlength="64" placeholder="leave empty for open network">
       <label id="lbl-ap-timeout">AP Timeout in seconds (0 = never off)</label>
       <input type="text" id="ap_timeout" maxlength="6" placeholder="0">
+      <label class="checkbox-row" style="margin-top:12px">
+        <input type="checkbox" id="ap_wake_on_move" onchange="updateErpmVisibility()">
+        <span id="lbl-ap-wake">Wake AP on movement (re-enable after timeout when riding)</span>
+      </label>
+    </div>
+    <div class="section">
+      <h3 id="lbl-blemode-title">BLE Mode</h3>
+      <label id="lbl-blemode-sel">Mode</label>
+      <select id="ble_mode" onchange="document.getElementById('blemode_auto').style.display=this.value==2?'':'none';updateErpmVisibility()" style="width:100%;padding:8px 10px;background:var(--bg3);border:1px solid var(--border);border-radius:4px;color:var(--text);font-family:system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;font-size:13px">
+        <option value="1" id="opt-mode-on">On (always advertise)</option>
+        <option value="0" id="opt-mode-off">Off (no BLE)</option>
+        <option value="2" id="opt-mode-auto">Auto (on when moving)</option>
+      </select>
+      <div id="blemode_auto" style="display:none;margin-top:10px">
+        <label id="lbl-blemode-off">Idle timeout (seconds, BLE off after no movement and no client)</label>
+        <input type="text" id="ble_auto_off_sec" maxlength="5" placeholder="120">
+        <div style="font-size:11px;color:var(--text3);margin-top:6px" id="lbl-blemode-hint">
+          Boot default: BLE on. Movement above threshold resets the idle timer. Active connection (BLE/TCP/Web-UI) pauses the timer.
+        </div>
+      </div>
+    </div>
+    <div class="section" id="erpm_section" style="display:none">
+      <h3 id="lbl-erpm-title">Movement Detection</h3>
+      <label id="lbl-erpm-power">ERPM threshold to wake BLE/WiFi when riding</label>
+      <input type="text" id="ble_auto_erpm_on" maxlength="6" placeholder="200">
+      <div style="font-size:11px;color:var(--text3);margin-top:6px" id="lbl-erpm-hint">
+        When BLE Auto mode or AP wake-on-movement is active and has switched off after the idle timeout, riding above this ERPM value switches BLE/AP back on. Higher value = needs faster riding to wake.
+      </div>
     </div>
     <div class="section">
       <h3 id="lbl-conn-title">Connection</h3>
@@ -392,27 +429,12 @@ static const char PAGE_HTML[] PROGMEM = R"rawliteral(
         <input type="checkbox" id="autopoll_enabled" onchange="document.getElementById('autopoll_opts').style.display=this.checked?'':'none'">
         <span id="lbl-autopoll-enabled">Poll VESC even when Web-UI is closed</span>
       </label>
+      <div id="autopoll_forced_hint" style="display:none;font-size:11px;color:var(--accent);margin-top:6px">
+        <span id="lbl-autopoll-forced">Required by BLE Auto mode or AP wake-on-movement — these need ERPM data.</span>
+      </div>
       <div id="autopoll_opts" style="display:none;margin-top:8px">
         <label id="lbl-autopoll-int">Poll interval (seconds, 1-60)</label>
         <input type="text" id="autopoll_interval" maxlength="3" placeholder="5">
-      </div>
-    </div>
-    <div class="section">
-      <h3 id="lbl-blemode-title">BLE Mode</h3>
-      <label id="lbl-blemode-sel">Mode</label>
-      <select id="ble_mode" onchange="document.getElementById('blemode_auto').style.display=this.value==2?'':'none'" style="width:100%;padding:8px 10px;background:var(--bg3);border:1px solid var(--border);border-radius:4px;color:var(--text);font-family:'Ndot47',monospace;font-size:13px">
-        <option value="1" id="opt-mode-on">On (always advertise)</option>
-        <option value="0" id="opt-mode-off">Off (no BLE)</option>
-        <option value="2" id="opt-mode-auto">Auto (on when moving)</option>
-      </select>
-      <div id="blemode_auto" style="display:none;margin-top:10px">
-        <label id="lbl-blemode-erpm">Movement threshold (|ERPM| above this turns BLE on)</label>
-        <input type="text" id="ble_auto_erpm_on" maxlength="6" placeholder="200">
-        <label id="lbl-blemode-off">Idle timeout (seconds, BLE off after no movement and no client)</label>
-        <input type="text" id="ble_auto_off_sec" maxlength="5" placeholder="120">
-        <div style="font-size:11px;color:var(--text3);margin-top:6px" id="lbl-blemode-hint">
-          Boot default: BLE on. Movement above threshold resets the idle timer. Active connection (BLE/TCP/Web-UI) pauses the timer.
-        </div>
       </div>
     </div>
     <div class="section">
@@ -523,6 +545,10 @@ function applyTranslations(){
   s('lbl-ap-name',          'AP Name (SSID)',                              'AP Name (SSID)');
   s('lbl-ap-pass',          'AP Password (leave empty for open network)',   'AP Passwort (leer = offenes Netz)');
   s('lbl-ap-timeout',       'AP Timeout in seconds (0 = never off)',        'AP Timeout in Sekunden (0 = nie aus)');
+  s('lbl-ap-wake',          'Wake AP on movement (re-enable after timeout when riding)', 'AP bei Bewegung aufwecken (nach Timeout beim Fahren wieder an)');
+  s('lbl-erpm-title',       'Movement Detection',                           'Bewegungserkennung');
+  s('lbl-erpm-power',       'ERPM threshold to wake BLE/WiFi when riding', 'ERPM-Schwelle zum Aufwecken von BLE/WLAN beim Fahren');
+  s('lbl-erpm-hint',        'When BLE Auto mode or AP wake-on-movement is active and has switched off after the idle timeout, riding above this ERPM value switches BLE/AP back on. Higher value = needs faster riding to wake.', 'Wenn BLE-Auto-Modus oder AP-Aufwecken bei Bewegung aktiv ist und sich nach dem Timeout abgeschaltet hat, schaltet das \u00dcberschreiten dieses ERPM-Werts beim Fahren BLE/WLAN wieder ein. H\u00f6herer Wert = schnelleres Fahren n\u00f6tig zum Aufwecken.');
   s('lbl-conn-title',       'Connection',                                   'Verbindung');
   s('lbl-port',             'TCP Port (default: 65101)',                    'TCP Port (Standard: 65101)');
   s('lbl-vesc-poll',        'Read VESC data (voltage, temp, fault)',        'VESC Daten auslesen (Spannung, Temp, Fault)');
@@ -535,13 +561,13 @@ function applyTranslations(){
   s('lbl-roam-hyst',        'Min. improvement (dB) to actually switch',     'Min. Verbesserung (dB) f\u00fcr Wechsel');
   s('lbl-autopoll-title',   'VESC Auto-Poll',                                'VESC Auto-Polling');
   s('lbl-autopoll-enabled', 'Poll VESC even when Web-UI is closed',          'VESC pollen auch wenn Web-UI geschlossen');
+  s('lbl-autopoll-forced',  'Required by BLE Auto mode or AP wake-on-movement — these need ERPM data.', 'Erforderlich f\u00fcr BLE-Auto-Modus oder AP-Aufwecken bei Bewegung \u2014 diese brauchen ERPM-Daten.');
   s('lbl-autopoll-int',     'Poll interval (seconds, 1-60)',                 'Poll-Intervall (Sekunden, 1-60)');
   s('lbl-blemode-title',    'BLE Mode',                                      'BLE Modus');
   s('lbl-blemode-sel',      'Mode',                                          'Modus');
   s('opt-mode-on',          'On (always advertise)',                         'An (immer advertisen)');
   s('opt-mode-off',         'Off (no BLE)',                                  'Aus (kein BLE)');
   s('opt-mode-auto',        'Auto (on when moving)',                         'Auto (an bei Bewegung)');
-  s('lbl-blemode-erpm',     'Movement threshold (|ERPM| above this turns BLE on)', 'Bewegungs-Schwelle (|ERPM| dar\u00fcber schaltet BLE an)');
   s('lbl-blemode-off',      'Idle timeout (seconds, BLE off after no movement and no client)', 'Inaktivit\u00e4ts-Timeout (Sek., BLE aus nach Stillstand ohne Client)');
   s('lbl-blemode-hint',     'Boot default: BLE on. Movement above threshold resets the idle timer. Active connection (BLE/TCP/Web-UI) pauses the timer.', 'Boot-Default: BLE an. Bewegung \u00fcber der Schwelle setzt den Timer zur\u00fcck. Aktive Verbindung (BLE/TCP/Web-UI) pausiert den Timer.');
   s('lbl-update-title',     'Update Server',                                'Update Server');
@@ -595,6 +621,7 @@ function loadInfo(){
       '<div class="info-row"><span>Free RAM</span><span class="info-val">'+(d.heap>=1024?(d.heap/1024).toFixed(1)+' KB':d.heap+' B')+'</span></div>'+
       '<div class="info-row"><span>AP</span><span class="info-val" style="color:'+(d.ap_active?'var(--ok)':'var(--text3)')+'">'+( d.ap_active?(de()?'Aktiv':'Active'):(de()?'Aus':'Off'))+(d.ap_active?' ('+d.ap_ip+')':'')+'</span></div>'+
       (d.ap_active&&d.ap_timeout_remaining>=0?'<div class="info-row"><span>'+(de()?'AP aus in':'AP off in')+'</span><span class="info-val">'+d.ap_timeout_remaining+'s</span></div>':'')+
+      (d.ap_active&&d.ap_timeout_remaining===-2?'<div class="info-row"><span>'+(de()?'AP aus in':'AP off in')+'</span><span class="info-val">'+(de()?'pausiert (Client verbunden)':'paused (client connected)')+'</span></div>':'')+
       '<div class="info-row"><span>TCP Port</span><span class="info-val">'+d.port+'</span></div>'+
       '<div class="info-row"><span>UART</span><span class="info-val">RX=GPIO'+d.rx_pin+' TX=GPIO'+d.tx_pin+'</span></div>'+
       '<div style="margin:10px 0 6px;font-size:11px;color:#666;text-transform:uppercase;letter-spacing:1px">VESC</div>'+
@@ -691,12 +718,34 @@ function esc(s){return String(s).replace(/&/g,'&amp;').replace(/"/g,'&quot;').re
 function addWifi(){if(wifiNetworks.length>=10){alert('Max 10');return;}wifiNetworks.push({ssid:'',pass:'',static:false,ip:'',gateway:'',subnet:'255.255.255.0',dns:''});renderWifiList();}
 function removeWifi(i){wifiNetworks.splice(i,1);renderWifiList();}
 
+function updateErpmVisibility(){
+  var bleAuto = document.getElementById('ble_mode').value==2;
+  var apWake  = document.getElementById('ap_wake_on_move').checked;
+  document.getElementById('erpm_section').style.display=(bleAuto||apWake)?'':'none';
+  // Auto-Poll wird von BLE-Auto und AP-Wake zwingend benoetigt (brauchen ERPM).
+  // In dem Fall den Haken setzen, sperren und die Optionen einblenden.
+  var needPoll = bleAuto || apWake;
+  var ap = document.getElementById('autopoll_enabled');
+  if(needPoll){
+    ap.checked = true;
+    ap.disabled = true;
+    document.getElementById('autopoll_opts').style.display='';
+    document.getElementById('autopoll_forced_hint').style.display='';
+  } else {
+    ap.disabled = false;
+    document.getElementById('autopoll_forced_hint').style.display='none';
+    // Sichtbarkeit der Optionen wieder an den tatsaechlichen Haken-Zustand koppeln
+    document.getElementById('autopoll_opts').style.display=ap.checked?'':'none';
+  }
+}
+
 function loadConfig(){
   fetch('/api/config').then(function(r){return r.json();}).then(function(d){
     document.getElementById('ble_name').value    = d.ble_name||'';
     document.getElementById('ap_ssid').value     = d.ap_ssid||'';
     document.getElementById('ap_pass').value     = d.ap_pass||'';
     document.getElementById('ap_timeout').value  = d.ap_timeout||0;
+    document.getElementById('ap_wake_on_move').checked = d.ap_wake_on_move===true;
     document.getElementById('vesc_port').value   = d.port||65101;
     document.getElementById('rx_pin').value      = d.rx_pin||6;
     document.getElementById('tx_pin').value      = d.tx_pin||5;
@@ -716,6 +765,7 @@ function loadConfig(){
     document.getElementById('ble_auto_erpm_on').value = d.ble_auto_erpm_on||200;
     document.getElementById('ble_auto_off_sec').value = d.ble_auto_off_sec||120;
     document.getElementById('blemode_auto').style.display = d.ble_mode==2?'':'none';
+    updateErpmVisibility();
     document.getElementById('version_url').value = d.version_url||'';
     document.getElementById('update_url').value  = d.update_url||'';
     wifiNetworks=(d.wifi||[]).map(function(n){return{ssid:n.ssid||'',pass:n.pass||'',static:n.static||false,ip:n.ip||'',gateway:n.gateway||'',subnet:n.subnet||'255.255.255.0',dns:n.dns||''};});
@@ -726,7 +776,7 @@ function loadConfig(){
 
 function showToast(msg, ok, duration){
   var t=document.getElementById('toast');
-  if(!t){t=document.createElement('div');t.id='toast';t.style.cssText='position:fixed;top:12px;left:50%;transform:translateX(-50%);padding:10px 18px;border-radius:6px;font-family:Ndot47,monospace;font-size:13px;z-index:9999;transition:opacity .3s;pointer-events:none';document.body.appendChild(t);}
+  if(!t){t=document.createElement('div');t.id='toast';t.style.cssText='position:fixed;top:12px;left:50%;transform:translateX(-50%);padding:10px 18px;border-radius:6px;font-family:system-ui,-apple-system,sans-serif;font-size:13px;z-index:9999;transition:opacity .3s;pointer-events:none';document.body.appendChild(t);}
   t.textContent=msg;
   t.style.background=ok?'var(--ok)':'var(--err)';
   t.style.color=ok?'#111':'#fff';
@@ -759,6 +809,7 @@ function saveConfig(){
     ap_ssid:     document.getElementById('ap_ssid').value,
     ap_pass:     document.getElementById('ap_pass').value,
     ap_timeout:  parseInt(document.getElementById('ap_timeout').value)||0,
+    ap_wake_on_move: document.getElementById('ap_wake_on_move').checked,
     port:        parseInt(document.getElementById('vesc_port').value)||65101,
     rx_pin:      parseInt(document.getElementById('rx_pin').value)||6,
     tx_pin:      parseInt(document.getElementById('tx_pin').value)||5,
@@ -769,7 +820,7 @@ function saveConfig(){
     roam_enabled:    document.getElementById('roam_enabled').checked,
     roam_threshold:  parseInt(document.getElementById('roam_threshold').value)||-75,
     roam_hysteresis: parseInt(document.getElementById('roam_hysteresis').value)||12,
-    autopoll_enabled:  document.getElementById('autopoll_enabled').checked,
+    autopoll_enabled:  document.getElementById('autopoll_enabled').checked || (document.getElementById('ble_mode').value==2) || document.getElementById('ap_wake_on_move').checked,
     autopoll_interval: parseInt(document.getElementById('autopoll_interval').value)||5,
     ble_mode:          parseInt(document.getElementById('ble_mode').value),
     ble_auto_erpm_on:  parseInt(document.getElementById('ble_auto_erpm_on').value)||200,
@@ -881,9 +932,15 @@ void handleApiInfo() {
   json += "\"ble_mac\":\""+String(NimBLEDevice::getAddress().toString().c_str())+"\",";
   json += "\"wifi_client_connected\":"+String((wifiClient&&wifiClient.connected())?"true":"false")+",";
   json += "\"ap_active\":"+String(apActive?"true":"false")+",";
-  if (apActive && cfg_ap_timeout > 0) {
-    long r = (long)cfg_ap_timeout - (long)((millis()-apStartTime)/1000);
-    json += "\"ap_timeout_remaining\":"+String(max(r,0L))+",";
+  if (apActive && cfg_ap_timeout > 0 && WiFi.status() == WL_CONNECTED) {
+    if (WiFi.softAPgetStationNum() > 0) {
+      // Client verbunden -> Timer pausiert
+      json += "\"ap_timeout_remaining\":-2,";
+    } else {
+      unsigned long ref = (apLastClientGone > 0) ? apLastClientGone : apStartTime;
+      long r = (long)cfg_ap_timeout - (long)((millis()-ref)/1000);
+      json += "\"ap_timeout_remaining\":"+String(max(r,0L))+",";
+    }
   } else json += "\"ap_timeout_remaining\":-1,";
   json += "\"ap_ip\":\""+WiFi.softAPIP().toString()+"\",";
   json += "\"heap\":"+String(ESP.getFreeHeap())+",";
@@ -929,6 +986,7 @@ void handleApiConfigGet() {
   json += "\"autopoll_interval\":"+String(cfg_autopoll_interval)+",";
   json += "\"ble_mode\":"+String(cfg_ble_mode)+",";
   json += "\"ble_auto_erpm_on\":"+String(cfg_ble_auto_erpm_on)+",";
+  json += "\"ap_wake_on_move\":"+String(cfg_ap_wake_on_move?"true":"false")+",";
   json += "\"ble_auto_off_sec\":"+String(cfg_ble_auto_off_sec)+",";
   json += "\"update_url\":\""+cfg_update_url+"\",";
   json += "\"version_url\":\""+cfg_version_url+"\",";
@@ -986,6 +1044,7 @@ void handleApiConfigPost() {
   cfg_autopoll_interval = parseInt2("autopoll_interval", 5);
   cfg_ble_mode          = parseInt2("ble_mode", 1);
   cfg_ble_auto_erpm_on  = parseInt2("ble_auto_erpm_on", 200);
+  cfg_ap_wake_on_move   = (body.indexOf("\"ap_wake_on_move\":true") >= 0);
   cfg_ble_auto_off_sec  = parseInt2("ble_auto_off_sec", 120);
   if (cfg_autopoll_interval < 1)   cfg_autopoll_interval = 1;
   if (cfg_autopoll_interval > 60)  cfg_autopoll_interval = 60;
@@ -1076,6 +1135,15 @@ void handleApiUpdateInstall() {
 
 void setupWebServer() {
   otaServer.on("/",                     HTTP_GET,  handlePage);
+  // Ausgelagerte statische Assets (einmal im Flash, vom Browser gecacht).
+  // Funktionieren offline im AP-Modus, da vom ESP selbst ausgeliefert.
+  otaServer.on("/style.css", HTTP_GET, [](){
+    otaServer.sendHeader("Cache-Control", "public, max-age=86400");
+    // CSS inkl. eingebetteter Ndot-Schrift (Base64). Ein einziger Request,
+    // von beiden Seiten (/ und spaeter /leds) genutzt. Kein separater Font-
+    // Request -> umgeht WOFF2-Ladeprobleme auf mobilen Browsern.
+    otaServer.send(200, "text/css", STYLE_CSS);
+  });
   otaServer.on("/api/info",             HTTP_GET,  handleApiInfo);
   otaServer.on("/api/config",           HTTP_GET,  handleApiConfigGet);
   otaServer.on("/api/config",           HTTP_POST, handleApiConfigPost);
@@ -1187,6 +1255,10 @@ void onWiFiEvent(WiFiEvent_t event) {
       // STA hat die Verbindung verloren. Die IDF räumt intern auf — dabei darf
       // der AP NICHT verschwinden. Mode hart auf AP_STA halten und AP prüfen.
       Serial.println("[evt] STA disconnected — protecting AP");
+      // WLAN ist weg -> der AP wird als Zugang wieder gebraucht, auch wenn ein
+      // vorheriger AP-Timeout ihn abgeschaltet hatte. apWanted reaktivieren,
+      // sonst koennte ensureAP() (das auf apWanted prueft) den AP nicht holen.
+      apWanted = true;
       if (WiFi.getMode() != WIFI_AP_STA) {
         WiFi.mode(WIFI_AP_STA);
       }
@@ -1254,6 +1326,9 @@ bool ensureAP(bool force) {
     isAPMode    = true;
     apActive    = true;
     apStartTime = millis();
+    apLastClientGone = 0;   // frischer Start: Idle-Timer laeuft ab AP-Start
+    apLastStationNum = 0;
+    apOffByTimeout = false; // AP laeuft wieder -> Timeout-Flag loeschen
     Serial.printf("AP (re)started: %s ch=%d ip=%s\n",
                   cfg_ap_ssid.c_str(), ch, WiFi.softAPIP().toString().c_str());
   } else {
@@ -1371,10 +1446,18 @@ void pollVesc() {
 
   if (wifiClient && wifiClient.connected()) return;
   if (deviceConnected) return;
-  if (!cfg_vesc_poll) return;
-  // Polling laeuft wenn Web-UI offen ODER Auto-Poll aktiviert.
-  bool autoPollActive = cfg_autopoll_enabled;
-  bool uiActive       = webUiActive();
+
+  // Eine bewegungs-abhaengige Funktion (BLE-Auto / AP-Wake-on-Move) braucht
+  // ERPM ZWINGEND — auch wenn der normale "VESC Daten auslesen"-Haken aus ist.
+  // Deshalb wird needErpmForWake VOR der cfg_vesc_poll-Pruefung ausgewertet.
+  bool needErpmForWake = (cfg_ble_mode == 2) || cfg_ap_wake_on_move;
+
+  // Wenn weder die Wake-Funktion noch das normale Polling aktiv sind, abbrechen.
+  if (!cfg_vesc_poll && !needErpmForWake) return;
+
+  // Polling laeuft wenn Web-UI offen ODER Auto-Poll aktiviert ODER Wake-Funktion.
+  bool autoPollActive  = cfg_autopoll_enabled || needErpmForWake;
+  bool uiActive        = webUiActive();
   if (!uiActive && !autoPollActive) return;
   // Intervall: bei aktiver UI fest 3s, sonst Auto-Poll-Intervall.
   unsigned long pollInterval = uiActive ? 3000UL : (unsigned long)cfg_autopoll_interval * 1000UL;
@@ -1810,15 +1893,60 @@ void loop() {
 
   // AP-Timeout: schaltet den AP gezielt ab (apWanted = false), wenn konfiguriert
   // und niemand am AP hängt. Danach hält der Watchdog ihn NICHT mehr am Leben.
-  if (apActive && cfg_ap_timeout > 0) {
-    if (millis() - apStartTime > (unsigned long)cfg_ap_timeout * 1000UL) {
-      if (WiFi.softAPgetStationNum() == 0) {
-        Serial.println("AP timeout — shutting down");
-        apWanted = false;
-        WiFi.softAPdisconnect(false);   // false -> Funk/STA bleibt an
-        apActive = false;
-        isAPMode = false;
+  // WICHTIG: Nur abschalten, wenn STA verbunden ist — sonst waere der ESP ueber
+  // gar kein Funknetz mehr erreichbar. Ohne WLAN bleibt der AP die einzige
+  // Zugriffsmoeglichkeit und darf nicht weg.
+  if (apActive && cfg_ap_timeout > 0 && WiFi.status() == WL_CONNECTED) {
+    int stations = WiFi.softAPgetStationNum();
+    // Flanke erkennen: ist gerade das letzte Geraet abgefallen?
+    if (stations == 0 && apLastStationNum > 0) {
+      apLastClientGone = millis();   // Timer ab JETZT neu starten
+      Serial.println("AP: last client left — idle timer restarted");
+    }
+    apLastStationNum = stations;
+
+    // Bewegung haelt den AP wach (analog BLE-Auto-Modus): wenn Wake-on-Move
+    // aktiv ist und |ERPM| ueber der Schwelle liegt, Timer zuruecksetzen.
+    // So flackert der AP nicht, solange gefahren wird. Greift nur bei
+    // aktiviertem Wake-on-Move; sonst bleibt der Timeout rein zeitbasiert.
+    if (cfg_ap_wake_on_move && vescStatus.connected) {
+      int32_t absErpm = vescStatus.erpm < 0 ? -vescStatus.erpm : vescStatus.erpm;
+      if (absErpm > cfg_ble_auto_erpm_on) {
+        apLastClientGone = millis();   // Referenzzeit auffrischen = Timer reset
       }
+    }
+
+    // Referenzzeit fuer den Timeout:
+    //  - wenn nie ein Client da war: ab AP-Start
+    //  - wenn ein Client weg ist:    ab Trennung
+    //  - bei Bewegung (s.o.):         laufend aufgefrischt
+    // Solange ein Client verbunden ist, wird der Timer nicht ausgewertet.
+    unsigned long ref = (apLastClientGone > 0) ? apLastClientGone : apStartTime;
+
+    if (stations == 0 && millis() - ref > (unsigned long)cfg_ap_timeout * 1000UL) {
+      Serial.println("AP timeout — shutting down AP, keeping STA");
+      apWanted = false;
+      WiFi.softAPdisconnect(true);    // AP stoppen + AP-Config loeschen
+      // Mode hart auf reines STA setzen. Das verhindert, dass die IDF einen
+      // Default-AP ("ESP-XXXX" ohne Passwort) im AP_STA-Modus hochzieht.
+      WiFi.mode(WIFI_STA);
+      apActive = false;
+      isAPMode = false;
+      apOffByTimeout = true;   // fuer Wake-on-Move merken
+    }
+  }
+
+  // AP Wake-on-Move: wenn der AP per Timeout aus ist und der Haken gesetzt ist,
+  // den AP bei Bewegung (|ERPM| > Schwelle) wieder hochziehen. WLAN/STA bleibt
+  // dabei unberuehrt — wir holen nur den AP zurueck.
+  if (apOffByTimeout && cfg_ap_wake_on_move && !apActive) {
+    int32_t absErpm = vescStatus.erpm < 0 ? -vescStatus.erpm : vescStatus.erpm;
+    if (vescStatus.connected && absErpm > cfg_ble_auto_erpm_on) {
+      Serial.printf("AP wake: movement (erpm=%d) -> AP back on\n", (int)vescStatus.erpm);
+      apWanted = true;
+      apOffByTimeout = false;
+      if (WiFi.getMode() != WIFI_AP_STA) WiFi.mode(WIFI_AP_STA);
+      ensureAP(true);
     }
   }
 
