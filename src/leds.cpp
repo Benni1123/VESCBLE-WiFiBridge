@@ -262,7 +262,7 @@ static const char LEDS_PAGE_HTML[] PROGMEM = R"ledslit(
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>LEDs</title>
+  <title>🛴 LED Steuerung</title>
   <link rel="stylesheet" href="/style.css">
   <style>
     input[type=range]{width:100%;accent-color:var(--accent);margin-top:6px}

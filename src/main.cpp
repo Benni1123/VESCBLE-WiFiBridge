@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <Preferences.h>
+#include <nvs_flash.h>        // komplette NVS-Partition loeschen (Factory-Reset)
 #include <NimBLEDevice.h>
 #include <WiFi.h>
 #include <esp_wifi.h>          // esp_wifi_set_config (Beacon-Intervall, AP-Feintuning)
@@ -21,6 +22,30 @@
 #define DEFAULT_HOSTNAME  "vesc-ble-wifi"
 #define DEFAULT_UPDATE_URL  "https://github.com/Benni1123/VESCBLE-WiFiBridge/releases/latest/download/firmware.bin"
 #define DEFAULT_VERSION_URL "https://github.com/Benni1123/VESCBLE-WiFiBridge/releases/latest/download/version.txt"
+
+// Feste, bewaehrte oeffentliche DNS-Server als Fallback. Werden als sekundaerer
+// (und ggf. primaerer) DNS gesetzt, falls der vom Nutzer hinterlegte DNS nicht
+// antwortet. So bleibt z.B. der Update-Check funktionsfaehig, auch wenn der
+// gewuenschte DNS gerade zickt. Reihenfolge: Google, dann Cloudflare.
+#define FALLBACK_DNS_PRIMARY   IPAddress(8,8,8,8)
+#define FALLBACK_DNS_SECONDARY IPAddress(1,1,1,1)
+
+// Setzt die statische IP-Konfig inkl. DNS-Fallback. Gewuenschter DNS wird
+// primaer gesetzt, ein fester oeffentlicher DNS sekundaer -> faellt der primaere
+// aus, bleibt die Namensaufloesung (z.B. fuer den Update-Check) funktionsfaehig.
+static bool applyStaticConfig(const String &ipS, const String &gwS,
+                              const String &subS, const String &dnsS) {
+  IPAddress ip, gw, sub;
+  if (!(ip.fromString(ipS) && gw.fromString(gwS) && sub.fromString(subS)))
+    return false;
+  IPAddress dns1;
+  if (dnsS.length() > 0 && dns1.fromString(dnsS)) {
+    IPAddress dns2 = (dns1 == FALLBACK_DNS_PRIMARY)
+                       ? FALLBACK_DNS_SECONDARY : FALLBACK_DNS_PRIMARY;
+    return WiFi.config(ip, gw, sub, dns1, dns2);
+  }
+  return WiFi.config(ip, gw, sub, FALLBACK_DNS_PRIMARY, FALLBACK_DNS_SECONDARY);
+}
 #define VESC_RX_PIN       6
 #define VESC_TX_PIN       5
 #define VESC_TCP_PORT     65101
@@ -229,6 +254,10 @@ static unsigned long lastReconnectTry  = 0;
 static bool          scanInProgress    = false;
 static unsigned long scanStartTime     = 0;
 static bool          staWasConnected   = false;
+// Fuer den automatischen WLAN-Stack-Neustart bei hartnaeckigem Haenger:
+// Zeitpunkt, seit dem wir durchgehend KEIN bekanntes Netz verbinden konnten.
+static unsigned long staDownSince      = 0;     // 0 = aktuell verbunden/ok
+static const unsigned long STA_HARD_RESTART_MS = 150000;  // 2,5 Min
 
 // ── Roaming-State ─────────────────────────────────────────────────────────────
 static unsigned long lastRssiCheck     = 0;
@@ -1332,19 +1361,60 @@ void handleOTAFinish() {
 void handleApiUpdateCheck() {
   if (WiFi.status()!=WL_CONNECTED){otaServer.send(400,"application/json","{\"error\":\"WiFi only\"}");return;}
   if (cfg_version_url.isEmpty()){otaServer.send(400,"application/json","{\"error\":\"No URL\"}");return;}
-  HTTPClient http; WiFiClientSecure sc; sc.setInsecure();
-  if (cfg_version_url.startsWith("https")) http.begin(sc,cfg_version_url); else http.begin(cfg_version_url);
-  http.setTimeout(8000); http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-  int code = http.GET();
-  if (code==200) {
-    String ver=http.getString(); ver.trim();
-    updateState.availableVersion=ver; updateState.error="";
-    otaServer.send(200,"application/json","{\"current\":\""+String(FIRMWARE_VERSION)+"\",\"available\":\""+ver+"\",\"update_available\":"+(ver!=String(FIRMWARE_VERSION)?"true":"false")+"}");
-  } else {
-    updateState.error="HTTP "+String(code);
-    otaServer.send(500,"application/json","{\"error\":\"HTTP "+String(code)+"\"}");
+
+  // Der Check scheitert sporadisch, weil die TLS-Verbindung zu GitHub (mehrstufige
+  // Redirect-Kette, je eigener Handshake) auf dem ESP mal RAM-/Funk-bedingt nicht
+  // durchkommt. Daher: bis zu 3 Versuche mit Pause dazwischen. Jeder Versuch baut
+  // seine TLS-Ressourcen frisch auf und gibt sie wieder frei (gegen Fragmentierung).
+  const int MAX_TRIES = 3;
+  int code = 0;
+  String ver = "";
+  bool ok = false;
+
+  for (int attempt = 1; attempt <= MAX_TRIES && !ok; attempt++) {
+    // Vor jedem Versuch pruefen, ob genug zusammenhaengender Heap fuer TLS da ist.
+    // Ein TLS-Handshake braucht ~40 KB am Stueck; bei zu wenig gar nicht erst
+    // versuchen, sondern kurz warten (evtl. gibt der Stack Speicher frei).
+    if (ESP.getMaxAllocHeap() < 45000) {
+      Serial.printf("UpdateCheck: zu wenig zusammenh. Heap (%u), warte...\n",
+                    (unsigned)ESP.getMaxAllocHeap());
+      delay(400);
+    }
+
+    HTTPClient http;
+    WiFiClientSecure sc;
+    sc.setInsecure();
+    if (cfg_version_url.startsWith("https")) http.begin(sc, cfg_version_url);
+    else                                     http.begin(cfg_version_url);
+    http.setTimeout(12000);   // grosszuegiger: drei Handshakes hintereinander
+    http.setConnectTimeout(8000);
+    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+
+    code = http.GET();
+    if (code == 200) {
+      ver = http.getString();
+      ver.trim();
+      if (ver.length() > 0) ok = true;
+    }
+    http.end();   // TLS-Ressourcen sofort freigeben (wichtig gegen Fragmentierung)
+
+    if (!ok) {
+      Serial.printf("UpdateCheck: Versuch %d fehlgeschlagen (HTTP %d)\n", attempt, code);
+      if (attempt < MAX_TRIES) delay(600);   // kurz beruhigen, dann neu
+    }
   }
-  http.end();
+
+  if (ok) {
+    updateState.availableVersion = ver;
+    updateState.error = "";
+    otaServer.send(200, "application/json",
+      "{\"current\":\""+String(FIRMWARE_VERSION)+"\",\"available\":\""+ver+
+      "\",\"update_available\":"+(ver!=String(FIRMWARE_VERSION)?"true":"false")+"}");
+  } else {
+    updateState.error = "HTTP "+String(code);
+    otaServer.send(500, "application/json",
+      "{\"error\":\"HTTP "+String(code)+" (nach "+String(MAX_TRIES)+" Versuchen)\"}");
+  }
 }
 
 void handleApiUpdateInstall() {
@@ -1378,7 +1448,21 @@ void setupWebServer() {
   otaServer.on("/api/info",             HTTP_GET,  handleApiInfo);
   otaServer.on("/api/config",           HTTP_GET,  handleApiConfigGet);
   otaServer.on("/api/config",           HTTP_POST, handleApiConfigPost);
-  otaServer.on("/api/factory-reset",    HTTP_POST, [](){ prefs.begin("vesccfg",false);prefs.clear();prefs.end();otaServer.send(200,"text/plain","OK");ledsOff();delay(500);ESP.restart(); });
+  otaServer.on("/api/factory-reset",    HTTP_POST, [](){
+    // Echtes "wie neu": die KOMPLETTE NVS-Partition loeschen, nicht nur einen
+    // Namespace. Damit verschwinden auch Alt-Leichen aus frueheren Versionen
+    // (umbenannte Keys etc.) und der "leds"-Namespace. Reihenfolge wichtig:
+    // erst alle offenen Preferences schliessen, dann NVS deinit -> erase -> init.
+    otaServer.send(200, "text/plain", "OK");   // Antwort noch senden, bevor wir loeschen
+    ledsOff();
+    delay(200);
+    prefs.end();                 // evtl. offenen vesccfg-Handle schliessen
+    nvs_flash_deinit();          // NVS freigeben (sonst "in use")
+    nvs_flash_erase();           // GESAMTE NVS-Partition loeschen
+    nvs_flash_init();            // frisch initialisieren (sauberer Zustand)
+    delay(300);
+    ESP.restart();
+  });
   otaServer.on("/api/wifi/scan",        HTTP_GET,  [](){ int n=WiFi.scanNetworks();String j="[";for(int i=0;i<n;i++){if(i)j+=",";j+="{\"ssid\":\""+WiFi.SSID(i)+"\",\"rssi\":"+String(WiFi.RSSI(i))+",\"secure\":"+String(WiFi.encryptionType(i)!=WIFI_AUTH_OPEN?"true":"false")+"}";}j+="]";WiFi.scanDelete();otaServer.send(200,"application/json",j); });
   otaServer.on("/api/update/status",    HTTP_GET,  [](){ otaServer.send(200,"application/json","{\"current\":\""+String(FIRMWARE_VERSION)+"\",\"available\":\""+updateState.availableVersion+"\",\"update_url\":\""+cfg_update_url+"\",\"version_url\":\""+cfg_version_url+"\",\"error\":\""+updateState.error+"\"}"); });
   otaServer.on("/api/update/check",     HTTP_GET,  handleApiUpdateCheck);
@@ -1579,8 +1663,9 @@ static void tuneApDhcp() {
   // minimal, laesst aber BT genug Funkzeit und bleibt stabil.
   esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
 
-  // Sendeleistung explizit auf Maximum (manchmal startet der ESP reduziert).
-  // 80 = 20 dBm (Einheit: 0.25 dBm). Verbessert Reichweite/Verbindungsqualitaet.
+  // Sendeleistung explizit auf Maximum. 80 = 20 dBm (Einheit: 0.25 dBm),
+  // verbessert Reichweite/Verbindungsqualitaet des AP. (War kurz im Verdacht,
+  // den Update-Check zu stoeren -- Ursache war aber DNS, daher wieder aktiv.)
   esp_wifi_set_max_tx_power(80);
 
   Serial.println("AP tune: ps=MIN_MODEM (BT-Koexistenz), TX-power max");
@@ -1733,10 +1818,7 @@ bool setupWiFiClient() {
   String csid = WiFi.SSID();
   for (auto &n : cfg_wifi) {
     if (n.ssid==csid && n.staticIp && n.ip.length()>0) {
-      IPAddress ip,gw,sub;
-      if (ip.fromString(n.ip) && gw.fromString(n.gateway) && sub.fromString(n.subnet)) {
-        IPAddress dns; if (n.dns.length()>0&&dns.fromString(n.dns)) WiFi.config(ip,gw,sub,dns); else WiFi.config(ip,gw,sub);
-      }
+      applyStaticConfig(n.ip, n.gateway, n.subnet, n.dns);
       break;
     }
   }
@@ -2060,12 +2142,7 @@ void handleRoaming() {
       // statische IP ggf. erneut setzen
       for (auto &w : cfg_wifi) {
         if (w.ssid == curSsid && w.staticIp && w.ip.length() > 0) {
-          IPAddress ip,gw,sub;
-          if (ip.fromString(w.ip)&&gw.fromString(w.gateway)&&sub.fromString(w.subnet)) {
-            IPAddress dns;
-            if (w.dns.length()>0&&dns.fromString(w.dns)) WiFi.config(ip,gw,sub,dns);
-            else WiFi.config(ip,gw,sub);
-          }
+          applyStaticConfig(w.ip, w.gateway, w.subnet, w.dns);
           break;
         }
       }
@@ -2096,8 +2173,10 @@ void handleRoaming() {
 // den Loop nicht mehr -> AP sendet durchgehend Beacons.
 void handleWiFiReconnect() {
   if (cfg_wifi.empty()) return;
+
   if (WiFi.status() == WL_CONNECTED) {
-    // verbunden -> evtl. laufenden Scan aufräumen
+    // verbunden -> alles gut. Notnagel-Timer zuruecksetzen, Scan aufraeumen.
+    staDownSince = 0;
     if (scanInProgress) {
       int16_t r = WiFi.scanComplete();
       if (r != WIFI_SCAN_RUNNING) { WiFi.scanDelete(); scanInProgress = false; }
@@ -2107,30 +2186,67 @@ void handleWiFiReconnect() {
 
   unsigned long now = millis();
 
-  // Phase 1: kein Scan läuft -> alle 10s einen ASYNC-Scan anstoßen
-  if (!scanInProgress) {
-    if (now - lastReconnectTry < 10000) return;
-    lastReconnectTry = now;
-    // async = true, hidden = true. Blockiert NICHT.
-    WiFi.scanNetworks(true, true);
-    scanInProgress = true;
-    scanStartTime  = now;
+  // Ab jetzt sind wir NICHT verbunden -> Notnagel-Timer starten, falls noch nicht.
+  if (staDownSince == 0) staDownSince = now;
+
+  // ── NOTNAGEL: hartnaeckiger Haenger ───────────────────────────────────────
+  // Wenn wir ueber STA_HARD_RESTART_MS durchgehend nicht verbinden konnten,
+  // ist der STA-Stack/Scan vermutlich verklemmt. Kompletter WLAN-STA-Neustart
+  // (AP bleibt erhalten). Das ersetzt den manuellen Geraete-Neustart.
+  if (now - staDownSince > STA_HARD_RESTART_MS) {
+    Serial.println("WiFi: hard STA stack restart (haengt zu lange)");
+    // laufenden Scan zwangsweise verwerfen
+    WiFi.scanDelete();
+    scanInProgress = false;
+    // STA komplett zuruecksetzen, Funk + AP behalten
+    WiFi.disconnect(true, true);    // STA trennen + gespeicherte STA-Config loeschen
+    delay(300);
+    if (WiFi.getMode() != WIFI_AP_STA) WiFi.mode(WIFI_AP_STA);
+    // wifiMulti komplett neu aufbauen
+    wifiMulti = WiFiMulti();
+    for (auto &n : cfg_wifi) wifiMulti.addAP(n.ssid.c_str(), n.pass.c_str());
+    // AP sicherstellen (der soll den Neustart ueberlebt haben)
+    ensureAP(false);
+    // Timer + Versuchstakt zuruecksetzen, frisch anfangen
+    staDownSince     = now;
+    lastReconnectTry = 0;
     return;
   }
 
-  // Phase 2: Scan läuft -> Ergebnis pollen (ohne zu blockieren)
-  int16_t res = WiFi.scanComplete();
-
-  if (res == WIFI_SCAN_RUNNING) {
-    // noch nicht fertig — Sicherheits-Timeout 15s
-    if (now - scanStartTime > 15000) {
+  // ── Phase 1: kein Scan laeuft -> alle 10s einen ASYNC-Scan anstossen ──────
+  if (!scanInProgress) {
+    if (now - lastReconnectTry < 10000) return;
+    lastReconnectTry = now;
+    int16_t started = WiFi.scanNetworks(true, true);   // async, inkl. hidden
+    // Bei erfolgreichem Start liefert der async-Scan WIFI_SCAN_RUNNING.
+    if (started == WIFI_SCAN_RUNNING) {
+      scanInProgress = true;
+      scanStartTime  = now;
+    } else {
+      // Jeder andere Rueckgabewert (z.B. WIFI_SCAN_FAILED, oder ein bereits
+      // verklemmter Scan-Zustand) -> hart raeumen, beim naechsten Mal neu.
       WiFi.scanDelete();
       scanInProgress = false;
     }
     return;
   }
 
-  // Scan fertig (res >= 0) oder Fehler (res == WIFI_SCAN_FAILED)
+  // ── Phase 2: Scan laeuft -> Ergebnis pollen (ohne zu blockieren) ──────────
+  int16_t res = WiFi.scanComplete();
+
+  if (res == WIFI_SCAN_RUNNING) {
+    // Sicherheits-Timeout: nach 12s den Scan-Zustand HART zuruecksetzen, damit
+    // ein neuer Scan garantiert starten kann (gegen verklemmten Scan-Zustand).
+    if (now - scanStartTime > 12000) {
+      Serial.println("WiFi: scan timeout -> reset scan state");
+      WiFi.scanDelete();
+      scanInProgress = false;
+      lastReconnectTry = now;   // 10s Pause bis zum naechsten Scan
+    }
+    return;
+  }
+
+  // Scan fertig (res >= 0) oder Fehler (res < 0).
   bool found = false;
   if (res > 0) {
     for (int i = 0; i < res && !found; i++) {
@@ -2142,25 +2258,18 @@ void handleWiFiReconnect() {
   WiFi.scanDelete();
   scanInProgress = false;
 
-  // Zaehler fuer hartnaeckige Connect-Fehlschlaege (bekanntes Netz da, aber
-  // Verbindung klappt nicht) -> nach mehreren Versuchen harter Stack-Reset.
   static int staConnectFails = 0;
 
   if (found) {
     Serial.println("WiFi: known network found, connecting...");
-    // Mode sicherstellen — Connect darf den AP nicht abwerfen
     if (WiFi.getMode() != WIFI_AP_STA) WiFi.mode(WIFI_AP_STA);
-    // wifiMulti.run() macht intern ein disconnect+connect. Der AP überlebt das,
-    // weil wir den Mode danach im Event-Handler / per ensureAP() schützen.
     if (wifiMulti.run(8000) == WL_CONNECTED) {
-      staConnectFails = 0;   // Erfolg -> Zaehler zuruecksetzen
+      staConnectFails = 0;
+      staDownSince = 0;   // verbunden -> Notnagel-Timer aus
       String csid = WiFi.SSID();
       for (auto &w : cfg_wifi) {
         if (w.ssid==csid && w.staticIp && w.ip.length()>0) {
-          IPAddress ip,gw,sub;
-          if (ip.fromString(w.ip)&&gw.fromString(w.gateway)&&sub.fromString(w.subnet)) {
-            IPAddress dns; if (w.dns.length()>0&&dns.fromString(w.dns)) WiFi.config(ip,gw,sub,dns); else WiFi.config(ip,gw,sub);
-          }
+          applyStaticConfig(w.ip, w.gateway, w.subnet, w.dns);
           break;
         }
       }
@@ -2169,22 +2278,17 @@ void handleWiFiReconnect() {
         NimBLEDevice::startAdvertising();
       }
     } else {
-      // Netz war da, aber Connect scheiterte.
       staConnectFails++;
       Serial.printf("WiFi: connect failed despite known network (fail #%d)\n", staConnectFails);
       if (staConnectFails >= 3) {
-        // Hartnaeckig -> STA-Teil des Stacks hart zuruecksetzen (AP bleibt!).
-        // disconnect(false,false) haelt Funk+Mode, raeumt nur den STA-Zustand.
         Serial.println("WiFi: hard STA reset after repeated failures");
         WiFi.disconnect(false, false);
         delay(300);
-        // wifiMulti frisch aufbauen
         wifiMulti = WiFiMulti();
         for (auto &n : cfg_wifi) wifiMulti.addAP(n.ssid.c_str(), n.pass.c_str());
         staConnectFails = 0;
       }
     }
-    // Egal ob connect geklappt hat: AP-Zustand wiederherstellen.
     ensureAP(false);
   }
 }
