@@ -2,6 +2,9 @@
 #include <Arduino.h>
 #include <Adafruit_NeoPixel.h>
 #include <Preferences.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/semphr.h>
 
 // ── Mehrkanal-LED-Steuerung (bis zu 4 Kanaele) ────────────────────────────────
 // Jeder Kanal hat eigene Hardware (Pin, Anzahl) und eigene Einstellungen
@@ -32,6 +35,22 @@ struct LedChannel {
 
 static LedChannel ch[LED_MAX_CHANNELS];
 static int        channelCount = 1;   // aktive Kanaele (1..4)
+
+// ── LED-Task auf Kern 1 ───────────────────────────────────────────────────────
+// Das LED-Rendering laeuft in einem EIGENEN FreeRTOS-Task (Kern 1), damit es
+// unabhaengig vom Haupt-loop() laeuft: haengt der Loop mal, laufen die LEDs
+// weiter -- und ein langsames show() bremst umgekehrt den Loop nicht mehr.
+// BEWUSST Kern 1 (nicht 0): Adafruit_NeoPixel show() sperrt fuer ~4,3ms die
+// Interrupts; auf Kern 0 (Funk-Stack) wuerde das WLAN/BLE stoeren.
+// Ein Mutex serialisiert Task-Rendering gegen die Web-Handler, die Strips neu
+// anlegen/loeschen koennen (sonst Use-after-free waehrend show()).
+static SemaphoreHandle_t ledsMutex      = nullptr;
+static TaskHandle_t      ledsTaskHandle = nullptr;
+static volatile bool     ledsEnabled    = false;
+static volatile int32_t  ledsLatestErpm = 0;
+
+static inline void ledsLock()   { if (ledsMutex) xSemaphoreTake(ledsMutex, portMAX_DELAY); }
+static inline void ledsUnlock() { if (ledsMutex) xSemaphoreGive(ledsMutex); }
 
 static Preferences ledPrefs;
 static WebServer  *ledServer = nullptr;
@@ -226,6 +245,32 @@ void ledsLoop(int32_t erpm) {
   ledsFlushPendingSave();   // verzoegertes NVS-Speichern nach Slider-Aktivitaet
 }
 
+// Vom Haupt-loop() aufgerufen: aktualisiert nur die geteilten Werte (billig).
+// Das eigentliche Rendering macht der LED-Task.
+void ledsUpdateState(bool enabled, int32_t erpm) {
+  ledsEnabled    = enabled;
+  ledsLatestErpm = erpm;
+}
+
+// Der LED-Task: rendert unter Mutex, unabhaengig vom Haupt-loop().
+static void ledsTaskFn(void *) {
+  for (;;) {
+    if (ledsEnabled) {
+      ledsLock();
+      ledsLoop(ledsLatestErpm);
+      ledsUnlock();
+    }
+    vTaskDelay(pdMS_TO_TICKS(5));   // ~ Frame-Granularitaet, gibt CPU frei
+  }
+}
+
+// Startet den LED-Task auf Kern 1 (einmalig). Nach ledsSetup() aufrufen.
+void ledsStartTask() {
+  if (ledsTaskHandle) return;   // schon gestartet
+  xTaskCreatePinnedToCore(ledsTaskFn, "ledsTask", 4096, nullptr, 1,
+                          &ledsTaskHandle, 1 /* Kern 1 */);
+}
+
 // Schaltet alle Kanaele hart aus. Vor Neustart/OTA aufrufen, damit die LEDs
 // nicht im letzten Frame haengen bleiben. Setzt auch effect=0 im RAM, damit
 // ein evtl. noch laufender ledsLoop() nichts mehr zeichnet.
@@ -233,6 +278,7 @@ void ledsOff() {
   // Ausstehende (debounced) Speicherung noch schnell schreiben, sonst gingen
   // gerade geschobene Werte beim folgenden Reboot/OTA verloren.
   if (ledSavePending) { ledSavePending = false; ledsSaveConfig(); }
+  ledsLock();   // kein paralleles show()/Zugriff vom Task waehrend Abschalten
   for (int i = 0; i < LED_MAX_CHANNELS; i++) {
     ch[i].effect = 0;
     if (ch[i].strip) {
@@ -240,6 +286,7 @@ void ledsOff() {
       ch[i].strip->show();
     }
   }
+  ledsUnlock();
 }
 
 // ── Zielkanaele aufloesen ─────────────────────────────────────────────────────
@@ -262,7 +309,7 @@ static const char LEDS_PAGE_HTML[] PROGMEM = R"ledslit(
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>🛴 LED Steuerung</title>
+  <title>LEDs</title>
   <link rel="stylesheet" href="/style.css">
   <style>
     input[type=range]{width:100%;accent-color:var(--accent);margin-top:6px}
@@ -489,6 +536,9 @@ void ledsSetup(WebServer *server) {
   ledServer = server;
   if (!ledServer) return;
 
+  // Mutex fuer die Serialisierung Task <-> Web-Handler zuerst anlegen.
+  if (!ledsMutex) ledsMutex = xSemaphoreCreateMutex();
+
   ledsLoadConfig();
   // WICHTIG: Nach jedem Neustart sollen die LEDs AUS sein, nie der letzte
   // Effekt. Deshalb effect aller Kanaele auf 0 (Aus) zwingen und die Strips
@@ -529,6 +579,7 @@ void ledsSetup(WebServer *server) {
     if (ledServer->hasArg("n")) {
       int n = ledServer->arg("n").toInt();
       if (n < 1) n = 1; if (n > LED_MAX_CHANNELS) n = LED_MAX_CHANNELS;
+      ledsLock();   // gegen Task-show() waehrend delete/realloc schuetzen
       if (n < channelCount) {
         for (int i = n; i < channelCount; i++) {
           if (ch[i].strip) { ch[i].strip->clear(); ch[i].strip->show();
@@ -539,6 +590,7 @@ void ledsSetup(WebServer *server) {
       channelCount = n;
       if (n > old) for (int i = old; i < n; i++) { initStripFor(i); applyChannel(i); }
       ledsSaveConfig();
+      ledsUnlock();
     }
     ledServer->send(200, "text/plain", "OK");
   });
@@ -630,7 +682,9 @@ void ledsSetup(WebServer *server) {
     }
     clampAll();
     ledsSaveConfig();
+    ledsLock();   // gegen Task-show() waehrend Strip-Reinit schuetzen
     for (int i = 0; i < channelCount; i++) { initStripFor(i); applyChannel(i); }
+    ledsUnlock();
     ledServer->send(200, "text/plain", "OK");
   });
 

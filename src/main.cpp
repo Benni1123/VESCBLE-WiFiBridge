@@ -5,6 +5,7 @@
 #include <WiFi.h>
 #include <esp_wifi.h>          // esp_wifi_set_config (Beacon-Intervall, AP-Feintuning)
 #include <esp_netif.h>         // DHCP-Server stoppen/konfigurieren/starten + Lease-Option
+#include <esp_netif_sta_list.h>// IP eines am AP verbundenen Clients ermitteln
 #include <WiFiAP.h>
 #include <WiFiMulti.h>
 #include <WebServer.h>
@@ -29,6 +30,13 @@
 // gewuenschte DNS gerade zickt. Reihenfolge: Google, dann Cloudflare.
 #define FALLBACK_DNS_PRIMARY   IPAddress(8,8,8,8)
 #define FALLBACK_DNS_SECONDARY IPAddress(1,1,1,1)
+
+// AP-IP der Bridge. Bewusst NICHT der uebliche Default 192.168.4.1 (den nutzen
+// viele ESP-Projekte und Geraete -> Kollisionsgefahr). 192.168.9.1 ist selten
+// belegt und kollidiert nicht mit den 10er-Netzen im Setup. Subnetz 255.255.255.0.
+#define AP_IP      IPAddress(192, 168, 9, 1)
+#define AP_GATEWAY IPAddress(192, 168, 9, 1)
+#define AP_SUBNET  IPAddress(255, 255, 255, 0)
 
 // Setzt die statische IP-Konfig inkl. DNS-Fallback. Gewuenschter DNS wird
 // primaer gesetzt, ein fester oeffentlicher DNS sekundaer -> faellt der primaere
@@ -106,6 +114,12 @@ void loadConfig() {
   cfg_ap_timeout  = prefs.getInt   ("ap_timeout",  0);
   cfg_update_url  = prefs.getString("update_url",  DEFAULT_UPDATE_URL);
   cfg_version_url = prefs.getString("version_url", DEFAULT_VERSION_URL);
+  // Reparatur bereits gespeicherter, durch \/ -Escaping beschaedigter URLs
+  // (kamen von einer aelteren App-Version mit org.json). Eine gueltige URL hat
+  // NIE einen Backslash -> \/ zurueck zu / wandeln. Ohne dies wuerde die alte
+  // kaputte URL aus dem NVS weiter verwendet, bis manuell neu gespeichert wird.
+  cfg_update_url.replace("\\/", "/");
+  cfg_version_url.replace("\\/", "/");
   cfg_rx_pin      = prefs.getInt   ("rx_pin",      VESC_RX_PIN);
   cfg_tx_pin      = prefs.getInt   ("tx_pin",      VESC_TX_PIN);
   cfg_autoreboot         = prefs.getBool("autoreboot",       false);
@@ -258,6 +272,51 @@ static bool          staWasConnected   = false;
 // Zeitpunkt, seit dem wir durchgehend KEIN bekanntes Netz verbinden konnten.
 static unsigned long staDownSince      = 0;     // 0 = aktuell verbunden/ok
 static const unsigned long STA_HARD_RESTART_MS = 150000;  // 2,5 Min
+
+// Exponentielles Backoff fuer die STA-Suche. Jeder Scan stoert den AP kurz
+// (die Funkeinheit huepft durch alle Kanaele -> AP in der Zeit nicht erreichbar).
+// Unterwegs (kein Heimnetz in Reichweite) wuerde staendiges Scannen den AP
+// dauernd stoeren. Darum: findet ein Scan KEIN bekanntes Netz, wird der Abstand
+// bis zum naechsten Scan verdoppelt (bis STA_SCAN_MAX_MS). Sobald ein Netz
+// gefunden wird, zurueck auf das Minimum -> heimkommen wird zuegig erkannt.
+static const unsigned long STA_SCAN_MIN_MS = 10000;   // 10 s (Start/nach Fund)
+static const unsigned long STA_SCAN_MAX_MS = 60000;   // 60 s (unterwegs)
+static unsigned long staScanInterval  = STA_SCAN_MIN_MS;
+
+// Non-blocking STA-Verbindungsaufbau: statt bis zu 8s zu blockieren (in denen der
+// AP steht), wird die Verbindung angestossen und der Status in den folgenden
+// Loop-Durchlaeufen gepollt. Der AP laeuft dabei ununterbrochen weiter.
+static bool          staConnecting     = false;   // Verbindung laeuft gerade
+static unsigned long staConnectStart   = 0;       // Startzeitpunkt des Versuchs
+static int           staConnectFails   = 0;       // fehlgeschlagene Versuche
+static const unsigned long STA_CONNECT_TIMEOUT_MS = 8000;
+
+// ── Diagnose-Zaehler (im Info-Tab der WebUI ablesbar) ─────────────────────────
+// Damit laesst sich ohne Serial-Log (ESP im Scooter) sehen, was im Funk-Betrieb
+// passiert: wie oft gescannt/verbunden/getrennt wird, wie oft der AP-Watchdog
+// eingreift, wie lange der laengste Loop-Durchlauf war (Blockade-Indikator) und
+// der Speicher-Tiefstand. Zusammen ergeben sie ein Bild statt Raterei.
+static uint32_t      diagScanCount       = 0;   // gestartete STA-Scans
+static uint32_t      diagStaConnects     = 0;   // erfolgreiche STA-Verbindungen
+static uint32_t      diagStaDisconnects  = 0;   // STA-Verbindungsabbrueche
+static uint32_t      diagApClientConn    = 0;   // AP-Client-Verbindungen (Handy)
+static uint32_t      diagApClientDisc    = 0;   // AP-Client-Trennungen
+static uint32_t      diagApWatchdogFires = 0;   // AP-Watchdog-Eingriffe (SSID weg)
+static uint8_t       diagLastDiscReason  = 0;   // letzter STA-Disconnect-Grund
+static unsigned long diagMaxLoopUs       = 0;   // laengster Loop-Durchlauf (us)
+static unsigned long diagLoopWindowStart = 0;   // Fenster-Start fuer Loop-Freq
+static uint32_t      diagLoopWindowCount = 0;   // Loops im aktuellen Fenster
+static uint32_t      diagLoopsPerSec     = 0;   // zuletzt gemessene Loop-Frequenz
+static uint32_t      diagMinHeap         = 0xFFFFFFFF;  // niedrigster freier Heap
+static uint32_t      diagProbeReqs       = 0;   // empfangene Probe-Requests (Handy funkt AP an)
+static int           diagLastProbeRssi   = 0;   // RSSI des letzten Probe-Requests
+
+// Nachlauf-Sperre: nachdem der letzte AP-Client weg ist, wird noch fuer
+// STA_SUPPRESS_AFTER_AP_MS KEIN STA-Scan gestartet. Verhindert, dass direkt
+// nach dem Trennen sofort wieder ein storender Scan kommt (und gibt einem
+// direkt erneut verbindenden Geraet Ruhe). 0 = keine Sperre aktiv.
+static unsigned long apClientGoneAt        = 0;
+static const unsigned long STA_SUPPRESS_AFTER_AP_MS = 20000;   // 20 s Nachlauf
 
 // ── Roaming-State ─────────────────────────────────────────────────────────────
 static unsigned long lastRssiCheck     = 0;
@@ -858,6 +917,7 @@ function loadInfo(){
       (d.mode!=='ap'?'<div class="info-row"><span>RSSI</span><span class="info-val">'+d.rssi+' dBm</span></div>':'')+
       '<div class="info-row"><span>Free RAM</span><span class="info-val">'+(d.heap>=1024?(d.heap/1024).toFixed(1)+' KB':d.heap+' B')+'</span></div>'+
       '<div class="info-row"><span>AP</span><span class="info-val" style="color:'+(d.ap_active?'var(--ok)':'var(--text3)')+'">'+( d.ap_active?(de()?'Aktiv':'Active'):(de()?'Aus':'Off'))+(d.ap_active?' ('+d.ap_ip+')':'')+'</span></div>'+
+      (d.ap_client_ip?'<div class="info-row"><span>'+(de()?'AP-Client IP':'AP client IP')+'</span><span class="info-val">'+d.ap_client_ip+'</span></div>':'')+
       (d.ap_active&&d.ap_timeout_remaining>=0?'<div class="info-row"><span>'+(de()?'AP aus in':'AP off in')+'</span><span class="info-val">'+d.ap_timeout_remaining+'s</span></div>':'')+
       (d.ap_active&&d.ap_timeout_remaining===-2?'<div class="info-row"><span>'+(de()?'AP aus in':'AP off in')+'</span><span class="info-val">'+(de()?'pausiert (Client verbunden)':'paused (client connected)')+'</span></div>':'')+
       '<div class="info-row"><span>TCP Port</span><span class="info-val">'+d.port+'</span></div>'+
@@ -870,7 +930,17 @@ function loadInfo(){
       '<div class="info-row" style="'+(d.vesc_connected?'':'opacity:0.4')+'"><span>'+(de()?'Fehlercode':'Fault')+'</span><span class="info-val" style="color:'+(d.vesc_fault===0?'#81c784':'#e57373')+'">'+(d.vesc_fault_str||'OK')+'</span></div>'+
       '<div class="info-row" style="'+(d.vesc_connected?'':'opacity:0.4')+'"><span>ERPM</span><span class="info-val">'+d.vesc_erpm+'</span></div>'+
       '<div class="info-row"><span>Uptime</span><span class="info-val">'+d.uptime+'</span></div>'+
-      '<div class="info-row"><span>Build</span><span class="info-val">'+d.build+'</span></div>';
+      '<div class="info-row"><span>Build</span><span class="info-val">'+d.build+'</span></div>'+
+      '<div style="margin:10px 0 6px;font-size:11px;color:#666;text-transform:uppercase;letter-spacing:1px">'+(de()?'Diagnose (WLAN/Loop)':'Diagnostics (WiFi/Loop)')+'</div>'+
+      '<div class="info-row"><span>'+(de()?'STA-Scans':'STA scans')+'</span><span class="info-val">'+d.diag_scans+'</span></div>'+
+      '<div class="info-row"><span>'+(de()?'STA verbunden':'STA connects')+'</span><span class="info-val">'+d.diag_sta_conn+'</span></div>'+
+      '<div class="info-row"><span>'+(de()?'STA Abbrueche':'STA disconnects')+'</span><span class="info-val" style="color:'+(d.diag_sta_disc>0?'#e0a030':'var(--text2)')+'">'+d.diag_sta_disc+(d.diag_sta_disc>0?' ('+(de()?'Grund':'reason')+' '+d.diag_disc_reason+')':'')+'</span></div>'+
+      '<div class="info-row"><span>'+(de()?'AP-Client verb./getr.':'AP client conn/disc')+'</span><span class="info-val">'+d.diag_ap_conn+' / '+d.diag_ap_disc+'</span></div>'+
+      '<div class="info-row"><span>'+(de()?'AP-Watchdog Eingriffe':'AP watchdog fires')+'</span><span class="info-val" style="color:'+(d.diag_wd_fires>0?'#e0a030':'var(--text2)')+'">'+d.diag_wd_fires+'</span></div>'+
+      '<div class="info-row"><span>'+(de()?'Loop max (ms)':'Loop max (ms)')+'</span><span class="info-val" style="color:'+(d.diag_loop_max_us>50000?'#e57373':(d.diag_loop_max_us>10000?'#e0a030':'var(--ok)'))+'">'+(d.diag_loop_max_us/1000).toFixed(1)+'</span></div>'+
+      '<div class="info-row"><span>'+(de()?'Loops/Sek':'Loops/sec')+'</span><span class="info-val">'+d.diag_loops_per_sec+'</span></div>'+
+      '<div class="info-row"><span>'+(de()?'Heap-Tiefstand':'Min free heap')+'</span><span class="info-val">'+(d.diag_min_heap>=1024?(d.diag_min_heap/1024).toFixed(1)+' KB':d.diag_min_heap+' B')+'</span></div>'+
+      '<div class="info-row"><span>'+(de()?'Probe-Requests (RSSI)':'Probe requests (RSSI)')+'</span><span class="info-val">'+d.diag_probe_reqs+(d.diag_probe_reqs>0?' ('+d.diag_probe_rssi+' dBm)':'')+'</span></div>';
   }).catch(function(){document.getElementById('infoContent').innerHTML='<div style="color:#e57373;font-size:13px">'+(de()?'Fehler':'Error')+'</div>';});
 }
 loadInfo();
@@ -1151,21 +1221,44 @@ function startUpload(){
 
 // ── Web handlers ──────────────────────────────────────────────────────────────
 void handleCaptivePortal() {
-  otaServer.sendHeader("Location", "http://192.168.4.1/", true);
+  String loc = "http://" + WiFi.softAPIP().toString() + "/";
+  otaServer.sendHeader("Location", loc, true);
   otaServer.send(302, "text/plain", "");
 }
 
 bool isCaptivePortalRequest() {
   String host = otaServer.hostHeader();
   IPAddress clientIP = otaServer.client().remoteIP();
-  if (clientIP[0]==192 && clientIP[1]==168 && clientIP[2]==4)
-    return (host != "192.168.4.1" && host != cfg_hostname + ".local");
+  IPAddress apIP     = WiFi.softAPIP();
+  // Client im AP-Subnetz? (erste drei Oktette gleich der AP-IP)
+  if (clientIP[0]==apIP[0] && clientIP[1]==apIP[1] && clientIP[2]==apIP[2])
+    return (host != apIP.toString() && host != cfg_hostname + ".local");
   return false;
 }
 
 void handlePage() {
   if (isCaptivePortalRequest()) { handleCaptivePortal(); return; }
   otaServer.send(200, "text/html", PAGE_HTML);
+}
+
+// Liefert die IP-Adresse des ersten am AP verbundenen Clients (Handy) als String,
+// oder "" wenn keiner verbunden ist / die IP noch nicht per DHCP vergeben wurde.
+// Zweistufig: Stationen holen (MAC), dann ueber esp_netif auf DHCP-IPs mappen.
+static String apClientIp() {
+  if (WiFi.softAPgetStationNum() == 0) return "";
+  wifi_sta_list_t staList;
+  if (esp_wifi_ap_get_sta_list(&staList) != ESP_OK) return "";
+  esp_netif_sta_list_t netifList;
+  if (esp_netif_get_sta_list(&staList, &netifList) != ESP_OK) return "";
+  for (int i = 0; i < netifList.num; i++) {
+    esp_ip4_addr_t ip = netifList.sta[i].ip;
+    if (ip.addr != 0) {   // gueltige (bereits vergebene) IP
+      char buf[16];
+      esp_ip4addr_ntoa(&ip, buf, sizeof(buf));
+      return String(buf);
+    }
+  }
+  return "";   // verbunden, aber noch keine IP vergeben
 }
 
 void handleApiInfo() {
@@ -1188,6 +1281,7 @@ void handleApiInfo() {
     }
   } else json += "\"ap_timeout_remaining\":-1,";
   json += "\"ap_ip\":\""+WiFi.softAPIP().toString()+"\",";
+  json += "\"ap_client_ip\":\""+apClientIp()+"\",";
   json += "\"heap\":"+String(ESP.getFreeHeap())+",";
   json += "\"uptime\":\""+uptime+"\",";
   json += "\"build\":\""+String(FIRMWARE_VERSION)+" ("+String(__DATE__)+" "+String(__TIME__)+")\",";
@@ -1201,6 +1295,19 @@ void handleApiInfo() {
   json += "\"vesc_fault\":"+String(vescStatus.faultCode)+",";
   json += "\"vesc_erpm\":"+String(vescStatus.erpm)+",";
   json += "\"vesc_fault_str\":\""+vescFaultToString(vescStatus.faultCode)+"\",";
+  // ── Diagnose-Zaehler ──
+  json += "\"diag_scans\":"+String(diagScanCount)+",";
+  json += "\"diag_sta_conn\":"+String(diagStaConnects)+",";
+  json += "\"diag_sta_disc\":"+String(diagStaDisconnects)+",";
+  json += "\"diag_disc_reason\":"+String(diagLastDiscReason)+",";
+  json += "\"diag_ap_conn\":"+String(diagApClientConn)+",";
+  json += "\"diag_ap_disc\":"+String(diagApClientDisc)+",";
+  json += "\"diag_wd_fires\":"+String(diagApWatchdogFires)+",";
+  json += "\"diag_loop_max_us\":"+String(diagMaxLoopUs)+",";
+  json += "\"diag_loops_per_sec\":"+String(diagLoopsPerSec)+",";
+  json += "\"diag_min_heap\":"+String(diagMinHeap==0xFFFFFFFF?0:diagMinHeap)+",";
+  json += "\"diag_probe_reqs\":"+String(diagProbeReqs)+",";
+  json += "\"diag_probe_rssi\":"+String(diagLastProbeRssi)+",";
   if (WiFi.status() != WL_CONNECTED) {
     json += "\"mode\":\"ap\",\"ip\":\""+WiFi.softAPIP().toString()+"\"";
   } else {
@@ -1254,8 +1361,25 @@ void handleApiConfigPost() {
     String s = "\""+key+"\":\"";
     int st = body.indexOf(s); if (st<0) return "";
     st += s.length();
-    int en = body.indexOf("\"", st);
-    return en<0 ? "" : body.substring(st, en);
+    // Bis zum naechsten UNESCAPTEN Anfuehrungszeichen lesen (ein \" gehoert
+    // noch zum Wert). Sonst wuerde ein escaptes " den Wert zu frueh abschneiden.
+    int en = st;
+    while (en < (int)body.length()) {
+      char c = body.charAt(en);
+      if (c == '"' ) break;                       // Ende des Strings
+      if (c == '\\' && en + 1 < (int)body.length()) en++;  // escaptes Zeichen ueberspringen
+      en++;
+    }
+    if (en >= (int)body.length()) return "";
+    String v = body.substring(st, en);
+    // JSON-Escapes zuruecknehmen. WICHTIG: \/ -> / (Androids org.json escaped
+    // Slashes -> sonst landen Backslashes in URLs und der Hostname wird kaputt).
+    v.replace("\\/", "/");
+    v.replace("\\\"", "\"");
+    v.replace("\\n", "\n");
+    v.replace("\\t", "\t");
+    v.replace("\\\\", "\\");   // zuletzt: doppelter Backslash -> einer
+    return v;
   };
   auto parseInt2 = [&](String key, int def) -> int {
     String s = "\""+key+"\":";
@@ -1361,6 +1485,11 @@ void handleOTAFinish() {
 void handleApiUpdateCheck() {
   if (WiFi.status()!=WL_CONNECTED){otaServer.send(400,"application/json","{\"error\":\"WiFi only\"}");return;}
   if (cfg_version_url.isEmpty()){otaServer.send(400,"application/json","{\"error\":\"No URL\"}");return;}
+
+  // Sicherheitshalber die URL saeubern: eine gueltige URL hat nie einen
+  // Backslash. So schlaegt der Check nicht mehr an einer \/ -verunstalteten
+  // URL fehl ("DNS Failed for \\"), egal wie sie in cfg_version_url kam.
+  cfg_version_url.replace("\\/", "/");
 
   // Der Check scheitert sporadisch, weil die TLS-Verbindung zu GitHub (mehrstufige
   // Redirect-Kette, je eigener Handshake) auf dem ESP mal RAM-/Funk-bedingt nicht
@@ -1504,6 +1633,7 @@ void setupWebServer() {
 
   // LED-Modul: registriert /leds (und spaeter LED-API) am Hauptserver.
   ledsSetup(&otaServer);
+  ledsStartTask();   // LED-Rendering in eigenen Task auf Kern 1 auslagern
 
   otaServer.begin();
   emergencyServer.begin();
@@ -1554,7 +1684,7 @@ class MyCallbacks : public BLECharacteristicCallbacks {
 // Fängt alle relevanten WiFi-Events ab. Der entscheidende Punkt für deinen Bug:
 // bei STA_DISCONNECTED darf der AP NICHT mitsterben. Wir setzen den Mode hart
 // zurück und ziehen den AP sofort wieder hoch, falls er gefallen ist.
-void onWiFiEvent(WiFiEvent_t event) {
+void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
   switch (event) {
     case ARDUINO_EVENT_WIFI_STA_CONNECTED:
       Serial.println("[evt] STA connected");
@@ -1562,6 +1692,7 @@ void onWiFiEvent(WiFiEvent_t event) {
 
     case ARDUINO_EVENT_WIFI_STA_GOT_IP:
       Serial.printf("[evt] STA got IP: %s\n", WiFi.localIP().toString().c_str());
+      diagStaConnects++;                    // Diagnose: erfolgreiche STA-Verbindung
       staWasConnected = true;
       // Kein ensureAP() hier (Reentranz vermeiden). Falls der STA-Connect den
       // AP-Channel verschoben hat, korrigiert der Watchdog im loop() das
@@ -1573,6 +1704,8 @@ void onWiFiEvent(WiFiEvent_t event) {
       // STA hat die Verbindung verloren. Die IDF räumt intern auf — dabei darf
       // der AP NICHT verschwinden. Mode hart auf AP_STA halten und AP prüfen.
       Serial.println("[evt] STA disconnected — protecting AP");
+      diagStaDisconnects++;                                 // Diagnose: Abbruch zaehlen
+      diagLastDiscReason = info.wifi_sta_disconnected.reason;// Diagnose: Grund merken
       // WLAN ist weg -> der AP wird als Zugang wieder gebraucht, auch wenn ein
       // vorheriger AP-Timeout ihn abgeschaltet hatte. apWanted reaktivieren.
       // WICHTIG: hier KEIN ensureAP() aufrufen (Reentranz -> Event-Schleife).
@@ -1601,10 +1734,22 @@ void onWiFiEvent(WiFiEvent_t event) {
 
     case ARDUINO_EVENT_WIFI_AP_STACONNECTED:
       Serial.println("[evt] AP: station connected");
+      diagApClientConn++;                   // Diagnose: Handy hat sich am AP verbunden
       break;
 
     case ARDUINO_EVENT_WIFI_AP_STADISCONNECTED:
       Serial.println("[evt] AP: station disconnected");
+      diagApClientDisc++;                   // Diagnose: Handy hat AP verlassen
+      // War das der LETZTE Client? Dann Nachlauf-Sperre starten: die naechsten
+      // STA_SUPPRESS_AFTER_AP_MS wird nicht gescannt (kein sofortiger Stoerscan).
+      if (WiFi.softAPgetStationNum() == 0) apClientGoneAt = millis();
+      break;
+
+    case ARDUINO_EVENT_WIFI_AP_PROBEREQRECVED:
+      // Ein Geraet funkt den AP an (Probe-Request). Zaehlen + RSSI merken.
+      // Damit laesst sich unterscheiden: Handy erreicht den AP ueberhaupt?
+      diagProbeReqs++;
+      diagLastProbeRssi = info.wifi_ap_probereqrecved.rssi;
       break;
 
     default:
@@ -1632,10 +1777,14 @@ static void tuneApDhcp() {
   // DHCP-Server stoppen (Pflicht, bevor Optionen gesetzt werden duerfen).
   esp_netif_dhcps_stop(ap);
 
-  // Lease-Zeit verkuerzen. Einheit der dhcps-Lease ist "Minuten-Bloecke"
-  // (lease_time * 60s). Default ist sehr lang; 2 reicht im AP-Betrieb voellig
-  // und laesst alte Leases schnell verfallen -> fluessigere Neuverbindungen.
-  uint32_t leaseMinutes = 2;
+  // Lease-Zeit LANG setzen (120 Min). Grund: Das Handy erneuert den Lease bei
+  // der Haelfte der Zeit im Hintergrund. Eine kurze Lease (frueher 2 Min ->
+  // Renew jede Minute) bedeutet staendige DHCP-Pakete, und JEDER Renew ist eine
+  // Gelegenheit fuer Paketverlust unter Funklast -> Abbruch / "Verbindungsfehler".
+  // Eine lange Lease heisst: einmal IP holen, dann lange Ruhe -> deutlich weniger
+  // DHCP-Verkehr und damit weniger Abbrueche. (Die Geschwindigkeit des ERSTEN
+  // IP-Bezugs haengt nicht an der Lease-Dauer, sondern am Paketverlust selbst.)
+  uint32_t leaseMinutes = 120;
   esp_netif_dhcps_option(ap, ESP_NETIF_OP_SET, ESP_NETIF_IP_ADDRESS_LEASE_TIME,
                          &leaseMinutes, sizeof(leaseMinutes));
 
@@ -1668,7 +1817,14 @@ static void tuneApDhcp() {
   // den Update-Check zu stoeren -- Ursache war aber DNS, daher wieder aktiv.)
   esp_wifi_set_max_tx_power(80);
 
-  Serial.println("AP tune: ps=MIN_MODEM (BT-Koexistenz), TX-power max");
+  // WiFi-Protokoll explizit auf 802.11 B/G/N setzen (statt IDF-Default). B als
+  // Basis macht Beacons/Management-Frames mit der robustesten Modulation --
+  // manche Handys verbinden sich damit zuverlaessiger, gerade bei schwachem
+  // Signal oder Stoerungen. Kostet nichts, N bleibt fuer den Datendurchsatz.
+  esp_wifi_set_protocol(WIFI_IF_AP,
+      WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
+
+  Serial.println("AP tune: ps=MIN_MODEM (BT-Koexistenz), TX-power max, proto=BGN");
 }
 
 bool ensureAP(bool force) {
@@ -1731,6 +1887,9 @@ bool ensureAP(bool force) {
   // obwohl noch keine gueltige IP da ist.
   bool ok = false;
   for (int attempt = 1; attempt <= 5; attempt++) {
+    // AP-IP explizit setzen (sonst waere es der Arduino-Default 192.168.4.1).
+    // Muss VOR softAP() aufgerufen werden.
+    WiFi.softAPConfig(AP_IP, AP_GATEWAY, AP_SUBNET);
     ok = WiFi.softAP(cfg_ap_ssid.c_str(), pass, ch, 0, 4);
     delay(150);  // Stack Zeit geben, den AP wirklich hochzufahren
     IPAddress ip = WiFi.softAPIP();
@@ -1886,6 +2045,13 @@ static void parseGetValues(const uint8_t *payload, size_t len) {
 
 static unsigned long lastVescPoll = 0;
 static std::string   vescPollBuffer;
+// Non-blocking Poll-State-Machine: nicht mehr bis zu 100ms in pollVesc()
+// blockieren (das wuerde den Webserver/handleClient ausbremsen -> ESP zeitweise
+// nicht erreichbar). Stattdessen Anfrage senden und die Antwort ueber mehrere
+// loop()-Durchlaeufe hinweg einsammeln.
+static bool          vescPollWaiting  = false;   // warten wir gerade auf Antwort?
+static unsigned long vescPollSentAt   = 0;       // wann wurde die Anfrage gesendet?
+static const unsigned long VESC_POLL_RESP_TIMEOUT_MS = 100;
 
 bool webUiActive() {
   return (millis() - lastBrowserPing < 5000);
@@ -1897,48 +2063,55 @@ void pollVesc() {
   if (wifiClient && wifiClient.connected()) return;
   if (deviceConnected) return;
 
+  // ── Antwort-Phase: warten wir bereits auf eine VESC-Antwort? ──────────────
+  // Non-blocking: jeden loop()-Durchlauf die verfuegbaren UART-Bytes einsammeln,
+  // NICHT blockierend warten. Fertig, sobald das Endbyte (0x03) da ist oder der
+  // Timeout abgelaufen ist. Waehrenddessen laeuft der Webserver ungestoert weiter.
+  if (vescPollWaiting) {
+    while (Serial1.available()) {
+      vescPollBuffer.push_back(Serial1.read());
+    }
+    bool complete = (vescPollBuffer.size() > 5 && vescPollBuffer.back() == 0x03);
+    bool timedOut = (now - vescPollSentAt >= VESC_POLL_RESP_TIMEOUT_MS);
+    if (!complete && !timedOut) return;   // weiter sammeln, spaeter erneut rein
+
+    // Auswertung (identisch zur frueheren blockierenden Version).
+    if (vescPollBuffer.size() > 5 && vescPollBuffer[0] == 0x02 && vescPollBuffer.back() == 0x03) {
+      uint8_t plen = vescPollBuffer[1];
+      if (cfg_debug && (cfg_debug_filter & 4)) { String h="POLL<=VESC: ";for(size_t i=0;i<min(vescPollBuffer.size(),(size_t)40);i++){char x[4];snprintf(x,4,"%02X ",(uint8_t)vescPollBuffer[i]);h+=x;} uartLogAdd(h); }
+      if (vescPollBuffer.size() >= (size_t)(plen + 4)) {
+        parseGetValues((const uint8_t*)vescPollBuffer.data() + 2, plen);
+      }
+    } else {
+      if (cfg_debug && (cfg_debug_filter & 4)) uartLogAdd("POLL<=VESC: no response ("+String(vescPollBuffer.size())+" bytes)");
+      if (now - vescStatus.lastUpdate > 6000) {
+        vescStatus.connected = false;
+      }
+    }
+    vescPollWaiting = false;   // Zyklus abgeschlossen
+    return;
+  }
+
+  // ── Anfrage-Phase: pruefen, ob ueberhaupt gepollt werden soll ─────────────
   // Eine bewegungs-abhaengige Funktion (BLE-Auto / AP-Wake-on-Move) braucht
   // ERPM ZWINGEND — auch wenn der normale "VESC Daten auslesen"-Haken aus ist.
-  // Deshalb wird needErpmForWake VOR der cfg_vesc_poll-Pruefung ausgewertet.
   bool needErpmForWake = (cfg_ble_mode == 2) || cfg_ap_wake_on_move;
-
-  // Wenn weder die Wake-Funktion noch das normale Polling aktiv sind, abbrechen.
   if (!cfg_vesc_poll && !needErpmForWake) return;
 
-  // Polling laeuft wenn Web-UI offen ODER Auto-Poll aktiviert ODER Wake-Funktion.
   bool autoPollActive  = cfg_autopoll_enabled || needErpmForWake;
   bool uiActive        = webUiActive();
   if (!uiActive && !autoPollActive) return;
-  // Intervall: bei aktiver UI fest 3s, sonst Auto-Poll-Intervall.
+
   unsigned long pollInterval = uiActive ? 3000UL : (unsigned long)cfg_autopoll_interval * 1000UL;
   if (now - lastVescPoll < pollInterval) return;
   lastVescPoll = now;
 
+  // Anfrage senden und in die Antwort-Phase wechseln (KEIN blockierendes Warten).
   Serial1.write(VESC_GET_VALUES_PKT, sizeof(VESC_GET_VALUES_PKT));
   if (cfg_debug && (cfg_debug_filter & 4)) uartLogAdd("POLL=>VESC: 02 01 04 40 84 03");
-
-  unsigned long start = millis();
   vescPollBuffer.clear();
-  while (millis() - start < 100) {
-    while (Serial1.available()) {
-      vescPollBuffer.push_back(Serial1.read());
-    }
-    if (vescPollBuffer.size() > 5 && vescPollBuffer.back() == 0x03) break;
-    delay(2);
-  }
-
-  if (vescPollBuffer.size() > 5 && vescPollBuffer[0] == 0x02 && vescPollBuffer.back() == 0x03) {
-    uint8_t plen = vescPollBuffer[1];
-    if (cfg_debug && (cfg_debug_filter & 4)) { String h="POLL<=VESC: ";for(size_t i=0;i<min(vescPollBuffer.size(),(size_t)40);i++){char x[4];snprintf(x,4,"%02X ",(uint8_t)vescPollBuffer[i]);h+=x;} uartLogAdd(h); }
-    if (vescPollBuffer.size() >= (size_t)(plen + 4)) {
-      parseGetValues((const uint8_t*)vescPollBuffer.data() + 2, plen);
-    }
-  } else {
-    if (cfg_debug && (cfg_debug_filter & 4)) uartLogAdd("POLL<=VESC: no response ("+String(vescPollBuffer.size())+" bytes)");
-    if (now - vescStatus.lastUpdate > 6000) {
-      vescStatus.connected = false;
-    }
-  }
+  vescPollSentAt  = now;
+  vescPollWaiting = true;
 }
 
 // ── BLE Mode Handler (An / Aus / Auto) ────────────────────────────────────────
@@ -2174,9 +2347,30 @@ void handleRoaming() {
 void handleWiFiReconnect() {
   if (cfg_wifi.empty()) return;
 
+  unsigned long now = millis();
+
+  // ── Verbunden? ────────────────────────────────────────────────────────────
   if (WiFi.status() == WL_CONNECTED) {
-    // verbunden -> alles gut. Notnagel-Timer zuruecksetzen, Scan aufraeumen.
-    staDownSince = 0;
+    staDownSince    = 0;
+    staScanInterval = STA_SCAN_MIN_MS;
+    if (staConnecting) {
+      // Gerade erfolgreich (non-blocking) verbunden -> abschliessen.
+      staConnecting   = false;
+      staConnectFails = 0;
+      String csid = WiFi.SSID();
+      for (auto &w : cfg_wifi) {
+        if (w.ssid==csid && w.staticIp && w.ip.length()>0) {
+          applyStaticConfig(w.ip, w.gateway, w.subnet, w.dns);
+          break;
+        }
+      }
+      Serial.printf("WiFi connected: %s | IP: %s\n",
+                    WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
+      if (cfg_ble_mode == 1 || (cfg_ble_mode == 2 && bleIsAdvertising)) {
+        NimBLEDevice::startAdvertising();
+      }
+      ensureAP(false);
+    }
     if (scanInProgress) {
       int16_t r = WiFi.scanComplete();
       if (r != WIFI_SCAN_RUNNING) { WiFi.scanDelete(); scanInProgress = false; }
@@ -2184,47 +2378,92 @@ void handleWiFiReconnect() {
     return;
   }
 
-  unsigned long now = millis();
-
-  // Ab jetzt sind wir NICHT verbunden -> Notnagel-Timer starten, falls noch nicht.
-  if (staDownSince == 0) staDownSince = now;
-
-  // ── NOTNAGEL: hartnaeckiger Haenger ───────────────────────────────────────
-  // Wenn wir ueber STA_HARD_RESTART_MS durchgehend nicht verbinden konnten,
-  // ist der STA-Stack/Scan vermutlich verklemmt. Kompletter WLAN-STA-Neustart
-  // (AP bleibt erhalten). Das ersetzt den manuellen Geraete-Neustart.
-  if (now - staDownSince > STA_HARD_RESTART_MS) {
-    Serial.println("WiFi: hard STA stack restart (haengt zu lange)");
-    // laufenden Scan zwangsweise verwerfen
-    WiFi.scanDelete();
-    scanInProgress = false;
-    // STA komplett zuruecksetzen, Funk + AP behalten
-    WiFi.disconnect(true, true);    // STA trennen + gespeicherte STA-Config loeschen
-    delay(300);
-    if (WiFi.getMode() != WIFI_AP_STA) WiFi.mode(WIFI_AP_STA);
-    // wifiMulti komplett neu aufbauen
-    wifiMulti = WiFiMulti();
-    for (auto &n : cfg_wifi) wifiMulti.addAP(n.ssid.c_str(), n.pass.c_str());
-    // AP sicherstellen (der soll den Neustart ueberlebt haben)
-    ensureAP(false);
-    // Timer + Versuchstakt zuruecksetzen, frisch anfangen
-    staDownSince     = now;
-    lastReconnectTry = 0;
+  // ── AP-Client verbunden? -> STA-Suche komplett aussetzen ───────────────────
+  // Sobald ein Client (z.B. dein Handy) am AP haengt, wird JEDE STA-Aktivitaet
+  // (Scannen/Verbinden) gestoppt. Der STA-Scan laesst die Funkeinheit durch alle
+  // Kanaele springen und stoert dabei den AP -> genau das killt sonst DHCP und
+  // Verbindung. Solange also jemand am AP ist, bleibt der AP absolut ungestoert.
+  // (Hinweis: Eine BESTEHENDE Heimnetz-Verbindung wird oben behandelt und bleibt
+  //  erhalten - ein fertiger STA-Link stoert den AP nicht, nur das Suchen tut es.)
+  // Sobald der letzte Client weg ist, laeuft die STA-Suche automatisch weiter.
+  if (WiFi.softAPgetStationNum() > 0) {
+    if (scanInProgress) { WiFi.scanDelete(); scanInProgress = false; }
+    if (staConnecting) {
+      // laufenden (non-blocking) Verbindungsversuch sauber abbrechen
+      staConnecting = false;
+      WiFi.disconnect(false, false);   // STA-Versuch stoppen, AP + Funk behalten
+    }
+    staDownSince     = 0;      // kein Haenger -> Notnagel-Neustart NICHT ausloesen
+    lastReconnectTry = now;    // nach Client-Weggang erst wieder nach Intervall scannen
+    apClientGoneAt   = 0;      // Nachlauf zuruecksetzen (laeuft erst NACH Weggang)
     return;
   }
 
-  // ── Phase 1: kein Scan laeuft -> alle 10s einen ASYNC-Scan anstossen ──────
+  // Nachlauf-Sperre: der letzte AP-Client ist gerade weg. Fuer die naechsten
+  // STA_SUPPRESS_AFTER_AP_MS NICHT scannen -> ein direkt erneut verbindendes
+  // Geraet hat Ruhe, und es kommt kein sofortiger Stoerscan. Danach freigeben.
+  if (apClientGoneAt != 0) {
+    if (now - apClientGoneAt < STA_SUPPRESS_AFTER_AP_MS) {
+      if (scanInProgress) { WiFi.scanDelete(); scanInProgress = false; }
+      staDownSince     = 0;    // kein Haenger -> Notnagel nicht ausloesen
+      lastReconnectTry = now;
+      return;
+    }
+    apClientGoneAt = 0;        // Nachlauf abgelaufen -> normale Suche wieder frei
+  }
+
+  // Ab hier NICHT verbunden und KEIN Client am AP.
+  if (staDownSince == 0) staDownSince = now;
+
+  // ── NOTNAGEL: hartnaeckiger Haenger -> kompletter STA-Stack-Neustart ───────
+  if (now - staDownSince > STA_HARD_RESTART_MS) {
+    Serial.println("WiFi: hard STA stack restart (haengt zu lange)");
+    WiFi.scanDelete();
+    scanInProgress = false;
+    staConnecting  = false;
+    WiFi.disconnect(true, true);
+    delay(300);
+    if (WiFi.getMode() != WIFI_AP_STA) WiFi.mode(WIFI_AP_STA);
+    wifiMulti = WiFiMulti();
+    for (auto &n : cfg_wifi) wifiMulti.addAP(n.ssid.c_str(), n.pass.c_str());
+    ensureAP(false);
+    staDownSince     = now;
+    lastReconnectTry = 0;
+    staScanInterval  = STA_SCAN_MIN_MS;
+    return;
+  }
+
+  // ── Phase VERBINDET: non-blocking Verbindungsaufbau laeuft -> Status pollen ─
+  // Kein blockierendes Warten! Der AP wird waehrenddessen normal weiter bedient.
+  if (staConnecting) {
+    if (now - staConnectStart > STA_CONNECT_TIMEOUT_MS) {
+      // Timeout -> Versuch abbrechen.
+      staConnecting = false;
+      staConnectFails++;
+      Serial.printf("WiFi: connect timeout (fail #%d)\n", staConnectFails);
+      lastReconnectTry = now;   // Pause bis zum naechsten Scan
+      if (staConnectFails >= 3) {
+        Serial.println("WiFi: hard STA reset after repeated failures");
+        WiFi.disconnect(false, false);
+        delay(200);
+        wifiMulti = WiFiMulti();
+        for (auto &n : cfg_wifi) wifiMulti.addAP(n.ssid.c_str(), n.pass.c_str());
+        staConnectFails = 0;
+      }
+    }
+    return;   // solange nicht verbunden/timeout -> weiter pollen (AP laeuft)
+  }
+
+  // ── Phase 1: kein Scan laeuft -> nach staScanInterval einen ASYNC-Scan ─────
   if (!scanInProgress) {
-    if (now - lastReconnectTry < 10000) return;
+    if (now - lastReconnectTry < staScanInterval) return;
     lastReconnectTry = now;
     int16_t started = WiFi.scanNetworks(true, true);   // async, inkl. hidden
-    // Bei erfolgreichem Start liefert der async-Scan WIFI_SCAN_RUNNING.
     if (started == WIFI_SCAN_RUNNING) {
+      diagScanCount++;                 // Diagnose: gestarteten Scan zaehlen
       scanInProgress = true;
       scanStartTime  = now;
     } else {
-      // Jeder andere Rueckgabewert (z.B. WIFI_SCAN_FAILED, oder ein bereits
-      // verklemmter Scan-Zustand) -> hart raeumen, beim naechsten Mal neu.
       WiFi.scanDelete();
       scanInProgress = false;
     }
@@ -2235,62 +2474,54 @@ void handleWiFiReconnect() {
   int16_t res = WiFi.scanComplete();
 
   if (res == WIFI_SCAN_RUNNING) {
-    // Sicherheits-Timeout: nach 12s den Scan-Zustand HART zuruecksetzen, damit
-    // ein neuer Scan garantiert starten kann (gegen verklemmten Scan-Zustand).
     if (now - scanStartTime > 12000) {
       Serial.println("WiFi: scan timeout -> reset scan state");
       WiFi.scanDelete();
       scanInProgress = false;
-      lastReconnectTry = now;   // 10s Pause bis zum naechsten Scan
+      lastReconnectTry = now;
     }
     return;
   }
 
-  // Scan fertig (res >= 0) oder Fehler (res < 0).
-  bool found = false;
+  // Scan fertig: das STAERKSTE bekannte Netz aus den Ergebnissen suchen.
+  int bestIdx = -1;
+  int32_t bestRssi = -1000;
   if (res > 0) {
-    for (int i = 0; i < res && !found; i++) {
+    for (int i = 0; i < res; i++) {
       for (auto &w : cfg_wifi) {
-        if (WiFi.SSID(i) == w.ssid) { found = true; break; }
-      }
-    }
-  }
-  WiFi.scanDelete();
-  scanInProgress = false;
-
-  static int staConnectFails = 0;
-
-  if (found) {
-    Serial.println("WiFi: known network found, connecting...");
-    if (WiFi.getMode() != WIFI_AP_STA) WiFi.mode(WIFI_AP_STA);
-    if (wifiMulti.run(8000) == WL_CONNECTED) {
-      staConnectFails = 0;
-      staDownSince = 0;   // verbunden -> Notnagel-Timer aus
-      String csid = WiFi.SSID();
-      for (auto &w : cfg_wifi) {
-        if (w.ssid==csid && w.staticIp && w.ip.length()>0) {
-          applyStaticConfig(w.ip, w.gateway, w.subnet, w.dns);
+        if (WiFi.SSID(i) == w.ssid) {
+          int32_t r = WiFi.RSSI(i);
+          if (r > bestRssi) { bestRssi = r; bestIdx = i; }
           break;
         }
       }
-      Serial.printf("WiFi connected: %s | IP: %s\n", WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
-      if (cfg_ble_mode == 1 || (cfg_ble_mode == 2 && bleIsAdvertising)) {
-        NimBLEDevice::startAdvertising();
-      }
-    } else {
-      staConnectFails++;
-      Serial.printf("WiFi: connect failed despite known network (fail #%d)\n", staConnectFails);
-      if (staConnectFails >= 3) {
-        Serial.println("WiFi: hard STA reset after repeated failures");
-        WiFi.disconnect(false, false);
-        delay(300);
-        wifiMulti = WiFiMulti();
-        for (auto &n : cfg_wifi) wifiMulti.addAP(n.ssid.c_str(), n.pass.c_str());
-        staConnectFails = 0;
-      }
     }
-    ensureAP(false);
   }
+  String bestSsid = (bestIdx >= 0) ? WiFi.SSID(bestIdx) : String("");
+  WiFi.scanDelete();
+  scanInProgress = false;
+
+  if (bestIdx < 0) {
+    // Kein bekanntes Netz in Reichweite (typisch: unterwegs) -> Backoff.
+    unsigned long doubled = staScanInterval * 2;
+    staScanInterval = (doubled > STA_SCAN_MAX_MS) ? STA_SCAN_MAX_MS : doubled;
+    Serial.printf("WiFi: kein bekanntes Netz -> naechster Scan in %lus\n",
+                  (unsigned long)(staScanInterval / 1000));
+    return;
+  }
+
+  // Bekanntes Netz gefunden -> Backoff zuruecksetzen und NON-BLOCKING verbinden.
+  staScanInterval = STA_SCAN_MIN_MS;
+  String pass = "";
+  for (auto &w : cfg_wifi) {
+    if (w.ssid == bestSsid) { pass = w.pass; break; }
+  }
+  if (WiFi.getMode() != WIFI_AP_STA) WiFi.mode(WIFI_AP_STA);
+  Serial.printf("WiFi: known network '%s' (RSSI %d) -> connecting (nonblocking)\n",
+                bestSsid.c_str(), (int)bestRssi);
+  WiFi.begin(bestSsid.c_str(), pass.c_str());   // startet sofort, blockiert NICHT
+  staConnecting   = true;
+  staConnectStart = now;
 }
 
 // ── Setup ─────────────────────────────────────────────────────────────────────
@@ -2390,6 +2621,22 @@ void setup() {
 std::string vescBuffer;
 
 void loop() {
+  // ── Diagnose: Loop-Zeit + Frequenz + Heap-Tiefstand messen ──────────────────
+  unsigned long diagLoopT0 = micros();
+  {
+    uint32_t h = ESP.getFreeHeap();
+    if (h < diagMinHeap) diagMinHeap = h;   // niedrigsten freien Heap merken
+    unsigned long nowMs = millis();
+    if (diagLoopWindowStart == 0) diagLoopWindowStart = nowMs;
+    diagLoopWindowCount++;
+    if (nowMs - diagLoopWindowStart >= 1000) {   // jede Sekunde Frequenz festhalten
+      diagLoopsPerSec     = diagLoopWindowCount;
+      diagLoopWindowCount = 0;
+      diagLoopWindowStart = nowMs;
+      diagMaxLoopUs       = 0;   // Max pro Sekunde zuruecksetzen (aktueller Wert)
+    }
+  }
+
   otaServer.handleClient();
   dnsServer.processNextRequest();
 
@@ -2459,33 +2706,21 @@ void loop() {
   static int apWatchdogFails = 0;
   if (apWanted && millis() - lastApEnsure > 5000) {
     lastApEnsure = millis();
-    wifi_mode_t mode = WiFi.getMode();
-    bool apBitSet  = (mode == WIFI_AP || mode == WIFI_AP_STA);
-    bool apIpValid = (WiFi.softAPIP() != IPAddress(0,0,0,0));
-    // Auch hier SSID pruefen: laeuft der IDF-Default "ESP-XXXX" statt unserer
-    // SSID, gilt der AP als "nicht ok" und wird via ensureAP() korrigiert.
-    bool apSsidOk  = (WiFi.softAPSSID() == cfg_ap_ssid);
-    if (!apBitSet || !apIpValid || !apSsidOk) {
+    // NUR die SSID pruefen. Grund: Modus-Bit und softAPIP() koennen in kurzen
+    // Uebergangsmomenten "falsch" aussehen (false positives) und wuerden dann
+    // unnoetig ein ensureAP() ausloesen, das einen gesunden AP stoert. Die SSID
+    // ist stabil UND aussagekraeftig genug fuer beide echten Fehlerfaelle:
+    //   - falsche SSID  -> der IDF-Default "ESP-XXXX" hat uebernommen
+    //   - leere  SSID   -> AP ist wirklich weg
+    // In beiden Faellen != cfg_ap_ssid -> wird sanft via ensureAP() korrigiert.
+    // Passt die SSID, gilt der AP als gesund und wird IN RUHE gelassen.
+    bool apSsidOk = (WiFi.softAPSSID() == cfg_ap_ssid);
+    if (!apSsidOk) {
       apWatchdogFails++;
-      Serial.printf("AP watchdog: AP down/wrong (fail #%d, ssid='%s') — restoring\n",
-                    apWatchdogFails, WiFi.softAPSSID().c_str());
-      if (apWatchdogFails >= 3) {
-        // Mehrfach gescheitert -> harter Stack-Reset.
-        Serial.println("AP watchdog: hard WiFi stack reset");
-        WiFi.disconnect(true, true);
-        WiFi.softAPdisconnect(true);
-        WiFi.mode(WIFI_OFF);
-        delay(500);
-        WiFi.mode(WIFI_AP_STA);
-        delay(300);
-        apWatchdogFails = 0;
-        // STA-Reconnect anstossen, damit auch das Heimnetz wieder kommt.
-        if (!cfg_wifi.empty()) {
-          wifiMulti = WiFiMulti();
-          for (auto &n : cfg_wifi) wifiMulti.addAP(n.ssid.c_str(), n.pass.c_str());
-        }
-      }
-      ensureAP(true);
+      diagApWatchdogFires++;   // Diagnose: Watchdog-Eingriff zaehlen
+      Serial.printf("AP watchdog: SSID falsch/leer ('%s', fail #%d) — soft restore\n",
+                    WiFi.softAPSSID().c_str(), apWatchdogFails);
+      ensureAP(true);   // sanft wiederherstellen, Funk NICHT komplett abschalten
     } else {
       apActive = true;
       apWatchdogFails = 0;   // AP lebt -> Fehlerzaehler zuruecksetzen
@@ -2521,7 +2756,9 @@ void loop() {
   // LED-Modul: bekommt aktuellen ERPM fuer spaetere bewegungsabhaengige Effekte.
   // Nur wenn die WS28XX-Steuerung aktiv ist -> bei deaktivierter Steuerung
   // werden keine Effekte mehr getrieben, LEDs bleiben aus.
-  if (cfg_leds_enabled) ledsLoop(vescStatus.erpm);
+  // LED-Rendering laeuft jetzt im eigenen Task (Kern 1). Hier nur noch billig
+  // den Zustand melden; das eigentliche show() macht der LED-Task.
+  ledsUpdateState(cfg_leds_enabled, vescStatus.erpm);
 
   if (!wifiClient || !wifiClient.connected()) {
     wifiClient = server.available();
@@ -2592,6 +2829,11 @@ void loop() {
     oldDeviceConnected = false;
   }
   if (deviceConnected && !oldDeviceConnected) oldDeviceConnected = true;
+
+  // Diagnose: Dauer dieses Loop-Durchlaufs; Maximum im aktuellen Sekundenfenster
+  // festhalten. Ein hoher Wert = irgendwas blockiert den Loop (Blockade-Indikator).
+  unsigned long diagLoopDt = micros() - diagLoopT0;
+  if (diagLoopDt > diagMaxLoopUs) diagMaxLoopUs = diagLoopDt;
 
   yield();
 }
