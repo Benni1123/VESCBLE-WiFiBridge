@@ -17,7 +17,7 @@ Download [`firmware_full.bin`](https://github.com/Benni1123/VESCBLE-WiFiBridge/r
 - WiFi TCP bridge on configurable port (default 65101)
 - Supports up to 10 WiFi networks with automatic failover and static IP per network
 - AP + Client simultaneous mode — Access Point always available alongside WiFi client
-- `192.168.4.1` always reachable even when connected to home WiFi
+- `192.168.9.1` always reachable even when connected to home WiFi
 - Captive portal for AP clients, DNS always running
 - Fallback to AP-only mode if no configured network is reachable
 
@@ -25,7 +25,7 @@ Download [`firmware_full.bin`](https://github.com/Benni1123/VESCBLE-WiFiBridge/r
 - Passes all VESC Tool commands transparently — zero modification
 - Periodic VESC status polling (voltage, FET temp, motor temp, fault code)
 - Polling only active when web UI is open — no unnecessary UART traffic
-<img width="729" height="814" alt="grafik" src="https://github.com/user-attachments/assets/eb4fab84-3d0a-4ddb-a896-99ac9515304a" />
+<img width="1280" height="2856" alt="Screenshot_20260704_213208" src="https://github.com/user-attachments/assets/a9230680-5cf9-46fd-91f1-05b8b3f9e2e8" />
 
 **Web Interface**
 - Responsive dark/light web UI (auto-detects browser theme, manual toggle)
@@ -35,8 +35,9 @@ Download [`firmware_full.bin`](https://github.com/Benni1123/VESCBLE-WiFiBridge/r
 - WiFi password show/hide toggle per network
 - OTA Flash tab: server update check with version comparison, manual firmware upload via drag & drop
 - API tab: full API reference, UART debug log with channel filter (BLE / WiFi / Poll)
-<img width="723" height="1075" alt="grafik" src="https://github.com/user-attachments/assets/cb691cb1-f149-42f3-b62f-290eb1a59504" />
-<img width="729" height="1026" alt="grafik" src="https://github.com/user-attachments/assets/612a1403-0988-4144-aa04-1ba9e66d173d" />
+<img width="1280" height="2366" alt="Screenshot_20260704_213256" src="https://github.com/user-attachments/assets/e7f0a232-899f-4af3-9325-858d776c99e6" />
+<img width="1280" height="2785" alt="Screenshot_20260704_213243" src="https://github.com/user-attachments/assets/74f500b5-a65a-46d2-ad39-d7d2eb0dd5e7" />
+
 
 **Reliability**
 - Auto reboot configurable: triggers after N seconds with no BLE or WiFi client connected
@@ -51,15 +52,17 @@ Download [`firmware_full.bin`](https://github.com/Benni1123/VESCBLE-WiFiBridge/r
   curl -X POST http://<ip>:8080/update -F "firmware=@firmware.bin"
   ```
 - Build version auto-increments patch number on every compile
-<img width="725" height="763" alt="grafik" src="https://github.com/user-attachments/assets/d0b8e364-2503-4b28-9ad3-debafa0ea0fa" />
+<img width="1280" height="2856" alt="Screenshot_20260704_213306" src="https://github.com/user-attachments/assets/2f7ee89f-1d9d-48ff-8c73-7221415ef731" />
 
 **Debug**
 - UART debug log in the web UI — persists across reboots (stored in NVS)
 - Per-channel filter: BLE traffic, WiFi traffic, VESC poll — enable individually
 - Log accessible via `/api/uart/log`, clearable via `/api/uart/clear`
-<img width="725" height="1077" alt="grafik" src="https://github.com/user-attachments/assets/927bbf46-7546-45cd-ad77-6900de262a25" />
-<img width="731" height="961" alt="grafik" src="https://github.com/user-attachments/assets/9548c311-992e-4669-baff-eee9526ae72d" />
+<img width="1280" height="1568" alt="Screenshot_20260704_213711" src="https://github.com/user-attachments/assets/7a8ee5c7-30dc-4579-8553-424fdc8cc377" />
+<img width="1280" height="2795" alt="Screenshot_20260704_213702" src="https://github.com/user-attachments/assets/71f4857b-7df4-4237-b972-f3c5f419877c" />
 
+**WS2812**
+- Test for up to 4 WS2812 LED channels.
 ---
 
 ## Hardware
@@ -97,7 +100,7 @@ After build, two binaries are created in `.pio/build/esp32-s3/`:
 
 **First Boot**
 1. ESP starts in Access Point mode: connect to `VESC-BLE-WiFi`
-2. Open `http://192.168.4.1` in your browser
+2. Open `http://192.168.9.1` in your browser
 3. Go to Config → add your WiFi network → Save
 4. Connect VESC Tool via BLE or WiFi TCP
 
