@@ -25,7 +25,7 @@ Download [`firmware_full.bin`](https://github.com/Benni1123/VESCBLE-WiFiBridge/r
 - Passes all VESC Tool commands transparently — zero modification
 - Periodic VESC status polling (voltage, FET temp, motor temp, fault code)
 - Polling only active when web UI is open — no unnecessary UART traffic
-<img width="1280" height="2856" alt="Screenshot_20260704_213208" src="https://github.com/user-attachments/assets/a9230680-5cf9-46fd-91f1-05b8b3f9e2e8" />
+<img src="https://github.com/user-attachments/assets/a9230680-5cf9-46fd-91f1-05b8b3f9e2e8" width="640" alt="Main Web Interface" />
 
 **Web Interface**
 - Responsive dark/light web UI (auto-detects browser theme, manual toggle)
@@ -35,9 +35,16 @@ Download [`firmware_full.bin`](https://github.com/Benni1123/VESCBLE-WiFiBridge/r
 - WiFi password show/hide toggle per network
 - OTA Flash tab: server update check with version comparison, manual firmware upload via drag & drop
 - API tab: full API reference, UART debug log with channel filter (BLE / WiFi / Poll)
-<img width="1280" height="2366" alt="Screenshot_20260704_213256" src="https://github.com/user-attachments/assets/e7f0a232-899f-4af3-9325-858d776c99e6" />
-<img width="1280" height="2785" alt="Screenshot_20260704_213243" src="https://github.com/user-attachments/assets/74f500b5-a65a-46d2-ad39-d7d2eb0dd5e7" />
 
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/74f500b5-a65a-46d2-ad39-d7d2eb0dd5e7" width="640" alt="Web Interface 1" />
+</p>
+
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/e7f0a232-899f-4af3-9325-858d776c99e6" width="640" alt="Web Interface 2" />
+</p>
+
+---
 
 **Reliability**
 - Auto reboot configurable: triggers after N seconds with no BLE or WiFi client connected
@@ -48,19 +55,29 @@ Download [`firmware_full.bin`](https://github.com/Benni1123/VESCBLE-WiFiBridge/r
 - Server-based OTA: checks `version.txt`, installs `firmware.bin` — HTTP and HTTPS supported (GitHub Releases ready)
 - Manual OTA: drag & drop `firmware.bin` in the browser
 - Emergency OTA on port 8080 — always available, even if main web server is unresponsive:
-  ```
+  ```bash
   curl -X POST http://<ip>:8080/update -F "firmware=@firmware.bin"
   ```
 - Build version auto-increments patch number on every compile
-<img width="1280" height="2856" alt="Screenshot_20260704_213306" src="https://github.com/user-attachments/assets/2f7ee89f-1d9d-48ff-8c73-7221415ef731" />
+
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/2f7ee89f-1d9d-48ff-8c73-7221415ef731" width="640" alt="OTA Update" />
+</p>
+
+---
 
 **Debug**
 - UART debug log in the web UI — persists across reboots (stored in NVS)
 - Per-channel filter: BLE traffic, WiFi traffic, VESC poll — enable individually
 - Log accessible via `/api/uart/log`, clearable via `/api/uart/clear`
-<img width="1280" height="1568" alt="Screenshot_20260704_213711" src="https://github.com/user-attachments/assets/7a8ee5c7-30dc-4579-8553-424fdc8cc377" />
-<img width="1280" height="2795" alt="Screenshot_20260704_213702" src="https://github.com/user-attachments/assets/71f4857b-7df4-4237-b972-f3c5f419877c" />
 
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/71f4857b-7df4-4237-b972-f3c5f419877c" width="640" alt="Debug Log" />
+</p>
+
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/7a8ee5c7-30dc-4579-8553-424fdc8cc377" width="640" alt="Debug Filter" />
+</p>
 **WS2812**
 - Test for up to 4 WS2812 LED channels.
 ---
