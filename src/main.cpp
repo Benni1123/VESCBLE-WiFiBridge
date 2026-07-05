@@ -95,6 +95,11 @@ int    cfg_ble_auto_erpm_on   = 200;   // |ERPM| > diesem Wert -> BLE/AP an, Tim
 // AP-Modus: 1=An (immer an), 2=Auto (an bei Bewegung, aus nach Idle-Timeout).
 // Bewusst KEIN "Aus" — der AP ist der Fallback-Zugang und darf nicht komplett weg.
 int    cfg_ap_mode            = 1;     // Default: An (Verhalten wie bisher)
+// Wurde jemals eine Konfiguration gespeichert? Nach Werksreset ist NVS leer ->
+// false. Solange false, gilt der ESP als "unkonfiguriert" und der AP wird hart
+// erzwungen (Sicherheit: nach Reset niemals AP aus). Wird beim ersten Speichern
+// true.
+bool   cfg_configured         = false;
 int    cfg_ble_auto_off_sec   = 120;   // nach X Sekunden ohne Bewegung & Client -> BLE aus
 bool   cfg_leds_enabled       = false; // WS28XX LED-Steuerung aktiv (zeigt LED-Reiter + /leds)
 
@@ -138,6 +143,7 @@ void loadConfig() {
   cfg_ble_mode           = prefs.getInt ("ble_mode",         1);
   cfg_ble_auto_erpm_on   = prefs.getInt ("ble_erpm_on",      200);
   cfg_ap_mode            = prefs.getInt ("ap_mode",          1);
+  cfg_configured         = prefs.getBool("configured",       false);
   cfg_ble_auto_off_sec   = prefs.getInt ("ble_off_sec",      120);
   cfg_leds_enabled       = prefs.getBool("leds_en",          false);
   int count = prefs.getInt("wifi_count", 0);
@@ -153,6 +159,10 @@ void loadConfig() {
     e.dns      = prefs.getString(("wdns"   +String(i)).c_str(), "");
     if (e.ssid.length() > 0) cfg_wifi.push_back(e);
   }
+  // Migration fuer Bestandsgeraete: wer schon WLAN-Netze gespeichert hat, gilt als
+  // konfiguriert (auch wenn der neue "configured"-Key noch fehlt) -> AP folgt dem
+  // gewaehlten Modus statt zwangsweise "An".
+  if (!cfg_configured && !cfg_wifi.empty()) cfg_configured = true;
   prefs.end();
   if (cfg_ble_name.isEmpty()) cfg_ble_name = DEFAULT_BLE_NAME;
   if (cfg_ap_ssid.isEmpty())  cfg_ap_ssid  = DEFAULT_AP_SSID;
@@ -203,6 +213,8 @@ void saveConfig() {
   prefs.putInt   ("ble_mode",    cfg_ble_mode);
   prefs.putInt   ("ble_erpm_on", cfg_ble_auto_erpm_on);
   prefs.putInt   ("ap_mode",     cfg_ap_mode);
+  cfg_configured = true;                         // ab jetzt konfiguriert
+  prefs.putBool  ("configured",  cfg_configured);
   prefs.putInt   ("ble_off_sec", cfg_ble_auto_off_sec);
   prefs.putBool  ("leds_en",     cfg_leds_enabled);
   prefs.putInt   ("wifi_count",  cfg_wifi.size());
@@ -751,6 +763,7 @@ static const char PAGE_HTML[] PROGMEM = R"rawliteral(
       </label>
     </div>
     <button class="btn" onclick="saveConfig()" id="saveBtn">Save</button>
+    <button class="btn" style="margin-top:8px;background:#e0a030" onclick="restartDevice()" id="restartBtn">Restart</button>
     <button class="btn red" style="margin-top:8px" onclick="factoryReset()" id="factoryBtn">Factory Reset</button>
   </div>
 
@@ -879,6 +892,7 @@ function applyTranslations(){
   s('scanBtn',              'Scan',                                         'Scan');
   s('addBtn',               '+ Manual',                                     '+ Manuell');
   s('saveBtn',              'Save',                                         'Speichern');
+  s('restartBtn',           'Restart',                                      'Neustart');
   s('factoryBtn',           'Factory Reset',                                'Werkseinstellungen');
   s('lbl-server-update',    'Server Update',                                'Server Update');
   s('checkBtn',             'Check for Updates',                            'Auf Updates prüfen');
@@ -1011,6 +1025,12 @@ function addWifiFromScan(ssid){
 function factoryReset(){
   if(!confirm(de()?'Zurücksetzen?':'Reset all settings?'))return;
   fetch('/api/factory-reset',{method:'POST'}).catch(function(){});
+}
+
+function restartDevice(){
+  if(!confirm(de()?'Gerät neu starten?':'Restart device?'))return;
+  fetch('/api/restart',{method:'POST'}).catch(function(){});
+  alert(de()?'Neustart läuft… Seite in ein paar Sekunden neu laden.':'Restarting… reload the page in a few seconds.');
 }
 
 var wifiNetworks=[];
@@ -1845,7 +1865,11 @@ static void tuneApDhcp() {
   esp_wifi_set_protocol(WIFI_IF_AP,
       WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
 
-  Serial.println("AP tune: ps=MIN_MODEM (BT-Koexistenz), TX-power max, proto=BGN");
+  // Kanalbreite fest auf 20 MHz (HT20). Auf 2,4 GHz bringt 40 MHz kaum etwas,
+  // macht aber oft Verbindungsaerger (Repeater/Router) -> HT20 ist stabiler.
+  esp_wifi_set_bandwidth(WIFI_IF_AP, WIFI_BW_HT20);
+
+  Serial.println("AP tune: ps=MIN_MODEM (BT-Koexistenz), TX-power max, proto=BGN, bw=HT20");
 }
 
 bool ensureAP(bool force) {
@@ -1994,6 +2018,7 @@ static void staApplyIpConfig(const String &ssid) {
 static void staBegin(const String &ssid, const String &pass) {
   staApplyIpConfig(ssid);
   WiFi.begin(ssid.c_str(), pass.c_str());
+  esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT20);   // 20 MHz auch fuer STA (Stabilitaet)
 }
 
 bool setupWiFiClient() {
@@ -2001,6 +2026,7 @@ bool setupWiFiClient() {
   Serial.println("WiFi Client: connecting...");
   WiFi.mode(WIFI_AP_STA);
   WiFi.setHostname(cfg_hostname.c_str());
+  esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT20);   // 20 MHz auch fuer STA (Stabilitaet)
   for (auto &n : cfg_wifi) { wifiMulti.addAP(n.ssid.c_str(), n.pass.c_str()); Serial.printf("  + %s\n", n.ssid.c_str()); }
 
   // Bis zu 2 Anlaeufe: erster normaler Versuch, bei Fehlschlag ein STA-Reset
@@ -2762,6 +2788,24 @@ void loop() {
   otaServer.handleClient();
   dnsServer.processNextRequest();
 
+  // ── SICHERHEIT: im Werkszustand (noch NICHTS gespeichert) AP hart erzwingen ──
+  // Nach einem Werksreset ist der NVS leer -> cfg_configured = false. Dann ist der
+  // AP der einzige Zugang und MUSS an bleiben, egal welcher Modus/Timeout. Sobald
+  // der Nutzer einmal speichert (cfg_configured = true), gilt sein gewaehlter
+  // AP-Modus — und Auto darf dann auch OHNE STA-Netz abschalten.
+  // Zugleich der "darf der AP ueberhaupt aus?"-Check: nur wenn konfiguriert UND
+  // Auto-Modus. Sonst niemals.
+  bool apMayShutOff = cfg_configured && (cfg_ap_mode == 2);
+  if (!cfg_configured) {
+    apWanted       = true;
+    apOffByTimeout = false;
+    if (!apActive) {
+      Serial.println("AP-Safety: Werkszustand (unkonfiguriert) -> AP erzwingen");
+      if (WiFi.getMode() != WIFI_AP_STA) WiFi.mode(WIFI_AP_STA);
+      ensureAP(true);
+    }
+  }
+
   // AP-Modus (analog BLE-Modus):
   //   1 = An   : AP immer an (klassisch), Timeout-Logik inaktiv.
   //   2 = Auto : verhaelt sich wie BLE-Auto — fahren haelt den AP wach, Stillstand
@@ -2798,7 +2842,7 @@ void loop() {
   // Rueckweg: naechste Bewegung holt den AP zurueck (siehe Wake-Block unten).
   // Steht der Scooter dauerhaft ohne STA-Netz, ist der ESP bis zur naechsten
   // Bewegung/Reboot nicht per WLAN erreichbar — im Auto-Modus so gewollt.
-  if (apActive && cfg_ap_mode == 2 && cfg_ap_timeout > 0) {
+  if (apActive && apMayShutOff && cfg_ap_timeout > 0) {
     int stations = WiFi.softAPgetStationNum();
     // Flanke erkennen: ist gerade das letzte Geraet abgefallen?
     if (stations == 0 && apLastStationNum > 0) {
@@ -2853,31 +2897,50 @@ void loop() {
     }
   }
 
-  // AP-Watchdog: prüft regelmäßig, ob der AP noch lebt, und zieht ihn bei
-  // Bedarf wieder hoch. Greift nur, solange apWanted == true.
-  // Eskalation: schlaegt die Wiederherstellung mehrfach hintereinander fehl,
-  // wird der WLAN-Stack hart zurueckgesetzt (gegen "manchmal kein WLAN").
+  // AP-Reconcile-Watchdog: gleicht alle 5 s SOLL (apWanted) und IST (sendet der
+  // AP unsere SSID?) ab — und korrigiert in BEIDE Richtungen:
+  //   soll AN, sendet nicht  -> anschalten (ensureAP)
+  //   soll AUS, sendet noch   -> abschalten (softAPdisconnect)
+  // apWanted ist die einzige Wahrheit fuer den Soll-Zustand: true ausser der AP
+  // wurde im Auto-Modus per Idle-Timeout abgeschaltet. Im Werkszustand
+  // (unkonfiguriert) ist apWanted oben bereits hart auf true gezwungen.
   static int apWatchdogFails = 0;
-  if (apWanted && millis() - lastApEnsure > 5000) {
+  if (millis() - lastApEnsure > 5000) {
     lastApEnsure = millis();
-    // NUR die SSID pruefen. Grund: Modus-Bit und softAPIP() koennen in kurzen
-    // Uebergangsmomenten "falsch" aussehen (false positives) und wuerden dann
-    // unnoetig ein ensureAP() ausloesen, das einen gesunden AP stoert. Die SSID
-    // ist stabil UND aussagekraeftig genug fuer beide echten Fehlerfaelle:
-    //   - falsche SSID  -> der IDF-Default "ESP-XXXX" hat uebernommen
-    //   - leere  SSID   -> AP ist wirklich weg
-    // In beiden Faellen != cfg_ap_ssid -> wird sanft via ensureAP() korrigiert.
-    // Passt die SSID, gilt der AP als gesund und wird IN RUHE gelassen.
-    bool apSsidOk = (WiFi.softAPSSID() == cfg_ap_ssid);
-    if (!apSsidOk) {
-      apWatchdogFails++;
-      diagApWatchdogFires++;   // Diagnose: Watchdog-Eingriff zaehlen
-      Serial.printf("AP watchdog: SSID falsch/leer ('%s', fail #%d) — soft restore\n",
-                    WiFi.softAPSSID().c_str(), apWatchdogFails);
-      ensureAP(true);   // sanft wiederherstellen, Funk NICHT komplett abschalten
+
+    wifi_mode_t mode  = WiFi.getMode();
+    bool apBitSet     = (mode == WIFI_AP || mode == WIFI_AP_STA);
+    bool apSsidOk     = (WiFi.softAPSSID() == cfg_ap_ssid);
+
+    if (apWanted) {
+      // ── SOLL AN ──────────────────────────────────────────────────────────
+      // Nur die SSID pruefen (Modus-Bit/IP koennen in Uebergangsmomenten kurz
+      // "falsch" aussehen). Falsche/leere SSID (IDF-Default "ESP-XXXX" oder AP
+      // wirklich weg) -> sanft wiederherstellen. Passt die SSID -> in Ruhe lassen.
+      if (!apSsidOk) {
+        apWatchdogFails++;
+        diagApWatchdogFires++;
+        Serial.printf("AP reconcile: soll AN, sendet nicht/falsch ('%s', fail #%d) -> ensureAP\n",
+                      WiFi.softAPSSID().c_str(), apWatchdogFails);
+        ensureAP(true);
+      } else {
+        apActive = true;
+        apWatchdogFails = 0;
+      }
     } else {
-      apActive = true;
-      apWatchdogFails = 0;   // AP lebt -> Fehlerzaehler zuruecksetzen
+      // ── SOLL AUS ─────────────────────────────────────────────────────────
+      // Der AP soll aus sein (Auto-Idle-Timeout). Sendet er trotzdem noch —
+      // sei es unsere SSID oder ein vom IDF hochgezogener Default-AP (AP-Bit
+      // gesetzt) — hart abschalten und auf reines STA gehen.
+      bool apStillBroadcasting = apSsidOk || apBitSet;
+      if (apStillBroadcasting) {
+        diagApWatchdogFires++;
+        Serial.println("AP reconcile: soll AUS, sendet aber noch -> AP abschalten");
+        WiFi.softAPdisconnect(true);
+        WiFi.mode(WIFI_STA);
+        apActive = false;
+        isAPMode = false;
+      }
     }
   }
 
