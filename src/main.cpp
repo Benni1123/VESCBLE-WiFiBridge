@@ -1666,6 +1666,13 @@ class MyServerCallbacks : public BLEServerCallbacks {
   void onConnect(NimBLEServer *pServer, ble_gap_conn_desc *desc) {
     Serial.printf("BLE connected: %s\n", NimBLEAddress(desc->peer_ota_addr).toString().c_str());
     deviceConnected = true;
+    // Entspanntes Verbindungsintervall anfordern, damit BLE waehrend einer aktiven
+    // Verbindung weniger Funkzeit belegt und mehr Airtime fuers WLAN uebrig bleibt.
+    // Einheiten: Intervall in 1,25 ms, Latenz in Intervallen, Timeout in 10 ms.
+    //   min=24 -> 30 ms, max=40 -> 50 ms, latency=0, timeout=400 -> 4000 ms.
+    // Das Phone (Central) darf das ablehnen -> dann bleibt es harmlos beim alten
+    // Wert, kein Disconnect. Falls die VESC-App traege wirkt, hier kleiner machen.
+    pServer->updateConnParams(desc->conn_handle, 24, 40, 0, 400);
     // Im Auto-Modus: aktive Verbindung haelt Timer pausiert, nicht erneut advertisen.
     // Bei "An"-Modus: weiter advertisen (so dass weitere Clients sich verbinden koennen).
     if (cfg_ble_mode == 1) NimBLEDevice::startAdvertising();
@@ -1955,6 +1962,40 @@ bool setupAccessPoint() {
 }
 
 // ── WiFi setup ────────────────────────────────────────────────────────────────
+
+// Setzt die IP-Konfiguration fuer eine SSID BEVOR verbunden wird.
+// KERNPUNKT des Static-IP-Bugs: WiFi.config() MUSS vor WiFi.begin() kommen.
+// Wird es danach (oder gar nicht) aufgerufen, verbindet der ESP per DHCP und
+// die statische IP greift nicht -> IP springt bei jedem Reconnect (z.B. .210
+// vs. .75). Fuer Netze OHNE statische IP wird hier explizit auf DHCP
+// zurueckgesetzt, damit keine alte statische IP aus einem frueheren Netz
+// haengen bleibt.
+static void staApplyIpConfig(const String &ssid) {
+  for (auto &w : cfg_wifi) {
+    if (w.ssid == ssid) {
+      if (w.staticIp && w.ip.length() > 0 &&
+          applyStaticConfig(w.ip, w.gateway, w.subnet, w.dns)) {
+        Serial.printf("WiFi: static IP %s fuer '%s' gesetzt (vor begin)\n",
+                      w.ip.c_str(), ssid.c_str());
+      } else {
+        // kein/ungueltiges Static -> DHCP erzwingen (0.0.0.0 = DHCP-Client an)
+        WiFi.config(IPAddress((uint32_t)0), IPAddress((uint32_t)0), IPAddress((uint32_t)0));
+      }
+      return;
+    }
+  }
+  // SSID nicht in der Config gefunden -> sicherheitshalber DHCP
+  WiFi.config(IPAddress((uint32_t)0), IPAddress((uint32_t)0), IPAddress((uint32_t)0));
+}
+
+// Einheitlicher STA-Verbindungsaufbau: erst IP-Config (static/DHCP), dann begin.
+// IMMER diesen Helfer statt WiFi.begin() direkt verwenden, damit die statische
+// IP in JEDEM Connect-Pfad (Boot, Reconnect, Roam) zuverlaessig greift.
+static void staBegin(const String &ssid, const String &pass) {
+  staApplyIpConfig(ssid);
+  WiFi.begin(ssid.c_str(), pass.c_str());
+}
+
 bool setupWiFiClient() {
   if (cfg_wifi.empty()) { Serial.println("WiFi: no networks configured"); return false; }
   Serial.println("WiFi Client: connecting...");
@@ -1991,7 +2032,14 @@ bool setupWiFiClient() {
   String csid = WiFi.SSID();
   for (auto &n : cfg_wifi) {
     if (n.ssid==csid && n.staticIp && n.ip.length()>0) {
-      applyStaticConfig(n.ip, n.gateway, n.subnet, n.dns);
+      // wifiMulti hat per DHCP verbunden. Static NACHtraeglich zu setzen ist
+      // unzuverlaessig -> einmal sauber neu verbinden MIT config vor begin.
+      Serial.println("WiFi: static IP -> sauberer Reconnect (config vor begin)");
+      WiFi.disconnect(false, false);
+      delay(50);
+      staBegin(csid, n.pass);
+      unsigned long t0 = millis();
+      while (WiFi.status() != WL_CONNECTED && millis() - t0 < 8000) delay(100);
       break;
     }
   }
@@ -2140,6 +2188,62 @@ void pollVesc() {
 // Eine aktive Verbindung (BLE / TCP / Web-UI) haelt den Timer pausiert.
 // (bleIsAdvertising und lastMovementTime sind weiter oben deklariert, weil
 //  MyServerCallbacks bereits auf bleIsAdvertising zugreift.)
+
+// ── BLE Advertising-Intervall: WLAN-Airtime zurueckgewinnen ────────────────────
+// BLE und WiFi teilen sich EIN 2,4-GHz-Radio; die Koexistenz erzwingt
+// WIFI_PS_MIN_MODEM (WIFI_PS_NONE ist gesperrt, solange BLE laeuft). Wenn der ESP
+// nur advertised (kein Client verbunden), frisst schnelles Advertising Airtime,
+// die dann dem WLAN fehlt -> ueber Repeater die typische "verbunden, aber schlecht
+// erreichbar"-Situation. Strategie ohne BLE abzuschalten:
+//   - Frisch beim (Neu-)Advertising: kurz schnelles Intervall -> Phone findet den
+//     ESP zuegig (Discovery-Fenster).
+//   - Danach ohne Client: langes Intervall -> WLAN bekommt spuerbar mehr Airtime.
+//   - Sobald ein Client verbunden ist: es wird i.d.R. nicht geadvertised -> egal;
+//     beim naechsten Advertising beginnt das Discovery-Fenster erneut.
+// Intervall-Einheit: 0.625 ms.
+static const uint16_t      ADV_FAST_MIN       = 32;    //  20 ms  (schnelle Discovery)
+static const uint16_t      ADV_FAST_MAX       = 64;    //  40 ms
+static const uint16_t      ADV_SLOW_MIN       = 3200;  // 2000 ms (Idle: Airtime maximal an WLAN abgeben)
+static const uint16_t      ADV_SLOW_MAX       = 4800;  // 3000 ms
+static const unsigned long ADV_FAST_WINDOW_MS = 8000;  // nur 8 s schnell, dann langsam
+static bool                advSlowActive      = false; // aktuell im HW gesetztes Intervall (Quelle der Wahrheit)
+static unsigned long       advStartedAt       = 0;     // seit wann ununterbrochen idle-geadvertised (0 = nicht)
+
+// Setzt das Advertising-Intervall (schnell/langsam). Wirkt beim naechsten start().
+static void applyAdvInterval(bool slow) {
+  NimBLEAdvertising *pAdv = NimBLEDevice::getAdvertising();
+  if (slow) { pAdv->setMinInterval(ADV_SLOW_MIN); pAdv->setMaxInterval(ADV_SLOW_MAX); }
+  else      { pAdv->setMinInterval(ADV_FAST_MIN); pAdv->setMaxInterval(ADV_FAST_MAX); }
+  advSlowActive = slow;
+}
+
+// Im Loop aufrufen: verwaltet das schnelle Discovery-Fenster und den Wechsel auf
+// langes Intervall bei laengerem Idle-Advertising.
+static void manageAdvInterval() {
+  // Nur relevant, wenn geadvertised wird UND kein Client verbunden ist.
+  if (!bleIsAdvertising || deviceConnected) {
+    advStartedAt = 0;   // naechstes Idle-Advertising startet wieder im Fast-Fenster
+    return;
+  }
+  unsigned long now = millis();
+  if (advStartedAt == 0) {
+    // Advertising hat gerade (wieder) begonnen -> schnelle Discovery-Phase.
+    advStartedAt = now;
+    if (advSlowActive) {   // stand noch auf langsam -> auf schnell zuruecksetzen
+      NimBLEDevice::stopAdvertising();
+      applyAdvInterval(false);
+      NimBLEDevice::startAdvertising();
+    }
+    return;
+  }
+  if (!advSlowActive && (now - advStartedAt > ADV_FAST_WINDOW_MS)) {
+    // Lange kein Client -> langes Intervall, WLAN bekommt Airtime zurueck.
+    NimBLEDevice::stopAdvertising();
+    applyAdvInterval(true);
+    NimBLEDevice::startAdvertising();
+    Serial.println("BLE adv: idle -> langsames Intervall (WiFi-Airtime)");
+  }
+}
 
 void handleBleMode() {
   static int lastMode = -1;
@@ -2320,6 +2424,7 @@ void handleRoaming() {
     // Gezielt auf die bessere BSSID verbinden.
     WiFi.disconnect(false, false);            // Funk an, Config behalten
     delay(20);
+    staApplyIpConfig(curSsid);                // static/DHCP VOR begin setzen
     WiFi.begin(curSsid.c_str(), pw.c_str(), targetChannel, targetBssid, true);
 
     unsigned long t0 = millis();
@@ -2535,7 +2640,7 @@ void handleWiFiReconnect() {
   if (WiFi.getMode() != WIFI_AP_STA) WiFi.mode(WIFI_AP_STA);
   Serial.printf("WiFi: known network '%s' (RSSI %d) -> connecting (nonblocking)\n",
                 bestSsid.c_str(), (int)bestRssi);
-  WiFi.begin(bestSsid.c_str(), pass.c_str());   // startet sofort, blockiert NICHT
+  staBegin(bestSsid, pass);   // IP-Config (static/DHCP) VOR begin, dann verbinden
   staConnecting   = true;
   staConnectStart = now;
 }
@@ -2572,6 +2677,7 @@ void setup() {
 
   NimBLEAdvertising *pAdv = NimBLEDevice::getAdvertising();
   pAdv->addServiceUUID(VESC_SERVICE_UUID);
+  applyAdvInterval(false);   // Start im schnellen Discovery-Intervall
   // Beim Boot Advertising nur starten wenn Modus nicht "Aus" ist.
   // Auto-Modus startet ebenfalls AN (laut Konfig-Wunsch).
   if (cfg_ble_mode != 0) {
@@ -2783,6 +2889,9 @@ void loop() {
 
   // BLE-Modus (Aus / An / Auto)
   handleBleMode();
+
+  // Advertising-Intervall an WLAN-Bedarf anpassen (Airtime sparen bei Idle)
+  manageAdvInterval();
 
   // Auto reboot
   if (cfg_autoreboot && cfg_autoreboot_time > 0) {
