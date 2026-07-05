@@ -91,8 +91,10 @@ bool   cfg_autopoll_enabled   = false;
 int    cfg_autopoll_interval  = 5;     // Sekunden zwischen Polls (1-60)
 // BLE-Modus: 0=Aus, 1=An, 2=Auto (an bei Bewegung, aus nach Timeout)
 int    cfg_ble_mode           = 1;     // Default: An (Verhalten wie bisher)
-int    cfg_ble_auto_erpm_on   = 200;   // |ERPM| > diesem Wert -> BLE an, Timer reset
-bool   cfg_ap_wake_on_move    = false; // AP nach Timeout bei Bewegung (ERPM) wieder anschalten
+int    cfg_ble_auto_erpm_on   = 200;   // |ERPM| > diesem Wert -> BLE/AP an, Timer reset
+// AP-Modus: 1=An (immer an), 2=Auto (an bei Bewegung, aus nach Idle-Timeout).
+// Bewusst KEIN "Aus" — der AP ist der Fallback-Zugang und darf nicht komplett weg.
+int    cfg_ap_mode            = 1;     // Default: An (Verhalten wie bisher)
 int    cfg_ble_auto_off_sec   = 120;   // nach X Sekunden ohne Bewegung & Client -> BLE aus
 bool   cfg_leds_enabled       = false; // WS28XX LED-Steuerung aktiv (zeigt LED-Reiter + /leds)
 
@@ -135,7 +137,7 @@ void loadConfig() {
   cfg_autopoll_interval  = prefs.getInt ("autopoll_int",     5);
   cfg_ble_mode           = prefs.getInt ("ble_mode",         1);
   cfg_ble_auto_erpm_on   = prefs.getInt ("ble_erpm_on",      200);
-  cfg_ap_wake_on_move    = prefs.getBool("ap_wake_move",     false);
+  cfg_ap_mode            = prefs.getInt ("ap_mode",          1);
   cfg_ble_auto_off_sec   = prefs.getInt ("ble_off_sec",      120);
   cfg_leds_enabled       = prefs.getBool("leds_en",          false);
   int count = prefs.getInt("wifi_count", 0);
@@ -200,7 +202,7 @@ void saveConfig() {
   prefs.putInt   ("autopoll_int",cfg_autopoll_interval);
   prefs.putInt   ("ble_mode",    cfg_ble_mode);
   prefs.putInt   ("ble_erpm_on", cfg_ble_auto_erpm_on);
-  prefs.putBool  ("ap_wake_move",cfg_ap_wake_on_move);
+  prefs.putInt   ("ap_mode",     cfg_ap_mode);
   prefs.putInt   ("ble_off_sec", cfg_ble_auto_off_sec);
   prefs.putBool  ("leds_en",     cfg_leds_enabled);
   prefs.putInt   ("wifi_count",  cfg_wifi.size());
@@ -636,12 +638,18 @@ static const char PAGE_HTML[] PROGMEM = R"rawliteral(
       <input type="text" id="ap_ssid" maxlength="32" placeholder="VESC-BLE-WiFi">
       <label id="lbl-ap-pass">AP Password (leave empty for open network)</label>
       <input type="password" id="ap_pass" maxlength="64" placeholder="leave empty for open network">
-      <label id="lbl-ap-timeout">AP Timeout in seconds (0 = never off)</label>
-      <input type="text" id="ap_timeout" maxlength="6" placeholder="0">
-      <label class="checkbox-row" style="margin-top:12px">
-        <input type="checkbox" id="ap_wake_on_move" onchange="updateErpmVisibility()">
-        <span id="lbl-ap-wake">Wake AP on movement (re-enable after timeout when riding)</span>
-      </label>
+      <label id="lbl-ap-mode-sel">AP Mode</label>
+      <select id="ap_mode" onchange="document.getElementById('apmode_auto').style.display=this.value==2?'':'none';updateErpmVisibility()" style="width:100%;padding:8px 10px;background:var(--bg3);border:1px solid var(--border);border-radius:4px;color:var(--text);font-family:'Ndot47',system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;font-size:13px">
+        <option value="1" id="opt-apmode-on">On (always on)</option>
+        <option value="2" id="opt-apmode-auto">Auto (on when riding, off when idle)</option>
+      </select>
+      <div id="apmode_auto" style="display:none;margin-top:10px">
+        <label id="lbl-ap-timeout">Idle timeout (seconds, AP off after no movement and no AP client)</label>
+        <input type="text" id="ap_timeout" maxlength="6" placeholder="120">
+        <div style="font-size:11px;color:var(--text3);margin-top:6px" id="lbl-apmode-hint">
+          Like BLE Auto: riding above the ERPM threshold keeps the AP awake and brings it back after timeout. A connected AP client pauses the timer.
+        </div>
+      </div>
     </div>
     <div class="section">
       <h3 id="lbl-blemode-title">BLE Mode</h3>
@@ -664,7 +672,7 @@ static const char PAGE_HTML[] PROGMEM = R"rawliteral(
       <label id="lbl-erpm-power">ERPM threshold to wake BLE/WiFi when riding</label>
       <input type="text" id="ble_auto_erpm_on" maxlength="6" placeholder="200">
       <div style="font-size:11px;color:var(--text3);margin-top:6px" id="lbl-erpm-hint">
-        When BLE Auto mode or AP wake-on-movement is active and has switched off after the idle timeout, riding above this ERPM value switches BLE/AP back on. Higher value = needs faster riding to wake.
+        When BLE Auto mode or AP Auto mode is active and has switched off after the idle timeout, riding above this ERPM value switches BLE/AP back on. Higher value = needs faster riding to wake.
       </div>
     </div>
     <div class="section">
@@ -712,7 +720,7 @@ static const char PAGE_HTML[] PROGMEM = R"rawliteral(
         <span id="lbl-autopoll-enabled">Poll VESC even when Web-UI is closed</span>
       </label>
       <div id="autopoll_forced_hint" style="display:none;font-size:11px;color:var(--accent);margin-top:6px">
-        <span id="lbl-autopoll-forced">Required by BLE Auto mode or AP wake-on-movement — these need ERPM data.</span>
+        <span id="lbl-autopoll-forced">Required by BLE Auto mode or AP Auto mode — these need ERPM data.</span>
       </div>
       <div id="autopoll_opts" style="display:none;margin-top:8px">
         <label id="lbl-autopoll-int">Poll interval (seconds, 1-60)</label>
@@ -833,11 +841,14 @@ function applyTranslations(){
   s('lbl-ap-title',         'Access Point (Fallback)',                     'Access Point (Fallback)');
   s('lbl-ap-name',          'AP Name (SSID)',                              'AP Name (SSID)');
   s('lbl-ap-pass',          'AP Password (leave empty for open network)',   'AP Passwort (leer = offenes Netz)');
-  s('lbl-ap-timeout',       'AP Timeout in seconds (0 = never off)',        'AP Timeout in Sekunden (0 = nie aus)');
-  s('lbl-ap-wake',          'Wake AP on movement (re-enable after timeout when riding)', 'AP bei Bewegung aufwecken (nach Timeout beim Fahren wieder an)');
+  s('lbl-ap-timeout',       'Idle timeout (seconds, AP off after no movement and no AP client)', 'Inaktivit\u00e4ts-Timeout (Sek., AP aus nach Stillstand ohne AP-Client)');
+  s('lbl-ap-mode-sel',      'AP Mode',                                      'AP Modus');
+  s('opt-apmode-on',        'On (always on)',                               'An (immer an)');
+  s('opt-apmode-auto',      'Auto (on when riding, off when idle)',         'Auto (an beim Fahren, aus bei Stillstand)');
+  s('lbl-apmode-hint',      'Like BLE Auto: riding above the ERPM threshold keeps the AP awake and brings it back after timeout. A connected AP client pauses the timer.', 'Wie BLE-Auto: Fahren \u00fcber der ERPM-Schwelle h\u00e4lt den AP wach und holt ihn nach dem Timeout zur\u00fcck. Ein verbundener AP-Client pausiert den Timer.');
   s('lbl-erpm-title',       'Movement Detection',                           'Bewegungserkennung');
   s('lbl-erpm-power',       'ERPM threshold to wake BLE/WiFi when riding', 'ERPM-Schwelle zum Aufwecken von BLE/WLAN beim Fahren');
-  s('lbl-erpm-hint',        'When BLE Auto mode or AP wake-on-movement is active and has switched off after the idle timeout, riding above this ERPM value switches BLE/AP back on. Higher value = needs faster riding to wake.', 'Wenn BLE-Auto-Modus oder AP-Aufwecken bei Bewegung aktiv ist und sich nach dem Timeout abgeschaltet hat, schaltet das \u00dcberschreiten dieses ERPM-Werts beim Fahren BLE/WLAN wieder ein. H\u00f6herer Wert = schnelleres Fahren n\u00f6tig zum Aufwecken.');
+  s('lbl-erpm-hint',        'When BLE Auto mode or AP Auto mode is active and has switched off after the idle timeout, riding above this ERPM value switches BLE/AP back on. Higher value = needs faster riding to wake.', 'Wenn BLE-Auto-Modus oder AP-Auto-Modus aktiv ist und sich nach dem Timeout abgeschaltet hat, schaltet das \u00dcberschreiten dieses ERPM-Werts beim Fahren BLE/WLAN wieder ein. H\u00f6herer Wert = schnelleres Fahren n\u00f6tig zum Aufwecken.');
   s('lbl-conn-title',       'Connection',                                   'Verbindung');
   s('lbl-port',             'TCP Port (default: 65101)',                    'TCP Port (Standard: 65101)');
   s('lbl-vesc-poll',        'Read VESC data (voltage, temp, fault)',        'VESC Daten auslesen (Spannung, Temp, Fault)');
@@ -850,7 +861,7 @@ function applyTranslations(){
   s('lbl-roam-hyst',        'Min. improvement (dB) to actually switch',     'Min. Verbesserung (dB) f\u00fcr Wechsel');
   s('lbl-autopoll-title',   'VESC Auto-Poll',                                'VESC Auto-Polling');
   s('lbl-autopoll-enabled', 'Poll VESC even when Web-UI is closed',          'VESC pollen auch wenn Web-UI geschlossen');
-  s('lbl-autopoll-forced',  'Required by BLE Auto mode or AP wake-on-movement — these need ERPM data.', 'Erforderlich f\u00fcr BLE-Auto-Modus oder AP-Aufwecken bei Bewegung \u2014 diese brauchen ERPM-Daten.');
+  s('lbl-autopoll-forced',  'Required by BLE Auto mode or AP Auto mode — these need ERPM data.', 'Erforderlich f\u00fcr BLE-Auto-Modus oder AP-Auto-Modus \u2014 diese brauchen ERPM-Daten.');
   s('lbl-autopoll-int',     'Poll interval (seconds, 1-60)',                 'Poll-Intervall (Sekunden, 1-60)');
   s('lbl-blemode-title',    'BLE Mode',                                      'BLE Modus');
   s('lbl-leds-title',       'LEDs',                                         'LEDs');
@@ -1032,11 +1043,11 @@ function removeWifi(i){wifiNetworks.splice(i,1);renderWifiList();}
 
 function updateErpmVisibility(){
   var bleAuto = document.getElementById('ble_mode').value==2;
-  var apWake  = document.getElementById('ap_wake_on_move').checked;
-  document.getElementById('erpm_section').style.display=(bleAuto||apWake)?'':'none';
-  // Auto-Poll wird von BLE-Auto und AP-Wake zwingend benoetigt (brauchen ERPM).
+  var apAuto  = document.getElementById('ap_mode').value==2;
+  document.getElementById('erpm_section').style.display=(bleAuto||apAuto)?'':'none';
+  // Auto-Poll wird von BLE-Auto und AP-Auto zwingend benoetigt (brauchen ERPM).
   // In dem Fall den Haken setzen, sperren und die Optionen einblenden.
-  var needPoll = bleAuto || apWake;
+  var needPoll = bleAuto || apAuto;
   var ap = document.getElementById('autopoll_enabled');
   if(needPoll){
     ap.checked = true;
@@ -1056,8 +1067,9 @@ function loadConfig(){
     document.getElementById('ble_name').value    = d.ble_name||'';
     document.getElementById('ap_ssid').value     = d.ap_ssid||'';
     document.getElementById('ap_pass').value     = d.ap_pass||'';
-    document.getElementById('ap_timeout').value  = d.ap_timeout||0;
-    document.getElementById('ap_wake_on_move').checked = d.ap_wake_on_move===true;
+    document.getElementById('ap_timeout').value  = d.ap_timeout||120;
+    document.getElementById('ap_mode').value     = d.ap_mode||1;
+    document.getElementById('apmode_auto').style.display = (d.ap_mode==2)?'':'none';
     document.getElementById('vesc_port').value   = d.port||65101;
     document.getElementById('rx_pin').value      = d.rx_pin||6;
     document.getElementById('tx_pin').value      = d.tx_pin||5;
@@ -1100,7 +1112,7 @@ function showToast(msg, ok, duration){
 }
 
 // Fields that need reboot
-var rebootFields=['ble_name','ap_ssid','ap_pass','ap_timeout','vesc_port','rx_pin','tx_pin'];
+var rebootFields=['ble_name','ap_ssid','ap_pass','vesc_port','rx_pin','tx_pin'];
 function needsReboot(){
   return rebootFields.some(function(id){
     var el=document.getElementById(id);
@@ -1122,8 +1134,8 @@ function saveConfig(){
     ble_name:    document.getElementById('ble_name').value,
     ap_ssid:     document.getElementById('ap_ssid').value,
     ap_pass:     document.getElementById('ap_pass').value,
-    ap_timeout:  parseInt(document.getElementById('ap_timeout').value)||0,
-    ap_wake_on_move: document.getElementById('ap_wake_on_move').checked,
+    ap_timeout:  parseInt(document.getElementById('ap_timeout').value)||120,
+    ap_mode: parseInt(document.getElementById('ap_mode').value)||1,
     port:        parseInt(document.getElementById('vesc_port').value)||65101,
     rx_pin:      parseInt(document.getElementById('rx_pin').value)||6,
     tx_pin:      parseInt(document.getElementById('tx_pin').value)||5,
@@ -1134,7 +1146,7 @@ function saveConfig(){
     roam_enabled:    document.getElementById('roam_enabled').checked,
     roam_threshold:  parseInt(document.getElementById('roam_threshold').value)||-75,
     roam_hysteresis: parseInt(document.getElementById('roam_hysteresis').value)||12,
-    autopoll_enabled:  document.getElementById('autopoll_enabled').checked || (document.getElementById('ble_mode').value==2) || document.getElementById('ap_wake_on_move').checked,
+    autopoll_enabled:  document.getElementById('autopoll_enabled').checked || (document.getElementById('ble_mode').value==2) || (document.getElementById('ap_mode').value==2),
     autopoll_interval: parseInt(document.getElementById('autopoll_interval').value)||5,
     ble_mode:          parseInt(document.getElementById('ble_mode').value),
     ble_auto_erpm_on:  parseInt(document.getElementById('ble_auto_erpm_on').value)||200,
@@ -1270,7 +1282,7 @@ void handleApiInfo() {
   json += "\"ble_mac\":\""+String(NimBLEDevice::getAddress().toString().c_str())+"\",";
   json += "\"wifi_client_connected\":"+String((wifiClient&&wifiClient.connected())?"true":"false")+",";
   json += "\"ap_active\":"+String(apActive?"true":"false")+",";
-  if (apActive && cfg_ap_timeout > 0) {
+  if (apActive && cfg_ap_mode == 2 && cfg_ap_timeout > 0) {
     if (WiFi.softAPgetStationNum() > 0) {
       // Client verbunden -> Timer pausiert
       json += "\"ap_timeout_remaining\":-2,";
@@ -1338,7 +1350,7 @@ void handleApiConfigGet() {
   json += "\"autopoll_interval\":"+String(cfg_autopoll_interval)+",";
   json += "\"ble_mode\":"+String(cfg_ble_mode)+",";
   json += "\"ble_auto_erpm_on\":"+String(cfg_ble_auto_erpm_on)+",";
-  json += "\"ap_wake_on_move\":"+String(cfg_ap_wake_on_move?"true":"false")+",";
+  json += "\"ap_mode\":"+String(cfg_ap_mode)+",";
   json += "\"ble_auto_off_sec\":"+String(cfg_ble_auto_off_sec)+",";
   json += "\"leds_enabled\":"+String(cfg_leds_enabled?"true":"false")+",";
   json += "\"update_url\":\""+cfg_update_url+"\",";
@@ -1414,7 +1426,7 @@ void handleApiConfigPost() {
   cfg_autopoll_interval = parseInt2("autopoll_interval", 5);
   cfg_ble_mode          = parseInt2("ble_mode", 1);
   cfg_ble_auto_erpm_on  = parseInt2("ble_auto_erpm_on", 200);
-  cfg_ap_wake_on_move   = (body.indexOf("\"ap_wake_on_move\":true") >= 0);
+  cfg_ap_mode           = parseInt2("ap_mode", 1);
   cfg_ble_auto_off_sec  = parseInt2("ble_auto_off_sec", 120);
   bool ledsWasEnabled   = cfg_leds_enabled;   // alten Zustand merken
   cfg_leds_enabled      = (body.indexOf("\"leds_enabled\":true") >= 0);
@@ -1424,6 +1436,8 @@ void handleApiConfigPost() {
   if (cfg_autopoll_interval < 1)   cfg_autopoll_interval = 1;
   if (cfg_autopoll_interval > 60)  cfg_autopoll_interval = 60;
   if (cfg_ble_mode < 0 || cfg_ble_mode > 2) cfg_ble_mode = 1;
+  if (cfg_ap_mode < 1 || cfg_ap_mode > 2)   cfg_ap_mode = 1;   // kein "Aus"
+  if (cfg_ap_mode == 2 && cfg_ap_timeout <= 0) cfg_ap_timeout = 120; // Auto braucht sinnvollen Idle-Timeout
   if (cfg_ble_auto_erpm_on < 10)    cfg_ble_auto_erpm_on = 10;
   if (cfg_ble_auto_erpm_on > 50000) cfg_ble_auto_erpm_on = 50000;
   if (cfg_ble_auto_off_sec < 5)     cfg_ble_auto_off_sec = 5;
@@ -2093,9 +2107,11 @@ void pollVesc() {
   }
 
   // ── Anfrage-Phase: pruefen, ob ueberhaupt gepollt werden soll ─────────────
-  // Eine bewegungs-abhaengige Funktion (BLE-Auto / AP-Wake-on-Move) braucht
-  // ERPM ZWINGEND — auch wenn der normale "VESC Daten auslesen"-Haken aus ist.
-  bool needErpmForWake = (cfg_ble_mode == 2) || cfg_ap_wake_on_move;
+  // Eine bewegungs-abhaengige Funktion braucht ERPM ZWINGEND — auch wenn der
+  // normale "VESC Daten auslesen"-Haken aus ist. Das gilt fuer den BLE-Auto-
+  // Modus UND fuer den AP-Auto-Modus (fahren haelt den AP wach / holt ihn
+  // zurueck, genau wie BLE-Auto).
+  bool needErpmForWake = (cfg_ble_mode == 2) || (cfg_ap_mode == 2);
   if (!cfg_vesc_poll && !needErpmForWake) return;
 
   bool autoPollActive  = cfg_autopoll_enabled || needErpmForWake;
@@ -2640,19 +2656,43 @@ void loop() {
   otaServer.handleClient();
   dnsServer.processNextRequest();
 
-  // AP-Timeout: schaltet den AP gezielt ab (apWanted = false), wenn konfiguriert
-  // und niemand am AP hängt. Danach hält der Watchdog ihn NICHT mehr am Leben.
-  // Verhalten wie beim BLE-Auto-Modus: der Timer laeuft rein idle-basiert
-  // (kein AP-Client + kein Wake-on-Move-Trigger) und ist BEWUSST NICHT an eine
-  // STA-Verbindung gekoppelt. Auf dem fahrenden Scooter gibt es meist kein
-  // Heim-WLAN -> ein STA-Gate wuerde den Timeout dort komplett aushebeln und der
-  // AP bliebe dauerhaft an (genau das wollen wir nicht).
-  // Rueckweg, wenn der AP nach Timeout aus ist:
-  //   - Wake-on-Move aktiv -> AP kommt bei Bewegung von selbst zurueck (wie BT).
-  //   - sonst -> Zugriff erst nach Reboot/Power-Cycle bzw. sobald wieder ein
-  //     bekanntes STA-Netz in Reichweite ist. Der Timeout ist opt-in
-  //     (cfg_ap_timeout > 0), das Abschalten ist also gewollt.
-  if (apActive && cfg_ap_timeout > 0) {
+  // AP-Modus (analog BLE-Modus):
+  //   1 = An   : AP immer an (klassisch), Timeout-Logik inaktiv.
+  //   2 = Auto : verhaelt sich wie BLE-Auto — fahren haelt den AP wach, Stillstand
+  //              ohne AP-Client schaltet ihn nach cfg_ap_timeout Sek. ab, naechste
+  //              Bewegung holt ihn zurueck. KEIN "Aus" (AP ist der Fallback-Zugang).
+  //
+  // Modus-Wechsel zur Laufzeit sauber behandeln (ohne Reboot, wie BLE):
+  static int lastApMode = -1;
+  if (cfg_ap_mode != lastApMode) {
+    if (lastApMode != -1) {
+      if (cfg_ap_mode == 1 && !apActive) {
+        // Auto -> An: AP sofort wieder hochziehen (STA bleibt unberuehrt).
+        apWanted = true;
+        apOffByTimeout = false;
+        if (WiFi.getMode() != WIFI_AP_STA) WiFi.mode(WIFI_AP_STA);
+        ensureAP(true);
+        Serial.println("AP mode -> ON: AP restored");
+      } else if (cfg_ap_mode == 2) {
+        // An -> Auto: Idle-Timer frisch starten, sonst wuerde ref=apStartTime
+        // (evtl. lange her) sofort einen Timeout ausloesen.
+        apLastClientGone = millis();
+        apLastStationNum = WiFi.softAPgetStationNum();
+        Serial.println("AP mode -> AUTO: idle timer started");
+      }
+    }
+    lastApMode = cfg_ap_mode;
+  }
+
+  // AP-Idle-Timeout (nur im Auto-Modus): schaltet den AP ab, wenn niemand am AP
+  // haengt und nicht gefahren wird. Danach haelt der Watchdog ihn NICHT mehr am
+  // Leben. BEWUSST NICHT an eine STA-Verbindung gekoppelt — auf dem fahrenden
+  // Scooter gibt es meist kein Heim-WLAN, ein STA-Gate wuerde den Timeout dort
+  // komplett aushebeln.
+  // Rueckweg: naechste Bewegung holt den AP zurueck (siehe Wake-Block unten).
+  // Steht der Scooter dauerhaft ohne STA-Netz, ist der ESP bis zur naechsten
+  // Bewegung/Reboot nicht per WLAN erreichbar — im Auto-Modus so gewollt.
+  if (apActive && cfg_ap_mode == 2 && cfg_ap_timeout > 0) {
     int stations = WiFi.softAPgetStationNum();
     // Flanke erkennen: ist gerade das letzte Geraet abgefallen?
     if (stations == 0 && apLastStationNum > 0) {
@@ -2661,11 +2701,11 @@ void loop() {
     }
     apLastStationNum = stations;
 
-    // Bewegung haelt den AP wach (analog BLE-Auto-Modus): wenn Wake-on-Move
-    // aktiv ist und |ERPM| ueber der Schwelle liegt, Timer zuruecksetzen.
-    // So flackert der AP nicht, solange gefahren wird. Greift nur bei
-    // aktiviertem Wake-on-Move; sonst bleibt der Timeout rein zeitbasiert.
-    if (cfg_ap_wake_on_move && vescStatus.connected) {
+    // Bewegung haelt den AP wach — 1:1 wie der BLE-Auto-Modus. Solange der
+    // VESC verbunden ist und |ERPM| ueber der Schwelle liegt, wird die
+    // Referenzzeit laufend aufgefrischt -> der Timer laeuft nie ab, solange
+    // gefahren wird.
+    if (vescStatus.connected) {
       int32_t absErpm = vescStatus.erpm < 0 ? -vescStatus.erpm : vescStatus.erpm;
       if (absErpm > cfg_ble_auto_erpm_on) {
         apLastClientGone = millis();   // Referenzzeit auffrischen = Timer reset
@@ -2680,7 +2720,7 @@ void loop() {
     unsigned long ref = (apLastClientGone > 0) ? apLastClientGone : apStartTime;
 
     if (stations == 0 && millis() - ref > (unsigned long)cfg_ap_timeout * 1000UL) {
-      Serial.println("AP timeout — shutting down AP, keeping STA");
+      Serial.println("AP auto: idle timeout — shutting down AP, keeping STA");
       apWanted = false;
       WiFi.softAPdisconnect(true);    // AP stoppen + AP-Config loeschen
       // Mode hart auf reines STA setzen. Das verhindert, dass die IDF einen
@@ -2692,15 +2732,16 @@ void loop() {
     }
   }
 
-  // AP Wake-on-Move: wenn der AP per Timeout aus ist und der Haken gesetzt ist,
-  // den AP bei Bewegung (|ERPM| > Schwelle) wieder hochziehen. WLAN/STA bleibt
-  // dabei unberuehrt — wir holen nur den AP zurueck.
-  if (apOffByTimeout && cfg_ap_wake_on_move && !apActive) {
+  // AP-Rueckkehr bei Bewegung — 1:1 wie BT-Auto beim Aufwecken. Ist der AP per
+  // Idle-Timeout aus und der Scooter faehrt wieder an (|ERPM| > Schwelle), wird
+  // der AP wieder hochgezogen. WLAN/STA bleibt dabei unberuehrt.
+  if (apOffByTimeout && cfg_ap_mode == 2 && !apActive) {
     int32_t absErpm = vescStatus.erpm < 0 ? -vescStatus.erpm : vescStatus.erpm;
     if (vescStatus.connected && absErpm > cfg_ble_auto_erpm_on) {
       Serial.printf("AP wake: movement (erpm=%d) -> AP back on\n", (int)vescStatus.erpm);
       apWanted = true;
       apOffByTimeout = false;
+      apLastClientGone = millis();   // Timer frisch starten, damit er nicht sofort wieder ablaeuft
       if (WiFi.getMode() != WIFI_AP_STA) WiFi.mode(WIFI_AP_STA);
       ensureAP(true);
     }
