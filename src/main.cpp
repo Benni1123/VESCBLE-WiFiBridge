@@ -2268,9 +2268,9 @@ void pollVesc() {
 // Intervall-Einheit: 0.625 ms.
 static const uint16_t      ADV_FAST_MIN       = 32;    //  20 ms  (schnelle Discovery)
 static const uint16_t      ADV_FAST_MAX       = 64;    //  40 ms
-static const uint16_t      ADV_SLOW_MIN       = 3200;  // 2000 ms (Idle: Airtime maximal an WLAN abgeben)
-static const uint16_t      ADV_SLOW_MAX       = 4800;  // 3000 ms
-static const unsigned long ADV_FAST_WINDOW_MS = 8000;  // nur 8 s schnell, dann langsam
+static const uint16_t      ADV_SLOW_MIN       = 1216;  //  760 ms  (Apple-empfohlener Wert:
+static const uint16_t      ADV_SLOW_MAX       = 1636;  // 1022 ms   zuverlaessig auffindbar, spart trotzdem Airtime)
+static const unsigned long ADV_FAST_WINDOW_MS = 15000; // 15 s schnell, dann langsam
 static bool                advSlowActive      = false; // aktuell im HW gesetztes Intervall (Quelle der Wahrheit)
 static unsigned long       advStartedAt       = 0;     // seit wann ununterbrochen idle-geadvertised (0 = nicht)
 
@@ -2306,7 +2306,7 @@ static void manageAdvInterval() {
     NimBLEDevice::stopAdvertising();
     applyAdvInterval(true);
     NimBLEDevice::startAdvertising();
-    dlog("BLE adv: idle -> langsames Intervall (WiFi-Airtime)\n");
+    dlog("BLE adv: idle -> langsames Intervall\n");
   }
 }
 
