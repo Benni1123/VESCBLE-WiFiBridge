@@ -82,7 +82,7 @@ int    cfg_autoreboot_time    = 300;
 bool   cfg_autoreboot_no_wifi = false;
 bool   cfg_debug              = false;
 int    cfg_log_size           = 50;
-int    cfg_debug_filter       = 7; // bitmask: 1=BLE 2=WiFi 4=Poll
+int    cfg_debug_filter       = 7; // bitmask: 1=BLE 2=WiFi 4=Poll 8=Status(BT/WLAN)
 bool   cfg_roam_enabled       = false; // RSSI-basiertes Roaming (gleiche SSID, anderer AP)
 int    cfg_roam_threshold     = -75;   // ab diesem RSSI (dBm) wird nach besserem AP gesucht
 int    cfg_roam_hysteresis    = 12;    // neuer AP muss min. so viele dB staerker sein
@@ -348,6 +348,29 @@ static void uartLogAdd(const String &line) {
   if (!cfg_debug) return;
   uartLog.push_back(line);
   while ((int)uartLog.size() > cfg_log_size) uartLog.erase(uartLog.begin());
+}
+
+// dlog(): BT/WLAN-Statusmeldungen. Gibt IMMER auf Serial aus (wie bisher) und
+// schreibt zusaetzlich ins UART-Log auf dem API-Tab, wenn der Debug-Modus an
+// ist und der "Status"-Filter (Bit 8) gesetzt ist. Anzeige, Refresh und Clear
+// laufen ueber die vorhandene UART-Log-UI — keine eigene Anzeige noetig.
+void dlog(const char *fmt, ...) {
+  char buf[200];
+  va_list args;
+  va_start(args, fmt);
+  vsnprintf(buf, sizeof(buf), fmt, args);
+  va_end(args);
+  Serial.print(buf);                                   // Serial IMMER
+  if (!cfg_debug || !(cfg_debug_filter & 8)) return;   // UI nur bei Debug+Status
+  size_t len = strlen(buf);
+  while (len && (buf[len-1] == '\n' || buf[len-1] == '\r')) buf[--len] = 0;
+  if (!len) return;
+  String line = String(millis() / 1000) + "s " + buf;
+  // uartLog wird 1:1 in ein JSON-Array eingebettet -> Anfuehrungszeichen und
+  // Backslashes entschaerfen, sonst bricht /api/uart/log.
+  line.replace("\\", "/");
+  line.replace("\"", "'");
+  uartLogAdd(line);
 }
 
 static String vescFaultToString(int code);
@@ -761,6 +784,7 @@ static const char PAGE_HTML[] PROGMEM = R"rawliteral(
         <input type="checkbox" id="leds_enabled">
         <span id="lbl-leds-enabled">Enable WS28XX control</span>
       </label>
+
     </div>
     <button class="btn" onclick="saveConfig()" id="saveBtn">Save</button>
     <button class="btn" style="margin-top:8px;background:#e0a030" onclick="restartDevice()" id="restartBtn">Restart</button>
@@ -826,8 +850,11 @@ static const char PAGE_HTML[] PROGMEM = R"rawliteral(
             <label class="checkbox-row" style="margin-top:4px;display:inline-flex;margin-right:12px">
               <input type="checkbox" id="dbg_wifi" onchange="updateFilter()"> WiFi
             </label>
-            <label class="checkbox-row" style="margin-top:4px;display:inline-flex">
+            <label class="checkbox-row" style="margin-top:4px;display:inline-flex;margin-right:12px">
               <input type="checkbox" id="dbg_poll" onchange="updateFilter()"> Poll
+            </label>
+            <label class="checkbox-row" style="margin-top:4px;display:inline-flex">
+              <input type="checkbox" id="dbg_status" onchange="updateFilter()"> Status
             </label>
           </div>
           <div style="display:flex;gap:8px;margin-bottom:8px">
@@ -1195,11 +1222,11 @@ function saveConfig(){
 
 // Debug
 function updateFilter(){
-  var f=(document.getElementById('dbg_ble').checked?1:0)|(document.getElementById('dbg_wifi').checked?2:0)|(document.getElementById('dbg_poll').checked?4:0);
+  var f=(document.getElementById('dbg_ble').checked?1:0)|(document.getElementById('dbg_wifi').checked?2:0)|(document.getElementById('dbg_poll').checked?4:0)|(document.getElementById('dbg_status').checked?8:0);
   fetch('/api/debug?en=1&filter='+f,{method:'POST'});
 }
 function setDebug(on){
-  var f=(document.getElementById('dbg_ble').checked?1:0)|(document.getElementById('dbg_wifi').checked?2:0)|(document.getElementById('dbg_poll').checked?4:0);
+  var f=(document.getElementById('dbg_ble').checked?1:0)|(document.getElementById('dbg_wifi').checked?2:0)|(document.getElementById('dbg_poll').checked?4:0)|(document.getElementById('dbg_status').checked?8:0);
   fetch('/api/debug?en='+(on?1:0)+'&filter='+f,{method:'POST'}).then(function(){
     document.getElementById('debugLogWrap').style.display=on?'':'none';
     if(on)loadUartLog();
@@ -1219,6 +1246,7 @@ function initDebugTab(){
     document.getElementById('dbg_ble').checked  = !!(d.filter & 1);
     document.getElementById('dbg_wifi').checked = !!(d.filter & 2);
     document.getElementById('dbg_poll').checked = !!(d.filter & 4);
+    document.getElementById('dbg_status').checked = !!(d.filter & 8);
     document.getElementById('debugLogWrap').style.display=d.enabled?'':'none';
     if(d.enabled)loadUartLog();
   }).catch(function(){});
@@ -1684,7 +1712,7 @@ static unsigned long lastMovementTime  = 0;
 
 class MyServerCallbacks : public BLEServerCallbacks {
   void onConnect(NimBLEServer *pServer, ble_gap_conn_desc *desc) {
-    Serial.printf("BLE connected: %s\n", NimBLEAddress(desc->peer_ota_addr).toString().c_str());
+    dlog("BLE connected: %s\n", NimBLEAddress(desc->peer_ota_addr).toString().c_str());
     deviceConnected = true;
     // Entspanntes Verbindungsintervall anfordern, damit BLE waehrend einer aktiven
     // Verbindung weniger Funkzeit belegt und mehr Airtime fuers WLAN uebrig bleibt.
@@ -1698,7 +1726,7 @@ class MyServerCallbacks : public BLEServerCallbacks {
     if (cfg_ble_mode == 1) NimBLEDevice::startAdvertising();
   }
   void onDisconnect(NimBLEServer *pServer) {
-    Serial.println("BLE disconnected");
+    dlog("BLE disconnected\n");
     deviceConnected = false;
     // Nur erneut advertisen, wenn der Modus das zulaesst und wir laut Zustand
     // gerade advertisen sollen. Sonst greift handleBleMode() im Loop nach.
@@ -1811,7 +1839,7 @@ void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
 static void tuneApDhcp() {
   esp_netif_t *ap = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
   if (ap == nullptr) {
-    Serial.println("AP tune: kein AP-netif gefunden");
+    dlog("AP tune: kein AP-netif gefunden\n");
     return;
   }
 
@@ -1831,7 +1859,7 @@ static void tuneApDhcp() {
 
   // DHCP-Server wieder starten.
   esp_err_t e = esp_netif_dhcps_start(ap);
-  Serial.printf("AP tune: DHCP lease=%lumin, dhcps_start=%d\n",
+  dlog("AP tune: DHCP lease=%lumin, dhcps_start=%d\n",
                 (unsigned long)leaseMinutes, (int)e);
 
   // Beacon-Intervall senken (Default 100ms). 100ms ist schon gut; wir setzen es
@@ -1869,7 +1897,7 @@ static void tuneApDhcp() {
   // macht aber oft Verbindungsaerger (Repeater/Router) -> HT20 ist stabiler.
   esp_wifi_set_bandwidth(WIFI_IF_AP, WIFI_BW_HT20);
 
-  Serial.println("AP tune: ps=MIN_MODEM (BT-Koexistenz), TX-power max, proto=BGN, bw=HT20");
+  dlog("AP tune: ps=MIN_MODEM (BT-Koexistenz), TX-power max, proto=BGN, bw=HT20\n");
 }
 
 bool ensureAP(bool force) {
@@ -1922,10 +1950,10 @@ bool ensureAP(bool force) {
       return true;   // AP laeuft korrekt (richtige SSID + Channel) -> nichts tun
     }
     // Channel weicht ab (STA hat den Channel geaendert) -> Neustart noetig.
-    Serial.printf("AP: channel changed (%d -> %d), restarting AP once\n", curCh, ch);
+    dlog("AP: channel changed (%d -> %d), restarting AP once\n", curCh, ch);
   } else if (apLooksUp && !ssidOk) {
     // Falsche SSID laeuft (z.B. IDF-Default "ESP-XXXX") -> softAP() erzwingen.
-    Serial.printf("AP: wrong SSID running ('%s', want '%s') -> starting correct AP\n",
+    dlog("AP: wrong SSID running ('%s', want '%s') -> starting correct AP\n",
                   runningSsid.c_str(), cfg_ap_ssid.c_str());
   }
 
@@ -1957,23 +1985,23 @@ bool ensureAP(bool force) {
       apLastClientGone = 0;   // frischer Start: Idle-Timer laeuft ab AP-Start
       apLastStationNum = 0;
       apOffByTimeout = false; // AP laeuft wieder -> Timeout-Flag loeschen
-      Serial.printf("AP (re)started: %s ch=%d ip=%s (try %d)\n",
+      dlog("AP (re)started: %s ch=%d ip=%s (try %d)\n",
                     cfg_ap_ssid.c_str(), ch, ip.toString().c_str(), attempt);
       tuneApDhcp();   // DHCP-Lease verkuerzen + Beacon/AP-Parameter optimieren
       return true;
     }
-    Serial.printf("AP start attempt %d failed (ok=%d ip=%s) — retrying\n",
+    dlog("AP start attempt %d failed (ok=%d ip=%s) — retrying\n",
                   attempt, ok ? 1 : 0, ip.toString().c_str());
     // Vor dem naechsten Versuch Mode neu setzen, Stack durchatmen lassen.
     WiFi.mode(WIFI_AP_STA);
     delay(200);
   }
-  Serial.println("AP start FAILED after 5 attempts!");
+  dlog("AP start FAILED after 5 attempts!\n");
   return false;
 }
 
 bool setupAccessPoint() {
-  Serial.printf("AP: %s\n", cfg_ap_ssid.c_str());
+  dlog("AP: %s\n", cfg_ap_ssid.c_str());
   apWanted = true;            // AP soll dauerhaft laufen
 
   bool ok = ensureAP(true);   // initial forciert starten (hat selbst 5 Retries)
@@ -1982,7 +2010,7 @@ bool setupAccessPoint() {
   // Eskalation: AP kam trotz 5 Versuchen nicht hoch. Jetzt WLAN-Stack KOMPLETT
   // zuruecksetzen und von vorne. Das hilft gegen haengenden/halb-initialisierten
   // WLAN-Treiber, den ein blosses softAP()-Retry nicht loest.
-  Serial.println("AP: hard reset of WiFi stack and retry...");
+  dlog("AP: hard reset of WiFi stack and retry...\n");
   WiFi.disconnect(true, true);   // STA trennen + Config loeschen
   WiFi.softAPdisconnect(true);   // AP stoppen + Config loeschen
   WiFi.mode(WIFI_OFF);
@@ -1990,9 +2018,9 @@ bool setupAccessPoint() {
   WiFi.mode(WIFI_AP_STA);
   delay(300);
   ok = ensureAP(true);
-  if (ok) { Serial.println("AP: recovered after stack reset"); return true; }
+  if (ok) { dlog("AP: recovered after stack reset\n"); return true; }
 
-  Serial.println("AP: STILL failing after stack reset!");
+  dlog("AP: STILL failing after stack reset!\n");
   return false;
 }
 
@@ -2010,7 +2038,7 @@ static void staApplyIpConfig(const String &ssid) {
     if (w.ssid == ssid) {
       if (w.staticIp && w.ip.length() > 0 &&
           applyStaticConfig(w.ip, w.gateway, w.subnet, w.dns)) {
-        Serial.printf("WiFi: static IP %s fuer '%s' gesetzt (vor begin)\n",
+        dlog("WiFi: static IP %s fuer '%s' gesetzt (vor begin)\n",
                       w.ip.c_str(), ssid.c_str());
       } else {
         // kein/ungueltiges Static -> DHCP erzwingen (0.0.0.0 = DHCP-Client an)
@@ -2033,8 +2061,8 @@ static void staBegin(const String &ssid, const String &pass) {
 }
 
 bool setupWiFiClient() {
-  if (cfg_wifi.empty()) { Serial.println("WiFi: no networks configured"); return false; }
-  Serial.println("WiFi Client: connecting...");
+  if (cfg_wifi.empty()) { dlog("WiFi: no networks configured\n"); return false; }
+  dlog("WiFi Client: connecting...\n");
   WiFi.mode(WIFI_AP_STA);
   WiFi.setHostname(cfg_hostname.c_str());
   esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT20);   // 20 MHz auch fuer STA (Stabilitaet)
@@ -2071,7 +2099,7 @@ bool setupWiFiClient() {
     if (n.ssid==csid && n.staticIp && n.ip.length()>0) {
       // wifiMulti hat per DHCP verbunden. Static NACHtraeglich zu setzen ist
       // unzuverlaessig -> einmal sauber neu verbinden MIT config vor begin.
-      Serial.println("WiFi: static IP -> sauberer Reconnect (config vor begin)");
+      dlog("WiFi: static IP -> sauberer Reconnect (config vor begin)\n");
       WiFi.disconnect(false, false);
       delay(50);
       staBegin(csid, n.pass);
@@ -2278,7 +2306,7 @@ static void manageAdvInterval() {
     NimBLEDevice::stopAdvertising();
     applyAdvInterval(true);
     NimBLEDevice::startAdvertising();
-    Serial.println("BLE adv: idle -> langsames Intervall (WiFi-Airtime)");
+    dlog("BLE adv: idle -> langsames Intervall (WiFi-Airtime)\n");
   }
 }
 
@@ -2294,18 +2322,18 @@ void handleBleMode() {
       if (pServer && pServer->getConnectedCount() > 0) { pServer->disconnect(0); delay(50); }
       NimBLEDevice::stopAdvertising();
       bleIsAdvertising = false;
-      Serial.println("BLE mode: OFF");
+      dlog("BLE mode: OFF\n");
     } else if (cfg_ble_mode == 1) {
       // An
       NimBLEDevice::startAdvertising();
       bleIsAdvertising = true;
-      Serial.println("BLE mode: ON");
+      dlog("BLE mode: ON\n");
     } else {
       // Auto: Default beim Boot/Wechsel -> an, Timer startet
       NimBLEDevice::startAdvertising();
       bleIsAdvertising = true;
       lastMovementTime = millis();
-      Serial.println("BLE mode: AUTO (starting ON)");
+      dlog("BLE mode: AUTO (starting ON)\n");
     }
   }
 
@@ -2323,7 +2351,7 @@ void handleBleMode() {
     if (!bleIsAdvertising) {
       NimBLEDevice::startAdvertising();
       bleIsAdvertising = true;
-      Serial.printf("BLE auto: movement (erpm=%d) -> ON\n", (int)vescStatus.erpm);
+      dlog("BLE auto: movement (erpm=%d) -> ON\n", (int)vescStatus.erpm);
     }
     return;
   }
@@ -2339,7 +2367,7 @@ void handleBleMode() {
     if (!bleIsAdvertising) {
       NimBLEDevice::startAdvertising();
       bleIsAdvertising = true;
-      Serial.println("BLE auto: client active -> ON");
+      dlog("BLE auto: client active -> ON\n");
     }
     return;
   }
@@ -2348,7 +2376,7 @@ void handleBleMode() {
   if (bleIsAdvertising) {
     unsigned long idleMs = millis() - lastMovementTime;
     if (idleMs >= (unsigned long)cfg_ble_auto_off_sec * 1000UL) {
-      Serial.printf("BLE auto: idle %lus, no client -> OFF\n", idleMs/1000);
+      dlog("BLE auto: idle %lus, no client -> OFF\n", idleMs/1000);
       NimBLEDevice::stopAdvertising();
       bleIsAdvertising = false;
     }
@@ -2522,7 +2550,7 @@ void handleWiFiReconnect() {
           break;
         }
       }
-      Serial.printf("WiFi connected: %s | IP: %s\n",
+      dlog("WiFi connected: %s | IP: %s\n",
                     WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
       if (cfg_ble_mode == 1 || (cfg_ble_mode == 2 && bleIsAdvertising)) {
         NimBLEDevice::startAdvertising();
@@ -2575,7 +2603,7 @@ void handleWiFiReconnect() {
 
   // ── NOTNAGEL: hartnaeckiger Haenger -> kompletter STA-Stack-Neustart ───────
   if (now - staDownSince > STA_HARD_RESTART_MS) {
-    Serial.println("WiFi: hard STA stack restart (haengt zu lange)");
+    dlog("WiFi: hard STA stack restart (haengt zu lange)\n");
     WiFi.scanDelete();
     scanInProgress = false;
     staConnecting  = false;
@@ -2598,10 +2626,10 @@ void handleWiFiReconnect() {
       // Timeout -> Versuch abbrechen.
       staConnecting = false;
       staConnectFails++;
-      Serial.printf("WiFi: connect timeout (fail #%d)\n", staConnectFails);
+      dlog("WiFi: connect timeout (fail #%d)\n", staConnectFails);
       lastReconnectTry = now;   // Pause bis zum naechsten Scan
       if (staConnectFails >= 3) {
-        Serial.println("WiFi: hard STA reset after repeated failures");
+        dlog("WiFi: hard STA reset after repeated failures\n");
         WiFi.disconnect(false, false);
         delay(200);
         wifiMulti = WiFiMulti();
@@ -2633,7 +2661,7 @@ void handleWiFiReconnect() {
 
   if (res == WIFI_SCAN_RUNNING) {
     if (now - scanStartTime > 12000) {
-      Serial.println("WiFi: scan timeout -> reset scan state");
+      dlog("WiFi: scan timeout -> reset scan state\n");
       WiFi.scanDelete();
       scanInProgress = false;
       lastReconnectTry = now;
@@ -2663,7 +2691,7 @@ void handleWiFiReconnect() {
     // Kein bekanntes Netz in Reichweite (typisch: unterwegs) -> Backoff.
     unsigned long doubled = staScanInterval * 2;
     staScanInterval = (doubled > STA_SCAN_MAX_MS) ? STA_SCAN_MAX_MS : doubled;
-    Serial.printf("WiFi: kein bekanntes Netz -> naechster Scan in %lus\n",
+    dlog("WiFi: kein bekanntes Netz -> naechster Scan in %lus\n",
                   (unsigned long)(staScanInterval / 1000));
     return;
   }
@@ -2675,7 +2703,7 @@ void handleWiFiReconnect() {
     if (w.ssid == bestSsid) { pass = w.pass; break; }
   }
   if (WiFi.getMode() != WIFI_AP_STA) WiFi.mode(WIFI_AP_STA);
-  Serial.printf("WiFi: known network '%s' (RSSI %d) -> connecting (nonblocking)\n",
+  dlog("WiFi: known network '%s' (RSSI %d) -> connecting (nonblocking)\n",
                 bestSsid.c_str(), (int)bestRssi);
   staBegin(bestSsid, pass);   // IP-Config (static/DHCP) VOR begin, dann verbinden
   staConnecting   = true;
@@ -2689,7 +2717,7 @@ void setup() {
   Serial.println("\n=== VESC BLE/WiFi Bridge ===");
 
   loadConfig();
-  Serial.printf("BLE Name: %s | WiFi networks: %d\n", cfg_ble_name.c_str(), cfg_wifi.size());
+  dlog("BLE Name: %s | WiFi networks: %d\n", cfg_ble_name.c_str(), cfg_wifi.size());
   Serial.printf("Free heap: %d bytes\n", ESP.getFreeHeap());
 
   Serial1.setRxBufferSize(512);
@@ -2720,10 +2748,10 @@ void setup() {
   if (cfg_ble_mode != 0) {
     pAdv->start();
     bleIsAdvertising = true;
-    Serial.printf("BLE advertising: %s\n", cfg_ble_name.c_str());
+    dlog("BLE advertising: %s\n", cfg_ble_name.c_str());
   } else {
     bleIsAdvertising = false;
-    Serial.println("BLE mode: OFF (no advertising at boot)");
+    dlog("BLE mode: OFF (no advertising at boot)\n");
   }
   // Initialer Bewegungs-Zeitstempel fuer Auto-Modus
   lastMovementTime = millis();
@@ -2811,7 +2839,7 @@ void loop() {
     apWanted       = true;
     apOffByTimeout = false;
     if (!apActive) {
-      Serial.println("AP-Safety: Werkszustand (unkonfiguriert) -> AP erzwingen");
+      dlog("AP-Safety: Werkszustand (unkonfiguriert) -> AP erzwingen\n");
       if (WiFi.getMode() != WIFI_AP_STA) WiFi.mode(WIFI_AP_STA);
       ensureAP(true);
     }
@@ -2833,13 +2861,13 @@ void loop() {
         apOffByTimeout = false;
         if (WiFi.getMode() != WIFI_AP_STA) WiFi.mode(WIFI_AP_STA);
         ensureAP(true);
-        Serial.println("AP mode -> ON: AP restored");
+        dlog("AP mode -> ON: AP restored\n");
       } else if (cfg_ap_mode == 2) {
         // An -> Auto: Idle-Timer frisch starten, sonst wuerde ref=apStartTime
         // (evtl. lange her) sofort einen Timeout ausloesen.
         apLastClientGone = millis();
         apLastStationNum = WiFi.softAPgetStationNum();
-        Serial.println("AP mode -> AUTO: idle timer started");
+        dlog("AP mode -> AUTO: idle timer started\n");
       }
     }
     lastApMode = cfg_ap_mode;
@@ -2858,7 +2886,7 @@ void loop() {
     // Flanke erkennen: ist gerade das letzte Geraet abgefallen?
     if (stations == 0 && apLastStationNum > 0) {
       apLastClientGone = millis();   // Timer ab JETZT neu starten
-      Serial.println("AP: last client left — idle timer restarted");
+      dlog("AP: last client left — idle timer restarted\n");
     }
     apLastStationNum = stations;
 
@@ -2881,7 +2909,7 @@ void loop() {
     unsigned long ref = (apLastClientGone > 0) ? apLastClientGone : apStartTime;
 
     if (stations == 0 && millis() - ref > (unsigned long)cfg_ap_timeout * 1000UL) {
-      Serial.println("AP auto: idle timeout — shutting down AP, keeping STA");
+      dlog("AP auto: idle timeout — shutting down AP, keeping STA\n");
       apWanted = false;
       WiFi.softAPdisconnect(true);    // AP stoppen + AP-Config loeschen
       // Mode hart auf reines STA setzen. Das verhindert, dass die IDF einen
@@ -2899,7 +2927,7 @@ void loop() {
   if (apOffByTimeout && cfg_ap_mode == 2 && !apActive) {
     int32_t absErpm = vescStatus.erpm < 0 ? -vescStatus.erpm : vescStatus.erpm;
     if (vescStatus.connected && absErpm > cfg_ble_auto_erpm_on) {
-      Serial.printf("AP wake: movement (erpm=%d) -> AP back on\n", (int)vescStatus.erpm);
+      dlog("AP wake: movement (erpm=%d) -> AP back on\n", (int)vescStatus.erpm);
       // apWanted MUSS gesetzt werden, sobald ERPM ueber der Schwelle liegt —
       // damit halten auch Watchdog/Safety den AP ab jetzt am Leben.
       apWanted = true;
@@ -2912,7 +2940,7 @@ void loop() {
       if (ensureAP(true)) {
         apOffByTimeout = false;
       } else {
-        Serial.println("AP wake: Start fehlgeschlagen -> Retry im naechsten Loop");
+        dlog("AP wake: Start fehlgeschlagen -> Retry im naechsten Loop\n");
       }
     }
   }
@@ -2940,7 +2968,7 @@ void loop() {
       if (!apSsidOk) {
         apWatchdogFails++;
         diagApWatchdogFires++;
-        Serial.printf("AP reconcile: soll AN, sendet nicht/falsch ('%s', fail #%d) -> ensureAP\n",
+        dlog("AP reconcile: soll AN, sendet nicht/falsch ('%s', fail #%d) -> ensureAP\n",
                       WiFi.softAPSSID().c_str(), apWatchdogFails);
         ensureAP(true);
       } else {
@@ -2955,7 +2983,7 @@ void loop() {
       bool apStillBroadcasting = apSsidOk || apBitSet;
       if (apStillBroadcasting) {
         diagApWatchdogFires++;
-        Serial.println("AP reconcile: soll AUS, sendet aber noch -> AP abschalten");
+        dlog("AP reconcile: soll AUS, sendet aber noch -> AP abschalten\n");
         WiFi.softAPdisconnect(true);
         WiFi.mode(WIFI_STA);
         apActive = false;
@@ -3005,7 +3033,7 @@ void loop() {
     if (wifiClient) {
       wifiClient.setNoDelay(true);
       wifiClient.setTimeout(100);
-      Serial.println("WiFi client connected");
+      dlog("WiFi client connected\n");
     }
   }
 
@@ -3015,7 +3043,7 @@ void loop() {
       size_t len = wifiClient.readBytes(buf, min(avail, MAX_BUF));
       if (len > 0) {
         if (cfg_debug && (cfg_debug_filter & 2)) { String h="WiFi=>VESC: ";for(size_t i=0;i<len;i++){char x[4];snprintf(x,4,"%02X ",buf[i]);h+=x;} uartLogAdd(h); }
-        Serial.printf("WiFi => VESC: %d bytes\n", len);
+        dlog("WiFi => VESC: %d bytes\n", len);
         Serial1.write(buf, len);
       }
     }
@@ -3047,7 +3075,7 @@ void loop() {
         size_t written = wifiClient.write((const uint8_t*)vescBuffer.c_str(), vescBuffer.length());
         if (written > 0) Serial.printf("VESC => WiFi: %d bytes\n", written);
         if (written < vescBuffer.length() && !wifiClient.connected()) {
-          Serial.println("WiFi client disconnected");
+          dlog("WiFi client disconnected\n");
           wifiClient.stop();
         }
       }
@@ -3064,7 +3092,7 @@ void loop() {
     delay(500);
     if (cfg_ble_mode == 1 || (cfg_ble_mode == 2 && bleIsAdvertising)) {
       pServer->startAdvertising();
-      Serial.println("BLE advertising restarted");
+      dlog("BLE advertising restarted\n");
     }
     oldDeviceConnected = false;
   }
