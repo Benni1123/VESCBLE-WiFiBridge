@@ -1873,9 +1873,20 @@ static void tuneApDhcp() {
 }
 
 bool ensureAP(bool force) {
-  (void)force;  // force wird nicht mehr gebraucht: ensureAP startet den AP nur
-                // neu wenn er wirklich down ist oder der Channel sich aendert.
-                // Das schuetzt verbundene Clients vor unnoetigen Neustarts.
+  // force == true  -> AP-Start ERZWINGEN: Gesundheitscheck ueberspringen und
+  //                   softAP() definitiv aufrufen. Noetig nach einem echten
+  //                   Timeout-Off (Wake bei Bewegung, Modus-Wechsel, Safety,
+  //                   Watchdog-Reparatur). Grund: nach WiFi.mode(WIFI_AP_STA)
+  //                   sieht das AP-Interface sofort "gesund" aus (AP-Bit gesetzt,
+  //                   IP 192.168.4.1, softAPSSID() kann noch die alte SSID aus
+  //                   der gespeicherten Config melden), OBWOHL softAP() nach dem
+  //                   Abschalten nie wieder lief -> Zombie-AP, der nichts sendet.
+  //                   Der Gesundheitscheck wuerde dann faelschlich early-returnen
+  //                   und der AP kaeme nach dem Timeout NIE zurueck.
+  // force == false -> schonender Modus fuer periodische Aufrufer (Reconnect,
+  //                   Roam, Channel-Absicherung): laeuft der AP nachweislich
+  //                   korrekt, NICHT neu starten — ein softAP()-Neustart wirft
+  //                   alle verbundenen Clients ab.
   if (!apWanted) return false;
 
   wifi_mode_t mode = WiFi.getMode();
@@ -1890,8 +1901,8 @@ bool ensureAP(bool force) {
 
   // *** WICHTIG gegen "Verbindungsfehler" beim Verbinden ***
   // Wenn der AP bereits sauber laeuft UND schon auf dem richtigen Channel ist,
-  // NICHT neu starten — auch nicht bei force. Ein softAP()-Neustart wirft alle
-  // verbundenen Clients ab und laesst Verbindungsversuche scheitern. Der
+  // NICHT neu starten — aber NUR bei force==false. Ein softAP()-Neustart wirft
+  // alle verbundenen Clients ab und laesst Verbindungsversuche scheitern. Der
   // Watchdog/Reconnect ruft ensureAP() haeufig auf; ohne diese Pruefung wuerde
   // der AP staendig neu gestartet und waere praktisch nicht verbindbar.
   // Pruefen ob der aktuell laufende AP WIRKLICH unserer ist (richtige SSID).
@@ -1903,7 +1914,7 @@ bool ensureAP(bool force) {
   String runningSsid = WiFi.softAPSSID();
   bool ssidOk = (runningSsid == cfg_ap_ssid);
 
-  if (apLooksUp && ssidOk && WiFi.softAPgetStationNum() >= 0) {
+  if (!force && apLooksUp && ssidOk && WiFi.softAPgetStationNum() >= 0) {
     int curCh = WiFi.channel();   // aktueller Betriebs-Channel
     bool channelOk = (curCh == ch) || (WiFi.status() != WL_CONNECTED);
     if (channelOk) {
@@ -2889,11 +2900,20 @@ void loop() {
     int32_t absErpm = vescStatus.erpm < 0 ? -vescStatus.erpm : vescStatus.erpm;
     if (vescStatus.connected && absErpm > cfg_ble_auto_erpm_on) {
       Serial.printf("AP wake: movement (erpm=%d) -> AP back on\n", (int)vescStatus.erpm);
+      // apWanted MUSS gesetzt werden, sobald ERPM ueber der Schwelle liegt —
+      // damit halten auch Watchdog/Safety den AP ab jetzt am Leben.
       apWanted = true;
-      apOffByTimeout = false;
       apLastClientGone = millis();   // Timer frisch starten, damit er nicht sofort wieder ablaeuft
       if (WiFi.getMode() != WIFI_AP_STA) WiFi.mode(WIFI_AP_STA);
-      ensureAP(true);
+      // force=true: echten softAP()-Start erzwingen (Zombie-AP-Schutz, s. ensureAP).
+      // apOffByTimeout erst bei ERFOLG loeschen — schlaegt der Start fehl (z.B.
+      // Kollision mit laufendem STA-Scan), feuert dieser Block im naechsten
+      // Loop-Durchlauf erneut, bis der AP wirklich sendet.
+      if (ensureAP(true)) {
+        apOffByTimeout = false;
+      } else {
+        Serial.println("AP wake: Start fehlgeschlagen -> Retry im naechsten Loop");
+      }
     }
   }
 
