@@ -1788,13 +1788,17 @@ class MyServerCallbacks : public BLEServerCallbacks {
   void onConnect(NimBLEServer *pServer, ble_gap_conn_desc *desc) {
     dlog("BLE connected: %s\n", NimBLEAddress(desc->peer_ota_addr).toString().c_str());
     deviceConnected = true;
-    // Entspanntes Verbindungsintervall anfordern, damit BLE waehrend einer aktiven
-    // Verbindung weniger Funkzeit belegt und mehr Airtime fuers WLAN uebrig bleibt.
-    // Einheiten: Intervall in 1,25 ms, Latenz in Intervallen, Timeout in 10 ms.
-    //   min=24 -> 30 ms, max=40 -> 50 ms, latency=0, timeout=400 -> 4000 ms.
-    // Das Phone (Central) darf das ablehnen -> dann bleibt es harmlos beim alten
-    // Wert, kein Disconnect. Falls die VESC-App traege wirkt, hier kleiner machen.
-    pServer->updateConnParams(desc->conn_handle, 24, 40, 0, 400);
+    // BEWUSST KEIN proaktiver Security-Request (startSecurity) beim Connect:
+    // Android beantwortet den auf manchen Geraeten mit einer ERSTEN Kopplungs-
+    // runde ohne PIN und erzwingt die MITM-Kopplung (PIN) erst beim folgenden
+    // geschuetzten Zugriff -> zwei Kopplungsdialoge hintereinander. Ohne den
+    // Request loest der erste geschuetzte GATT-Zugriff GENAU EINE Kopplung mit
+    // PIN-Dialog aus. Bereits gekoppelte Geraete verschluesseln beim Zugriff
+    // automatisch neu.
+    // Aktive Verbindungen laufen DAUERHAFT mit den schnellen Parametern des
+    // Handys/PCs — Pairing (PIN), Discovery und VESC-Tool-Kommunikation bleiben
+    // flott, keine Timeouts, keine Traegheit. Airtime fuers WLAN wird nur im
+    // Idle gespart (langsames Advertising, wenn KEIN Client verbunden ist).
     // Im Auto-Modus: aktive Verbindung haelt Timer pausiert, nicht erneut advertisen.
     // Bei "An"-Modus: weiter advertisen (so dass weitere Clients sich verbinden koennen).
     if (cfg_ble_mode == 1) NimBLEDevice::startAdvertising();
