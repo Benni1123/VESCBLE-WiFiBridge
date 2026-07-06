@@ -100,6 +100,11 @@ int    cfg_ap_mode            = 1;     // Default: An (Verhalten wie bisher)
 // erzwungen (Sicherheit: nach Reset niemals AP aus). Wird beim ersten Speichern
 // true.
 bool   cfg_configured         = false;
+// BLE-PIN-Pairing (optional): wenn aktiv, verlangt der ESP beim Koppeln die
+// Eingabe dieses 6-stelligen Passkeys (MITM-Schutz). Ohne Haken: Just Works
+// (Kopplung wird automatisch angenommen, wie bisher).
+bool   cfg_ble_pin_enabled    = false;
+int    cfg_ble_pin            = 123456;   // 6-stellig, 000000..999999
 int    cfg_ble_auto_off_sec   = 120;   // nach X Sekunden ohne Bewegung & Client -> BLE aus
 bool   cfg_leds_enabled       = false; // WS28XX LED-Steuerung aktiv (zeigt LED-Reiter + /leds)
 
@@ -144,6 +149,8 @@ void loadConfig() {
   cfg_ble_auto_erpm_on   = prefs.getInt ("ble_erpm_on",      200);
   cfg_ap_mode            = prefs.getInt ("ap_mode",          1);
   cfg_configured         = prefs.getBool("configured",       false);
+  cfg_ble_pin_enabled    = prefs.getBool("ble_pin_en",       false);
+  cfg_ble_pin            = prefs.getInt ("ble_pin",          123456);
   cfg_ble_auto_off_sec   = prefs.getInt ("ble_off_sec",      120);
   cfg_leds_enabled       = prefs.getBool("leds_en",          false);
   int count = prefs.getInt("wifi_count", 0);
@@ -181,6 +188,7 @@ void loadConfig() {
   if (cfg_autopoll_interval > 60)  cfg_autopoll_interval = 60;
   if (cfg_ble_mode < 0 || cfg_ble_mode > 2) cfg_ble_mode = 1;
   if (cfg_ble_auto_erpm_on < 10)    cfg_ble_auto_erpm_on = 10;
+  if (cfg_ble_pin < 0 || cfg_ble_pin > 999999) cfg_ble_pin = 123456;  // 6-stelliger Passkey
   if (cfg_ble_auto_erpm_on > 50000) cfg_ble_auto_erpm_on = 50000;
   if (cfg_ble_auto_off_sec < 5)     cfg_ble_auto_off_sec = 5;
   if (cfg_ble_auto_off_sec > 3600)  cfg_ble_auto_off_sec = 3600;
@@ -215,6 +223,8 @@ void saveConfig() {
   prefs.putInt   ("ap_mode",     cfg_ap_mode);
   cfg_configured = true;                         // ab jetzt konfiguriert
   prefs.putBool  ("configured",  cfg_configured);
+  prefs.putBool  ("ble_pin_en",  cfg_ble_pin_enabled);
+  prefs.putInt   ("ble_pin",     cfg_ble_pin);
   prefs.putInt   ("ble_off_sec", cfg_ble_auto_off_sec);
   prefs.putBool  ("leds_en",     cfg_leds_enabled);
   prefs.putInt   ("wifi_count",  cfg_wifi.size());
@@ -371,6 +381,26 @@ void dlog(const char *fmt, ...) {
   line.replace("\\", "/");
   line.replace("\"", "'");
   uartLogAdd(line);
+}
+
+// Wendet die BLE-Security-Einstellungen an (beim Boot und nach Config-Save).
+// NimBLE uebernimmt die Werte zur Laufzeit fuer alle KUENFTIGEN Kopplungen —
+// kein Reboot noetig. Bereits gespeicherte Bonds bleiben gueltig.
+void applyBleSecurity() {
+  if (cfg_ble_pin_enabled) {
+    // PIN-Pairing: MITM an + "Display only" -> der ESP "zeigt" den statischen
+    // Passkey (steht in der Config), die Gegenseite (Windows/Handy) muss ihn
+    // beim Koppeln eingeben. Falsche PIN -> Kopplung schlaegt fehl.
+    NimBLEDevice::setSecurityAuth(true /*bonding*/, true /*mitm*/, true /*secure conn*/);
+    NimBLEDevice::setSecurityIOCap(BLE_HS_IO_DISPLAY_ONLY);
+    NimBLEDevice::setSecurityPasskey((uint32_t)cfg_ble_pin);
+    dlog("BLE security: PIN-Pairing aktiv\n");
+  } else {
+    // Just Works: Kopplungsanfragen werden automatisch angenommen (wie bisher).
+    NimBLEDevice::setSecurityAuth(true /*bonding*/, false /*mitm*/, true /*secure conn*/);
+    NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT);
+    dlog("BLE security: Just-Works-Pairing (ohne PIN)\n");
+  }
 }
 
 static String vescFaultToString(int code);
@@ -666,6 +696,17 @@ static const char PAGE_HTML[] PROGMEM = R"rawliteral(
       <h3>BLE</h3>
       <label id="lbl-ble-name">BLE Name (visible in VESC Tool)</label>
       <input type="text" id="ble_name" maxlength="32" placeholder="VESC-BLE-WiFi">
+      <label class="checkbox-row" style="margin-top:12px">
+        <input type="checkbox" id="ble_pin_enabled" onchange="document.getElementById('blepin_wrap').style.display=this.checked?'':'none'">
+        <span id="lbl-ble-pin-en">Require PIN for BLE pairing</span>
+      </label>
+      <div id="blepin_wrap" style="display:none;margin-top:8px">
+        <label id="lbl-ble-pin">BLE pairing PIN (6 digits)</label>
+        <input type="text" id="ble_pin" maxlength="6" inputmode="numeric" placeholder="123456">
+        <div style="font-size:11px;color:var(--text3);margin-top:6px" id="lbl-ble-pin-hint">
+          Exactly 6 digits required (leading zeros allowed, e.g. 001234). With PIN enabled, unpaired devices cannot communicate — pairing with PIN is enforced (takes effect after restart). Already paired devices stay paired. Without the checkbox, pairing is accepted automatically (Just Works).
+        </div>
+      </div>
     </div>
     <div class="section">
       <h3 id="lbl-ap-title">Access Point (Fallback)</h3>
@@ -904,6 +945,9 @@ function applyTranslations(){
   s('lbl-autopoll-forced',  'Required by BLE Auto mode or AP Auto mode — these need ERPM data.', 'Erforderlich f\u00fcr BLE-Auto-Modus oder AP-Auto-Modus \u2014 diese brauchen ERPM-Daten.');
   s('lbl-autopoll-int',     'Poll interval (seconds, 1-60)',                 'Poll-Intervall (Sekunden, 1-60)');
   s('lbl-blemode-title',    'BLE Mode',                                      'BLE Modus');
+  s('lbl-ble-pin-en',       'Require PIN for BLE pairing',                   'PIN beim BLE-Koppeln verlangen');
+  s('lbl-ble-pin',          'BLE pairing PIN (6 digits)',                    'BLE-Kopplungs-PIN (6 Ziffern)');
+  s('lbl-ble-pin-hint',     'Exactly 6 digits required (leading zeros allowed, e.g. 001234). With PIN enabled, unpaired devices cannot communicate — pairing with PIN is enforced (takes effect after restart). Already paired devices stay paired. Without the checkbox, pairing is accepted automatically (Just Works).', 'Genau 6 Ziffern erforderlich (fuehrende Nullen erlaubt, z.B. 001234). Mit PIN koennen ungekoppelte Geraete nicht kommunizieren — Kopplung mit PIN wird erzwungen (greift nach Neustart). Bereits gekoppelte Geraete bleiben gekoppelt. Ohne Haken wird die Kopplung automatisch angenommen (Just Works).');
   s('lbl-leds-title',       'LEDs',                                         'LEDs');
   s('lbl-leds-enabled',     'Enable WS28XX control',                        'WS28XX Steuerung aktivieren');
   s('lbl-blemode-sel',      'Mode',                                          'Modus');
@@ -1112,6 +1156,10 @@ function updateErpmVisibility(){
 function loadConfig(){
   fetch('/api/config').then(function(r){return r.json();}).then(function(d){
     document.getElementById('ble_name').value    = d.ble_name||'';
+    document.getElementById('ble_pin_enabled').checked = d.ble_pin_enabled===true;
+    window.origBlePinEn = d.ble_pin_enabled===true;
+    document.getElementById('ble_pin').value     = (d.ble_pin!==undefined)?String(d.ble_pin).padStart(6,'0'):'123456';
+    document.getElementById('blepin_wrap').style.display = d.ble_pin_enabled===true?'':'none';
     document.getElementById('ap_ssid').value     = d.ap_ssid||'';
     document.getElementById('ap_pass').value     = d.ap_pass||'';
     document.getElementById('ap_timeout').value  = d.ap_timeout||120;
@@ -1175,10 +1223,16 @@ function markOriginals(){
 }
 
 function saveConfig(){
+  if(document.getElementById('ble_pin_enabled').checked && !/^\d{6}$/.test(document.getElementById('ble_pin').value)){
+    alert(de()?'BLE-PIN muss genau 6 Ziffern haben. F\u00fchrende Nullen sind erlaubt, z.B. 001234.':'BLE PIN must be exactly 6 digits. Leading zeros are allowed, e.g. 001234.');
+    return;
+  }
   var wifi=wifiNetworks.filter(function(n){return n.ssid.trim().length>0;});
   var reboot=needsReboot();
   var bodyObj={
     ble_name:    document.getElementById('ble_name').value,
+    ble_pin_enabled: document.getElementById('ble_pin_enabled').checked,
+    ble_pin:     parseInt(document.getElementById('ble_pin').value)||0,
     ap_ssid:     document.getElementById('ap_ssid').value,
     ap_pass:     document.getElementById('ap_pass').value,
     ap_timeout:  parseInt(document.getElementById('ap_timeout').value)||120,
@@ -1211,7 +1265,13 @@ function saveConfig(){
           showToast(de()?'Gespeichert — ESP startet neu...':'Saved — ESP restarting...',true,8000);
           setTimeout(function(){location.reload();},5000);
         } else {
-          showToast(de()?'Gespeichert ✓':'Saved ✓',true,3000);
+          var pinChanged=(window.origBlePinEn!==undefined)&&(window.origBlePinEn!==bodyObj.ble_pin_enabled);
+          if(pinChanged){
+            showToast(de()?'Gespeichert ✓ — Neustart noetig, damit der PIN-Schutz greift (Neustart-Button unten)':'Saved ✓ — restart required for PIN protection to take effect (Restart button below)',true,8000);
+            window.origBlePinEn=bodyObj.ble_pin_enabled;
+          } else {
+            showToast(de()?'Gespeichert ✓':'Saved ✓',true,3000);
+          }
           markOriginals();
         }
       } else {
@@ -1399,6 +1459,8 @@ void handleApiConfigGet() {
   json += "\"ble_mode\":"+String(cfg_ble_mode)+",";
   json += "\"ble_auto_erpm_on\":"+String(cfg_ble_auto_erpm_on)+",";
   json += "\"ap_mode\":"+String(cfg_ap_mode)+",";
+  json += "\"ble_pin_enabled\":"+String(cfg_ble_pin_enabled?"true":"false")+",";
+  json += "\"ble_pin\":"+String(cfg_ble_pin)+",";
   json += "\"ble_auto_off_sec\":"+String(cfg_ble_auto_off_sec)+",";
   json += "\"leds_enabled\":"+String(cfg_leds_enabled?"true":"false")+",";
   json += "\"update_url\":\""+cfg_update_url+"\",";
@@ -1475,6 +1537,15 @@ void handleApiConfigPost() {
   cfg_ble_mode          = parseInt2("ble_mode", 1);
   cfg_ble_auto_erpm_on  = parseInt2("ble_auto_erpm_on", 200);
   cfg_ap_mode           = parseInt2("ap_mode", 1);
+  // BLE-PIN-Felder NUR uebernehmen, wenn sie im Body vorhanden sind. Grund:
+  // eine (aeltere) Companion-App, die die Felder nicht kennt, wuerde beim
+  // Speichern sonst die PIN stillschweigend deaktivieren (indexOf -> false)
+  // und den Wert auf den Default zuruecksetzen. Fehlen die Felder, bleiben
+  // die gespeicherten Werte unveraendert.
+  if (body.indexOf("\"ble_pin_enabled\":") >= 0)
+    cfg_ble_pin_enabled = (body.indexOf("\"ble_pin_enabled\":true") >= 0);
+  if (body.indexOf("\"ble_pin\":") >= 0)
+    cfg_ble_pin         = parseInt2("ble_pin", cfg_ble_pin);
   cfg_ble_auto_off_sec  = parseInt2("ble_auto_off_sec", 120);
   bool ledsWasEnabled   = cfg_leds_enabled;   // alten Zustand merken
   cfg_leds_enabled      = (body.indexOf("\"leds_enabled\":true") >= 0);
@@ -1487,6 +1558,9 @@ void handleApiConfigPost() {
   if (cfg_ap_mode < 1 || cfg_ap_mode > 2)   cfg_ap_mode = 1;   // kein "Aus"
   if (cfg_ap_mode == 2 && cfg_ap_timeout <= 0) cfg_ap_timeout = 120; // Auto braucht sinnvollen Idle-Timeout
   if (cfg_ble_auto_erpm_on < 10)    cfg_ble_auto_erpm_on = 10;
+  if (cfg_ble_pin < 0 || cfg_ble_pin > 999999) cfg_ble_pin = 123456;  // 6-stelliger Passkey
+  // BLE-Security sofort uebernehmen (gilt fuer kuenftige Kopplungen, kein Reboot)
+  if (NimBLEDevice::getInitialized()) applyBleSecurity();
   if (cfg_ble_auto_erpm_on > 50000) cfg_ble_auto_erpm_on = 50000;
   if (cfg_ble_auto_off_sec < 5)     cfg_ble_auto_off_sec = 5;
   if (cfg_ble_auto_off_sec > 3600)  cfg_ble_auto_off_sec = 3600;
@@ -2736,24 +2810,36 @@ void setup() {
   if (cfg_ble_name.isEmpty()) cfg_ble_name = DEFAULT_BLE_NAME;
   NimBLEDevice::init(cfg_ble_name.c_str());
   NimBLEDevice::setPower(ESP_PWR_LVL_P9);
-  // Pairing/Bonding fuer VESC Tool unter Windows: der Windows-BLE-Stack besteht
-  // beim Verbinden auf einer Kopplung. Konfiguration = "Just Works":
-  //   - Bonding an       -> Windows merkt sich die Kopplung dauerhaft (NVS),
-  //                         beim naechsten Mal keine erneute Abfrage.
-  //   - kein MITM        -> keine PIN-/Bestaetigungs-Abfrage.
-  //   - NO_INPUT_OUTPUT  -> ESP meldet "kann nichts anzeigen/eingeben"
-  //                         => Kopplungsanfrage wird AUTOMATISCH angenommen.
+  // Pairing/Bonding fuer VESC Tool unter Windows. Je nach Config-Haken:
+  //   - ohne BLE-PIN: "Just Works" -> Kopplung wird automatisch angenommen.
+  //   - mit  BLE-PIN: statischer 6-stelliger Passkey muss eingegeben werden.
   // Handys/Apps, die wie bisher unverschluesselt verbinden, laufen unveraendert:
   // die Characteristics verlangen keine Verschluesselung, Pairing ist optional.
-  NimBLEDevice::setSecurityAuth(true /*bonding*/, false /*mitm*/, true /*secure conn*/);
-  NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT);
+  applyBleSecurity();
 
   pServer = NimBLEDevice::createServer();
   pServer->setCallbacks(new MyServerCallbacks());
 
   BLEService *pService = pServer->createService(VESC_SERVICE_UUID);
-  pCharacteristicVescTx = pService->createCharacteristic(VESC_CHARACTERISTIC_UUID_TX, NIMBLE_PROPERTY::NOTIFY | NIMBLE_PROPERTY::READ);
-  pCharacteristicVescRx = pService->createCharacteristic(VESC_CHARACTERISTIC_UUID_RX, NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR);
+  // Characteristic-Properties abhaengig vom BLE-PIN-Haken:
+  //   PIN AUS -> wie bisher: offene Properties, jede App kann ungekoppelt
+  //              verbinden und kommunizieren (Just Works ist rein optional).
+  //   PIN AN  -> Verschluesselung + Authentifizierung ERZWINGEN. Ungekoppelte
+  //              Clients bekommen beim ersten Zugriff "insufficient
+  //              authentication" -> Android/Windows starten dann AUTOMATISCH
+  //              die Kopplung mit PIN-Abfrage. Ohne richtige PIN keine
+  //              VESC-Kommunikation.
+  // WICHTIG: Properties werden bei der Erstellung festgelegt -> ein Umschalten
+  // des PIN-Hakens wirkt auf diesen Schutz erst nach einem NEUSTART (die
+  // Kopplungs-PIN selbst gilt sofort). Die Oberflaeche weist darauf hin.
+  uint32_t txProps = NIMBLE_PROPERTY::NOTIFY | NIMBLE_PROPERTY::READ;
+  uint32_t rxProps = NIMBLE_PROPERTY::WRITE  | NIMBLE_PROPERTY::WRITE_NR;
+  if (cfg_ble_pin_enabled) {
+    txProps |= NIMBLE_PROPERTY::READ_ENC  | NIMBLE_PROPERTY::READ_AUTHEN;
+    rxProps |= NIMBLE_PROPERTY::WRITE_ENC | NIMBLE_PROPERTY::WRITE_AUTHEN;
+  }
+  pCharacteristicVescTx = pService->createCharacteristic(VESC_CHARACTERISTIC_UUID_TX, txProps);
+  pCharacteristicVescRx = pService->createCharacteristic(VESC_CHARACTERISTIC_UUID_RX, rxProps);
   pCharacteristicVescRx->setCallbacks(new MyCallbacks());
 
   pService->start();
