@@ -1737,6 +1737,14 @@ class MyServerCallbacks : public BLEServerCallbacks {
   void onMTUChange(uint16_t MTU, ble_gap_conn_desc *desc) {
     MTU_SIZE = MTU; PACKET_SIZE = MTU_SIZE - 3;
   }
+  // Wird nach einem Pairing-Versuch (z.B. von Windows/VESC Tool) aufgerufen.
+  // Just-Works nimmt automatisch an — hier nur das Ergebnis loggen, damit man
+  // im UART-Log (Status-Filter) sieht, ob die Kopplung geklappt hat.
+  void onAuthenticationComplete(ble_gap_conn_desc *desc) {
+    dlog("BLE pairing: %s (encrypted=%d bonded=%d)\n",
+         desc->sec_state.encrypted ? "OK" : "FEHLGESCHLAGEN",
+         desc->sec_state.encrypted, desc->sec_state.bonded);
+  }
 };
 
 class MyCallbacks : public BLECharacteristicCallbacks {
@@ -2306,7 +2314,7 @@ static void manageAdvInterval() {
     NimBLEDevice::stopAdvertising();
     applyAdvInterval(true);
     NimBLEDevice::startAdvertising();
-    dlog("BLE adv: idle -> langsames Intervall\n");
+    dlog("BLE adv: idle -> langsames Intervall (WiFi-Airtime)\n");
   }
 }
 
@@ -2728,6 +2736,17 @@ void setup() {
   if (cfg_ble_name.isEmpty()) cfg_ble_name = DEFAULT_BLE_NAME;
   NimBLEDevice::init(cfg_ble_name.c_str());
   NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+  // Pairing/Bonding fuer VESC Tool unter Windows: der Windows-BLE-Stack besteht
+  // beim Verbinden auf einer Kopplung. Konfiguration = "Just Works":
+  //   - Bonding an       -> Windows merkt sich die Kopplung dauerhaft (NVS),
+  //                         beim naechsten Mal keine erneute Abfrage.
+  //   - kein MITM        -> keine PIN-/Bestaetigungs-Abfrage.
+  //   - NO_INPUT_OUTPUT  -> ESP meldet "kann nichts anzeigen/eingeben"
+  //                         => Kopplungsanfrage wird AUTOMATISCH angenommen.
+  // Handys/Apps, die wie bisher unverschluesselt verbinden, laufen unveraendert:
+  // die Characteristics verlangen keine Verschluesselung, Pairing ist optional.
+  NimBLEDevice::setSecurityAuth(true /*bonding*/, false /*mitm*/, true /*secure conn*/);
+  NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT);
 
   pServer = NimBLEDevice::createServer();
   pServer->setCallbacks(new MyServerCallbacks());
