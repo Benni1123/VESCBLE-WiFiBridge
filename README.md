@@ -1,7 +1,5 @@
 # VescBLEBridge
 
-![A picture of a cat](/assets/_MG_6227.JPG)
-
 VescBLEBridge is a project that lets you add Bluetooth connectivity to your Vesc Controller for only 3€. It utilizes the ESP32 C3 microcontroller as a cost-effective BLE (Bluetooth Low Energy) module. It allows seamless communication between your Vesc controllers and the Vesc Tool App.
 
 ## Features
