@@ -52,6 +52,37 @@ bool bleAdvertisingActive() {
 }
 static unsigned long lastMovementTime  = 0;
 
+// ── STA-Scan-Backoff ─────────────────────────────────────────────────────────
+// Feste Stufen statt Verdopplung: 20s -> 40s -> 60s -> 120s.
+// Nach Erreichen der letzten Stufe bleibt der Abstand dauerhaft bei 120s,
+// solange kein bekanntes WLAN erfolgreich verbunden wurde. Ein normales
+// "kein Netz gefunden" ist unterwegs KEIN WLAN-Stack-Fehler und darf deshalb
+// keinen Hard-Reset des STA-Stacks ausloesen.
+static const unsigned long STA_SCAN_BACKOFF_MS[] = {
+  20000UL,
+  40000UL,
+  60000UL,
+  120000UL
+};
+static const uint8_t STA_SCAN_BACKOFF_LAST =
+    (uint8_t)(sizeof(STA_SCAN_BACKOFF_MS) / sizeof(STA_SCAN_BACKOFF_MS[0]) - 1);
+static uint8_t staScanBackoffStage = 0;
+
+static void resetStaScanBackoff(unsigned long now, bool restartWait) {
+  staScanBackoffStage = 0;
+  staScanInterval = STA_SCAN_BACKOFF_MS[0];
+  if (restartWait) lastReconnectTry = now;
+}
+
+static void advanceStaScanBackoff(unsigned long now) {
+  if (staScanBackoffStage < STA_SCAN_BACKOFF_LAST) {
+    staScanBackoffStage++;
+  }
+  staScanInterval = STA_SCAN_BACKOFF_MS[staScanBackoffStage];
+  // Die neue Wartezeit beginnt erst NACH dem abgeschlossenen Scan.
+  lastReconnectTry = now;
+}
+
 class MyServerCallbacks : public BLEServerCallbacks {
   void onConnect(NimBLEServer *pServer, ble_gap_conn_desc *desc) {
     dlog("BLE connected: %s\n", NimBLEAddress(desc->peer_ota_addr).toString().c_str());
@@ -1030,8 +1061,11 @@ void handleWiFiReconnect() {
 
   // ── Verbunden? ────────────────────────────────────────────────────────────
   if (WiFi.status() == WL_CONNECTED) {
-    staDownSince    = 0;
-    staScanInterval = STA_SCAN_MIN_MS;
+    staDownSince = 0;
+    // Erst eine wirklich erfolgreiche Verbindung setzt das Backoff wieder auf
+    // die erste Stufe. Solange das Heimnetz nur nicht gefunden wird, bleibt die
+    // erreichte Stufe (bis dauerhaft 120s) erhalten.
+    resetStaScanBackoff(now, true);
     if (staConnecting) {
       // Gerade erfolgreich (non-blocking) verbunden -> abschliessen.
       staConnecting   = false;
@@ -1092,25 +1126,12 @@ void handleWiFiReconnect() {
   }
 
   // Ab hier NICHT verbunden und KEIN Client am AP.
-  if (staDownSince == 0) staDownSince = now;
-
-  // ── NOTNAGEL: hartnaeckiger Haenger -> kompletter STA-Stack-Neustart ───────
-  if (now - staDownSince > STA_HARD_RESTART_MS) {
-    dlog("WiFi: hard STA stack restart (haengt zu lange)\n");
-    WiFi.scanDelete();
-    scanInProgress = false;
-    staConnecting  = false;
-    WiFi.disconnect(true, true);
-    delay(300);
-    if (WiFi.getMode() != WIFI_AP_STA) WiFi.mode(WIFI_AP_STA);
-    wifiMulti = WiFiMulti();
-    for (auto &n : cfg_wifi) wifiMulti.addAP(n.ssid.c_str(), n.pass.c_str());
-    ensureAP(false);
-    staDownSince     = now;
-    lastReconnectTry = 0;
-    staScanInterval  = STA_SCAN_MIN_MS;
-    return;
-  }
+  // Ein laenger fehlendes Heimnetz ist ein normaler Zustand (z.B. unterwegs),
+  // kein Beweis fuer einen haengenden WLAN-Stack. Darum gibt es hier bewusst
+  // KEINEN zeitbasierten Hard-Reset mehr. Echte Fehler werden weiterhin dort
+  // repariert, wo sie sicher erkennbar sind: Scan-Timeout und wiederholte
+  // Verbindungs-Timeouts.
+  staDownSince = 0;
 
   // ── Phase VERBINDET: non-blocking Verbindungsaufbau laeuft -> Status pollen ─
   // Kein blockierendes Warten! Der AP wird waehrenddessen normal weiter bedient.
@@ -1181,16 +1202,19 @@ void handleWiFiReconnect() {
   scanInProgress = false;
 
   if (bestIdx < 0) {
-    // Kein bekanntes Netz in Reichweite (typisch: unterwegs) -> Backoff.
-    unsigned long doubled = staScanInterval * 2;
-    staScanInterval = (doubled > STA_SCAN_MAX_MS) ? STA_SCAN_MAX_MS : doubled;
-    dlog("WiFi: kein bekanntes Netz -> naechster Scan in %lus\n",
-                  (unsigned long)(staScanInterval / 1000));
+    // Kein bekanntes Netz in Reichweite (typisch: unterwegs). Exakte Stufen:
+    // 20s -> 40s -> 60s -> 120s -> 120s -> 120s ...
+    advanceStaScanBackoff(now);
+    dlog("WiFi: kein bekanntes Netz -> naechster Scan in %lus (Stufe %u/%u)\n",
+         (unsigned long)(staScanInterval / 1000),
+         (unsigned)(staScanBackoffStage + 1),
+         (unsigned)(STA_SCAN_BACKOFF_LAST + 1));
     return;
   }
 
-  // Bekanntes Netz gefunden -> Backoff zuruecksetzen und NON-BLOCKING verbinden.
-  staScanInterval = STA_SCAN_MIN_MS;
+  // Bekanntes Netz gefunden -> NON-BLOCKING verbinden. Das Backoff wird erst
+  // nach einer TATSAECHLICH erfolgreichen Verbindung auf 20s zurueckgesetzt.
+  // Scheitert die Verbindung, bleibt die erreichte Warte-Stufe erhalten.
   String pass = "";
   for (auto &w : cfg_wifi) {
     if (w.ssid == bestSsid) { pass = w.pass; break; }
@@ -1291,6 +1315,10 @@ void wifiBleSetup() {
   // Danach STA verbinden (blockierend beim Boot, das ist ok).
   bool staOK = setupWiFiClient();
   (void)staOK;
+
+  // Der erste asynchrone Suchlauf beginnt 20 Sekunden NACH Abschluss des
+  // Boot-Verbindungsversuchs. Danach gilt 20 -> 40 -> 60 -> 120 -> 120 ...
+  resetStaScanBackoff(millis(), true);
 
   // AP nach STA-Connect nochmal absichern (STA-Connect kann Channel ändern).
   ensureAP(false);
