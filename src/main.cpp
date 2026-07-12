@@ -2,6 +2,7 @@
 #include "globals.h"
 #include "config.h"
 #include "debuglog.h"
+#include "time-service.h"
 #include "wifi-ble.h"
 #include "vesc.h"
 #include "webui.h"
@@ -11,6 +12,7 @@
 // sind diese Einheiten leer. So gibt es keine doppelten Definitionen.
 #include "config.cpp"
 #include "debuglog.cpp"
+#include "time-service.cpp"
 #include "wifi-ble.cpp"
 #include "vesc.cpp"
 #include "webui.cpp"
@@ -28,6 +30,7 @@ void setup() {
 
   vescSetup();
   wifiBleSetup();
+  timeServiceSetup();
   webUiSetup();
   vescTcpSetup();
 
@@ -57,6 +60,7 @@ void loop() {
 
   webUiLoop();
   wifiBleLoop();
+  timeServiceLoop();
   vescLoop();
 
   // Diagnose: Dauer dieses Loop-Durchlaufs; Maximum im aktuellen Sekundenfenster

@@ -6,6 +6,7 @@
 #include "globals.h"
 #include "config.h"
 #include "debuglog.h"
+#include "time-service.h"
 #include "wifi-ble.h"
 #include "vesc.h"
 #include "webui.h"
@@ -473,12 +474,14 @@ static const char PAGE_HTML[] PROGMEM = R"rawliteral(
       <div class="ep"><span class="method get">GET</span><a class="path" href="/api/wifi/disconnect-reasons" target="_blank">/api/wifi/disconnect-reasons</a><div class="desc">All ESP-IDF WiFi disconnect reason numbers and names</div></div>
       <div class="ep"><span class="method get">GET</span><a class="path" href="/api/uart/log" target="_blank">/api/uart/log</a><div class="desc">UART debug log (requires debug mode)</div></div>
       <div class="ep"><span class="method get">GET</span><a class="path" href="/api/boot/status" target="_blank">/api/boot/status</a><div class="desc">Last boot/reset reason, watchdog, panic and brownout status</div></div>
+      <div class="ep"><span class="method get">GET</span><a class="path" href="/api/time" target="_blank">/api/time</a><div class="desc">Current clock, sync source and NTP status</div></div>
       <div class="ep"><span class="method get">GET</span><a class="path" href="/api/ping" target="_blank">/api/ping</a><div class="desc">Keepalive — activates VESC polling</div></div>
       <div class="api-h2">POST</div>
       <div class="ep"><span class="method post">POST</span><span class="path">/api/config</span><div class="desc">Save config and restart (JSON body)</div></div>
       <div class="ep"><span class="method post">POST</span><span class="path">/api/uart/clear</span><div class="desc">Clear UART debug log</div></div>
       <div class="ep"><span class="method post">POST</span><span class="path">/api/update/install</span><div class="desc">Download and flash from update_url</div></div>
       <div class="ep"><span class="method post">POST</span><span class="path">/api/ap/start</span><div class="desc">Manually start or repair the access point (debug test)</div></div>
+      <div class="ep"><span class="method post">POST</span><span class="path">/api/time?epoch=...&amp;source=app</span><div class="desc">Set Unix time; source may be supplied as query parameter or JSON field</div></div>
       <div class="ep"><span class="method post">POST</span><span class="path">/api/restart</span><div class="desc">Restart the ESP</div></div>
       <div class="ep"><span class="method post">POST</span><span class="path">/api/factory-reset</span><div class="desc">Clear NVS and restart</div></div>
       <div class="ep"><span class="method post">POST</span><span class="path">/update</span><div class="desc">Manual OTA (multipart/form-data, field: firmware)</div></div>
@@ -608,6 +611,43 @@ applyTranslations();
   if(m && ['info','config','ota','api'].indexOf(m[1])>=0) showTab(m[1]);
 })();
 
+// Im reinen AP-Betrieb gibt es eventuell weder Heimnetz/NTP noch eine App,
+// die die Uhr setzt. Dann uebernimmt die WebUI EINMALIG die Systemzeit des
+// Browsers. Eine bereits gueltige ESP-Zeit wird niemals ueberschrieben.
+async function syncBrowserTimeIfInvalid(){
+  try {
+    var response=await fetch('/api/time',{cache:'no-store'});
+    if(!response.ok)return;
+
+    var status=await response.json();
+    if(status.valid)return;
+
+    var epochMs=Date.now();
+    // Dieselbe Plausibilitaetsgrenze wie im ESP-Zeitdienst: ab 2020.
+    if(!Number.isFinite(epochMs)||epochMs<1577836800000)return;
+
+    // only_if_invalid=1 wird serverseitig nochmals geprueft. Falls zwischen
+    // GET und POST bereits NTP synchronisiert hat, bleibt diese Zeit erhalten.
+    await fetch('/api/time?epoch='+encodeURIComponent(String(epochMs))+'&only_if_invalid=1&source=browser',{
+      method:'POST',
+      cache:'no-store'
+    });
+  }catch(e){
+    // Keine Fehlermeldung in der UI: Uptime-Logging funktioniert weiterhin.
+  }
+}
+syncBrowserTimeIfInvalid();
+
+function timeSourceLabel(source){
+  source=String(source||'').toLowerCase();
+  if(source==='ntp')return 'NTP';
+  if(source==='browser')return de()?'Browser':'Browser';
+  if(source==='app')return de()?'App':'App';
+  if(source==='home_assistant')return 'Home Assistant';
+  if(source==='api')return 'API';
+  return source?source.toUpperCase():'';
+}
+
 function loadInfo(){
   fetch('/api/info').then(function(r){return r.json();}).then(function(d){
     document.getElementById('statusBar').textContent=d.mode==='ap'&&!d.ssid?'AP: '+d.ip:'WiFi: '+d.ssid+' ('+d.ip+')';
@@ -633,6 +673,7 @@ function loadInfo(){
       '<div class="info-row" style="'+(d.vesc_connected?'':'opacity:0.4')+'"><span>Temp Motor</span><span class="info-val">'+d.vesc_temp_motor+' °C</span></div>'+
       '<div class="info-row" style="'+(d.vesc_connected?'':'opacity:0.4')+'"><span>'+(de()?'Fehlercode':'Fault')+'</span><span class="info-val" style="color:'+(d.vesc_fault===0?'#81c784':'#e57373')+'">'+(d.vesc_fault_str||'OK')+'</span></div>'+
       '<div class="info-row" style="'+(d.vesc_connected?'':'opacity:0.4')+'"><span>ERPM</span><span class="info-val">'+d.vesc_erpm+'</span></div>'+
+      '<div class="info-row"><span>'+(de()?'Systemzeit':'System time')+'</span><span class="info-val" style="color:'+(d.time_valid?'var(--text2)':'#e0a030')+'">'+(d.time_valid?esc(d.time_local)+(d.time_source?' ('+esc(timeSourceLabel(d.time_source))+')':''):(de()?'Nicht synchronisiert':'Not synchronized'))+'</span></div>'+
       '<div class="info-row"><span>Uptime</span><span class="info-val">'+d.uptime+'</span></div>'+
       '<div class="info-row"><span>Build</span><span class="info-val">'+d.build+'</span></div>'+
       '<div style="margin:10px 0 6px;font-size:11px;color:#666;text-transform:uppercase;letter-spacing:1px">'+(de()?'Letzter Start':'Last boot')+'</div>'+
@@ -1036,6 +1077,13 @@ void handleApiInfo() {
   json += "\"reset_brownout\":"+String(bootGetResetReason()==ESP_RST_BROWNOUT?"true":"false")+",";
   json += "\"reset_panic\":"+String(bootGetResetReason()==ESP_RST_PANIC?"true":"false")+",";
   json += "\"reset_watchdog\":"+String(bootIsWatchdog()?"true":"false")+",";
+  // Uhrzeit: per NTP im Heimnetz oder per POST /api/time von der App.
+  json += "\"time_valid\":" + String(timeServiceIsValid()?"true":"false") + ",";
+  json += "\"time_epoch\":" + String((unsigned long)timeServiceEpoch()) + ",";
+  json += "\"time_local\":\"" + jsonEscapeDebug(timeServiceLocalString()) + "\",";
+  json += "\"time_utc\":\"" + jsonEscapeDebug(timeServiceUtcString()) + "\",";
+  json += "\"time_source\":\"" + jsonEscapeDebug(timeServiceSource()) + "\",";
+  json += "\"time_last_sync\":" + String((unsigned long)timeServiceLastSyncEpoch()) + ",";
   // ── Diagnose-Zaehler ──
   json += "\"diag_scans\":"+String(diagScanCount)+",";
   json += "\"diag_sta_conn\":"+String(diagStaConnects)+",";
@@ -1325,6 +1373,121 @@ void handleApiUpdateInstall() {
   dlog("Server-OTA beendet/fehlgeschlagen, Rueckgabecode: %d\n", updateResult);
 }
 
+// Liest ein einfaches String-Feld aus einem JSON-Body, z.B.
+// {"epoch":1783830000000,"source":"app"}. Fuer die kleine Time-API
+// reicht diese schlanke Auswertung; es wird keine zusaetzliche JSON-Library
+// benoetigt.
+static String parseApiJsonStringField(const String &json, const char *fieldName) {
+  String key = "\"" + String(fieldName) + "\"";
+  int keyPos = json.indexOf(key);
+  if (keyPos < 0) return "";
+
+  int colon = json.indexOf(':', keyPos + key.length());
+  if (colon < 0) return "";
+
+  int start = colon + 1;
+  while (start < (int)json.length() &&
+         (json.charAt(start) == ' ' || json.charAt(start) == '\t' ||
+          json.charAt(start) == '\r' || json.charAt(start) == '\n')) {
+    start++;
+  }
+  if (start >= (int)json.length()) return "";
+
+  // Fuer source erwarten wir normalerweise einen JSON-String.
+  if (json.charAt(start) == '"') {
+    start++;
+    String value;
+    bool escaped = false;
+    for (int i = start; i < (int)json.length(); i++) {
+      char c = json.charAt(i);
+      if (escaped) {
+        value += c;
+        escaped = false;
+      } else if (c == '\\') {
+        escaped = true;
+      } else if (c == '"') {
+        value.trim();
+        return value;
+      } else {
+        value += c;
+      }
+    }
+    return "";
+  }
+
+  // Zusaetzlich unquoted Werte bis Komma oder Objektende akzeptieren.
+  int end = start;
+  while (end < (int)json.length() && json.charAt(end) != ',' &&
+         json.charAt(end) != '}' && json.charAt(end) != '\r' &&
+         json.charAt(end) != '\n') {
+    end++;
+  }
+  String value = json.substring(start, end);
+  value.trim();
+  return value;
+}
+
+// Prioritaet:
+// 1. Query-/Form-Parameter source=app
+// 2. JSON-Body {"source":"app"}
+// 3. Fallback "api"
+static String parseApiTimeSource() {
+  String source = otaServer.arg("source");
+  source.trim();
+  if (!source.isEmpty()) return source;
+
+  String body = otaServer.arg("plain");
+  body.trim();
+  if (body.startsWith("{")) {
+    source = parseApiJsonStringField(body, "source");
+    source.trim();
+    if (!source.isEmpty()) return source;
+  }
+
+  return "api";
+}
+
+static bool parseApiEpoch(uint64_t &epochValue, String &error) {
+  String raw = otaServer.arg("epoch");
+  if (raw.isEmpty()) raw = otaServer.arg("plain");
+  raw.trim();
+
+  // JSON der App akzeptieren: {"epoch":1783826067}
+  if (raw.startsWith("{")) {
+    int keyPos = raw.indexOf("\"epoch\"");
+    if (keyPos < 0) {
+      error = "missing epoch";
+      return false;
+    }
+    int colon = raw.indexOf(':', keyPos);
+    if (colon < 0) {
+      error = "invalid JSON";
+      return false;
+    }
+    int start = colon + 1;
+    while (start < (int)raw.length() &&
+           (raw.charAt(start) == ' ' || raw.charAt(start) == '\t' || raw.charAt(start) == '"')) start++;
+    int end = start;
+    while (end < (int)raw.length() && raw.charAt(end) >= '0' && raw.charAt(end) <= '9') end++;
+    raw = raw.substring(start, end);
+  }
+
+  if (raw.isEmpty()) {
+    error = "missing epoch";
+    return false;
+  }
+
+  char *endPtr = nullptr;
+  unsigned long long parsed = strtoull(raw.c_str(), &endPtr, 10);
+  if (endPtr == raw.c_str() || (endPtr && *endPtr != 0)) {
+    error = "epoch must be an integer";
+    return false;
+  }
+
+  epochValue = (uint64_t)parsed;
+  return true;
+}
+
 void setupWebServer() {
   otaServer.on("/",                     HTTP_GET,  handlePage);
   // Ausgelagerte statische Assets (einmal im Flash, vom Browser gecacht).
@@ -1382,6 +1545,38 @@ void setupWebServer() {
   });
   otaServer.on("/api/debug/status", HTTP_GET, [](){ otaServer.send(200,"application/json","{\"enabled\":"+String(cfg_debug?"true":"false")+",\"filter\":"+String(cfg_debug_filter)+"}"); });
   otaServer.on("/api/boot/status",  HTTP_GET, [](){ otaServer.send(200,"application/json",bootStatusJson()); });
+  otaServer.on("/api/time", HTTP_GET, [](){
+    otaServer.send(200, "application/json", timeServiceJson());
+  });
+  otaServer.on("/api/time", HTTP_POST, [](){
+    // Browser-Synchronisierung darf nur eine noch ungueltige Uhr setzen.
+    // Normale App/API-Aufrufe ohne only_if_invalid koennen die Zeit weiterhin
+    // bewusst aktualisieren. Die serverseitige Pruefung vermeidet ein Rennen
+    // mit einem NTP-Sync zwischen GET /api/time und diesem POST.
+    if (otaServer.arg("only_if_invalid") == "1" && timeServiceIsValid()) {
+      String response = timeServiceJson();
+      response.remove(response.length() - 1);
+      response += ",\"ok\":true,\"skipped\":true}";
+      otaServer.send(200, "application/json", response);
+      return;
+    }
+
+    uint64_t epochValue = 0;
+    String error;
+    if (!parseApiEpoch(epochValue, error)) {
+      otaServer.send(400, "application/json", "{\"ok\":false,\"error\":\"" + jsonEscapeDebug(error) + "\"}");
+      return;
+    }
+    String source = parseApiTimeSource();
+    if (!timeServiceSetEpoch(epochValue, error, source)) {
+      otaServer.send(400, "application/json", "{\"ok\":false,\"error\":\"" + jsonEscapeDebug(error) + "\"}");
+      return;
+    }
+    String response = timeServiceJson();
+    response.remove(response.length() - 1);
+    response += ",\"ok\":true}";
+    otaServer.send(200, "application/json", response);
+  });
   otaServer.on("/api/uart/log",         HTTP_GET,  [](){ otaServer.send(200,"application/json",uartLogJson()); });
   otaServer.on("/api/uart/clear",       HTTP_POST, [](){ uartLogClear(); otaServer.send(200,"text/plain","OK"); });
   otaServer.on("/update",               HTTP_POST, handleOTAFinish, handleOTAUpdate);

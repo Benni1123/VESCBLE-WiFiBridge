@@ -5,6 +5,7 @@
 #if defined(VESC_BRIDGE_UNITY_BUILD)
 #include "globals.h"
 #include "debuglog.h"
+#include "time-service.h"
 
 
 #ifndef RTC_NOINIT_ATTR
@@ -26,7 +27,9 @@ static String logSanitize(String line) {
 
 void uartLogAdd(const String &line) {
   if (!cfg_debug) return;
-  uartLog.push_back(logSanitize(line));
+  String clean = logSanitize(line);
+  if (clean.isEmpty()) return;
+  uartLog.push_back(timeServiceLogStamp() + " " + clean);
   while ((int)uartLog.size() > cfg_log_size) uartLog.erase(uartLog.begin());
 }
 
@@ -69,8 +72,8 @@ void bootDiagMarkPlannedRestart(const char *reason) {
   rtcRestartMarker.checksum = restartMarkerChecksum(rtcRestartMarker.reason);
   rtcRestartMarker.magic = RESTART_MARKER_MAGIC;
 
-  String line = String(millis() / 1000) + "s [SYSTEM] Geplanter Neustart: " + rtcRestartMarker.reason;
-  Serial.println(line);
+  String line = String("[SYSTEM] Geplanter Neustart: ") + rtcRestartMarker.reason;
+  Serial.println(timeServiceLogStamp() + " " + line);
   uartLogAdd(line); // unabhaengig vom Status-Filter, sofern Debug aktiv ist
 }
 
@@ -216,17 +219,68 @@ void captureBootDiagnostics() {
   // kleinem Log-Limit nicht von spaeteren WiFi-/BLE-Meldungen verdraengt werden.
 }
 
+// Rechnet einen alten, nur mit Uptime gespeicherten Logeintrag auf eine echte
+// lokale Uhrzeit zurueck, sobald die Systemzeit gueltig ist.
+//
+// Beispiel:
+//   gespeichert:  "18s [evt] AP started"
+//   angezeigt:    "2026-07-12 04:51:53 [uptime 18s] [evt] AP started"
+//
+// Die Uptime bleibt die unveraenderte Referenz. Die Kalenderzeit wird erst beim
+// Abruf von /api/uart/log berechnet. Dadurch werden auch Bootmeldungen mit 0s
+// nach einer spaeteren NTP-/Browser-/App-Synchronisierung sinnvoll datiert.
+static String uartLogResolveUptimeStamp(const String &line) {
+  if (!timeServiceIsValid()) return line;
+
+  const int len = line.length();
+  int pos = 0;
+  while (pos < len && line.charAt(pos) >= '0' && line.charAt(pos) <= '9') pos++;
+
+  // Nur das von uns erzeugte Format "<Sekunden>s <Text>" umwandeln.
+  if (pos == 0 || pos >= len || line.charAt(pos) != 's') return line;
+  if (pos + 1 < len && line.charAt(pos + 1) != ' ') return line;
+
+  uint64_t entryUptimeSec = 0;
+  for (int i = 0; i < pos; i++) {
+    entryUptimeSec = entryUptimeSec * 10ULL + (uint64_t)(line.charAt(i) - '0');
+  }
+
+  const uint64_t currentUptimeSec = (uint64_t)millis() / 1000ULL;
+  const time_t currentEpoch = timeServiceEpoch();
+  if (currentEpoch <= 0 || entryUptimeSec > currentUptimeSec) return line;
+
+  const uint64_t ageSec = currentUptimeSec - entryUptimeSec;
+  const time_t entryEpoch = currentEpoch - (time_t)ageSec;
+
+  struct tm localTm;
+  memset(&localTm, 0, sizeof(localTm));
+  localtime_r(&entryEpoch, &localTm);
+
+  char dateTime[24];
+  if (strftime(dateTime, sizeof(dateTime), "%Y-%m-%d %H:%M:%S", &localTm) == 0)
+    return line;
+
+  String result = String(dateTime) + " [uptime " + String((unsigned long)entryUptimeSec) + "s]";
+
+  // Das urspruengliche "18s" entfernen, den folgenden Text aber beibehalten.
+  if (pos + 1 < len) result += line.substring(pos + 1);
+  return result;
+}
+
 String uartLogJson() {
   String json = "[";
   bool first = true;
   auto appendLine = [&](String line) {
     if (!first) json += ",";
     first = false;
+    line = uartLogResolveUptimeStamp(line);
     json += "\"" + jsonEscapeDebug(logSanitize(line)) + "\"";
   };
 
   if (cfg_debug) {
     // Boot-/Resetdiagnose ist absichtlich nicht Teil des begrenzten Ringpuffers.
+    // 0s wird nach einer Zeitsynchronisierung auf die ungefaehre Bootzeit
+    // zurueckgerechnet; ohne gueltige Uhr bleibt weiterhin "0s" sichtbar.
     for (const String &line : bootDiagnosticLines) appendLine("0s " + line);
     for (const String &line : uartLog) appendLine(line);
   }
@@ -268,7 +322,7 @@ void dlog(const char *fmt, ...) {
   size_t len = strlen(buf);
   while (len && (buf[len-1] == '\n' || buf[len-1] == '\r')) buf[--len] = 0;
   if (!len) return;
-  uartLogAdd(String(millis() / 1000) + "s " + buf);
+  uartLogAdd(String(buf));
 }
 
 #endif // VESC_BRIDGE_UNITY_BUILD

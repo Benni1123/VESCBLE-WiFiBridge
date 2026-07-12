@@ -6,6 +6,7 @@
 #include "globals.h"
 #include "config.h"
 #include "debuglog.h"
+#include "time-service.h"
 #include "wifi-ble.h"
 
 // Interne, aber seit Arduino-ESP32 2.x/3.x vorhandene Initialisierungsfunktion.
@@ -149,7 +150,7 @@ static void wifiEventLog(const char *fmt, ...) {
   Serial.println(msg);
 
   if (!cfg_debug || !(cfg_debug_filter & 2)) return;
-  uartLogAdd(String(millis() / 1000) + "s " + msg);
+  uartLogAdd(String(msg));
 }
 
 // Vollstaendige Klartext-Zuordnung fuer ESP-IDF wifi_err_reason_t.
