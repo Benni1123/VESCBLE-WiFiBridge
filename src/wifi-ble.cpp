@@ -810,6 +810,25 @@ static void applyAdvInterval(bool slow) {
 // Im Loop aufrufen: verwaltet das schnelle Discovery-Fenster und den Wechsel auf
 // langes Intervall bei laengerem Idle-Advertising.
 static void manageAdvInterval() {
+  // ── Volle Leistung gewuenscht? -> Energiesparmodus komplett AUS ────────────
+  // Der Haken "BLE-Energiesparmodus deaktivieren" stellt das alte Verhalten
+  // wieder her: Advertising bleibt DAUERHAFT im schnellen Intervall (20-40ms),
+  // es wird nie auf das langsame Airtime-Spar-Intervall gewechselt. Der ESP
+  // ist damit jederzeit sofort auffindbar. Greift ohne Neustart: steht die
+  // Hardware gerade auf "langsam" (Haken wurde soeben gesetzt), wird sofort
+  // auf schnell zurueckgeschaltet.
+  if (cfg_ble_full_power) {
+    advStartedAt = 0;   // falls der Haken spaeter wieder entfernt wird:
+                        // Fast-Fenster beginnt dann von vorn
+    if (advSlowActive) {
+      NimBLEDevice::stopAdvertising();
+      applyAdvInterval(false);
+      if (bleIsAdvertising) NimBLEDevice::startAdvertising();
+      dlog("BLE adv: Energiesparmodus AUS -> dauerhaft schnelles Intervall\n");
+    }
+    return;
+  }
+
   // Nur relevant, wenn geadvertised wird UND kein Client verbunden ist.
   if (!bleIsAdvertising || deviceConnected) {
     advStartedAt = 0;   // naechstes Idle-Advertising startet wieder im Fast-Fenster

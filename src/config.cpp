@@ -61,6 +61,7 @@ void loadConfig() {
   cfg_ble_pin_enabled    = prefs.getBool("ble_pin_en",       false);
   cfg_ble_pin            = prefs.getInt ("ble_pin",          123456);
   cfg_ble_auto_off_sec   = prefs.getInt ("ble_off_sec",      120);
+  cfg_ble_full_power     = prefs.getBool("ble_fullpwr",      false);
   cfg_leds_enabled       = prefs.getBool("leds_en",          false);
   int count = prefs.getInt("wifi_count", 0);
   cfg_wifi.clear();
@@ -135,6 +136,7 @@ void saveConfig() {
   prefs.putBool  ("ble_pin_en",  cfg_ble_pin_enabled);
   prefs.putInt   ("ble_pin",     cfg_ble_pin);
   prefs.putInt   ("ble_off_sec", cfg_ble_auto_off_sec);
+  prefs.putBool  ("ble_fullpwr", cfg_ble_full_power);
   prefs.putBool  ("leds_en",     cfg_leds_enabled);
   prefs.putInt   ("wifi_count",  cfg_wifi.size());
   for (int i = 0; i < (int)cfg_wifi.size(); i++) {

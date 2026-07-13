@@ -311,6 +311,13 @@ static const char PAGE_HTML[] PROGMEM = R"rawliteral(
           Exactly 6 digits required (leading zeros allowed, e.g. 001234). With PIN enabled, unpaired devices cannot communicate — pairing with PIN is enforced (takes effect after restart). Already paired devices stay paired. Without the checkbox, pairing is accepted automatically (Just Works).
         </div>
       </div>
+      <label class="checkbox-row" style="margin-top:12px">
+        <input type="checkbox" id="ble_full_power">
+        <span id="lbl-ble-fullpwr">Disable BLE power saving (full performance)</span>
+      </label>
+      <div style="font-size:11px;color:var(--text3);margin-top:6px" id="lbl-ble-fullpwr-hint">
+        Without the checkbox, advertising slows down after 15s idle to give WiFi more airtime (BLE and WiFi share one radio). With the checkbox, advertising stays permanently at the fast interval (20-40ms) — the device is always instantly discoverable and connects fastest, but WiFi throughput may suffer. Takes effect immediately, no restart needed.
+      </div>
     </div>
     <div class="section">
       <h3 id="lbl-ap-title">Access Point (Fallback)</h3>
@@ -558,6 +565,8 @@ function applyTranslations(){
   s('lbl-ble-pin-en',       'Require PIN for BLE pairing',                   'PIN beim BLE-Koppeln verlangen');
   s('lbl-ble-pin',          'BLE pairing PIN (6 digits)',                    'BLE-Kopplungs-PIN (6 Ziffern)');
   s('lbl-ble-pin-hint',     'Exactly 6 digits required (leading zeros allowed, e.g. 001234). With PIN enabled, unpaired devices cannot communicate — pairing with PIN is enforced (takes effect after restart). Already paired devices stay paired. Without the checkbox, pairing is accepted automatically (Just Works).', 'Genau 6 Ziffern erforderlich (fuehrende Nullen erlaubt, z.B. 001234). Mit PIN koennen ungekoppelte Geraete nicht kommunizieren — Kopplung mit PIN wird erzwungen (greift nach Neustart). Bereits gekoppelte Geraete bleiben gekoppelt. Ohne Haken wird die Kopplung automatisch angenommen (Just Works).');
+  s('lbl-ble-fullpwr',      'Disable BLE power saving (full performance)',   'BLE-Energiesparmodus deaktivieren (volle Leistung)');
+  s('lbl-ble-fullpwr-hint', 'Without the checkbox, advertising slows down after 15s idle to give WiFi more airtime (BLE and WiFi share one radio). With the checkbox, advertising stays permanently at the fast interval (20-40ms) — the device is always instantly discoverable and connects fastest, but WiFi throughput may suffer. Takes effect immediately, no restart needed.', 'Ohne Haken wird das Advertising nach 15s Leerlauf verlangsamt, damit das WLAN mehr Airtime bekommt (BLE und WLAN teilen sich ein Funkmodul). Mit Haken bleibt das Advertising dauerhaft im schnellen Intervall (20-40ms) — der ESP ist jederzeit sofort auffindbar und verbindet am schnellsten, das WLAN kann dafuer langsamer werden. Greift sofort, kein Neustart noetig.');
   s('lbl-leds-title',       'LEDs',                                         'LEDs');
   s('lbl-leds-enabled',     'Enable WS28XX control',                        'WS28XX Steuerung aktivieren');
   s('lbl-blemode-sel',      'Mode',                                          'Modus');
@@ -812,6 +821,7 @@ function loadConfig(){
     window.origBlePinEn = d.ble_pin_enabled===true;
     document.getElementById('ble_pin').value     = (d.ble_pin!==undefined)?String(d.ble_pin).padStart(6,'0'):'123456';
     document.getElementById('blepin_wrap').style.display = d.ble_pin_enabled===true?'':'none';
+    document.getElementById('ble_full_power').checked = d.ble_full_power===true;
     document.getElementById('ap_ssid').value     = d.ap_ssid||'';
     document.getElementById('ap_pass').value     = d.ap_pass||'';
     document.getElementById('ap_timeout').value  = d.ap_timeout||120;
@@ -885,6 +895,7 @@ function saveConfig(){
     ble_name:    document.getElementById('ble_name').value,
     ble_pin_enabled: document.getElementById('ble_pin_enabled').checked,
     ble_pin:     parseInt(document.getElementById('ble_pin').value)||0,
+    ble_full_power: document.getElementById('ble_full_power').checked,
     ap_ssid:     document.getElementById('ap_ssid').value,
     ap_pass:     document.getElementById('ap_pass').value,
     ap_timeout:  parseInt(document.getElementById('ap_timeout').value)||120,
@@ -1131,6 +1142,7 @@ void handleApiConfigGet() {
   json += "\"ap_mode\":"+String(cfg_ap_mode)+",";
   json += "\"ble_pin_enabled\":"+String(cfg_ble_pin_enabled?"true":"false")+",";
   json += "\"ble_pin\":"+String(cfg_ble_pin)+",";
+  json += "\"ble_full_power\":"+String(cfg_ble_full_power?"true":"false")+",";
   json += "\"ble_auto_off_sec\":"+String(cfg_ble_auto_off_sec)+",";
   json += "\"leds_enabled\":"+String(cfg_leds_enabled?"true":"false")+",";
   json += "\"update_url\":\""+cfg_update_url+"\",";
@@ -1216,6 +1228,11 @@ void handleApiConfigPost() {
     cfg_ble_pin_enabled = (body.indexOf("\"ble_pin_enabled\":true") >= 0);
   if (body.indexOf("\"ble_pin\":") >= 0)
     cfg_ble_pin         = parseInt2("ble_pin", cfg_ble_pin);
+  // Wie bei den PIN-Feldern: nur uebernehmen, wenn das Feld im Body vorhanden
+  // ist. Eine aeltere Companion-App, die den Haken nicht kennt, wuerde ihn
+  // beim Speichern sonst stillschweigend deaktivieren.
+  if (body.indexOf("\"ble_full_power\":") >= 0)
+    cfg_ble_full_power  = (body.indexOf("\"ble_full_power\":true") >= 0);
   cfg_ble_auto_off_sec  = parseInt2("ble_auto_off_sec", 120);
   bool ledsWasEnabled   = cfg_leds_enabled;   // alten Zustand merken
   cfg_leds_enabled      = (body.indexOf("\"leds_enabled\":true") >= 0);

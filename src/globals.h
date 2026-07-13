@@ -104,6 +104,12 @@ bool   cfg_configured         = false;
 bool   cfg_ble_pin_enabled    = false;
 int    cfg_ble_pin            = 123456;   // 6-stellig, 000000..999999
 int    cfg_ble_auto_off_sec   = 120;   // nach X Sekunden ohne Bewegung & Client -> BLE aus
+// BLE-Energiesparmodus (Advertising-Drosselung bei Idle) deaktivieren:
+// true = volle Leistung — das Advertising bleibt dauerhaft im schnellen
+// Intervall (20-40ms), wie in fruehen Firmware-Versionen. Der ESP ist damit
+// jederzeit sofort auffindbar/verbindbar, das kostet aber WLAN-Airtime
+// (BLE und WiFi teilen sich EIN 2,4-GHz-Radio).
+bool   cfg_ble_full_power     = false;
 bool   cfg_leds_enabled       = false; // WS28XX LED-Steuerung aktiv (zeigt LED-Reiter + /leds)
 
 struct WiFiEntry {
