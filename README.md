@@ -29,8 +29,6 @@ The bridge can operate as a WiFi station and as its own fallback access point at
 
 ## Screenshots
 
-The web interface is shown below using the screenshots stored in `docs/screenshots/`.
-
 ### Live status
 
 <p align="center">
@@ -93,19 +91,6 @@ The web interface is shown below using the screenshots stored in `docs/screensho
 
 The screenshot filenames are case-sensitive. The repository layout should be:
 
-```text
-docs/
-└── screenshots/
-    ├── info.png
-    ├── config1.png
-    ├── config2.png
-    ├── ota.png
-    ├── api1.png
-    ├── api2.png
-    └── led.png
-```
-
----
 
 ## Main features
 
