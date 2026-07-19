@@ -1034,8 +1034,11 @@ static String apClientIp() {
   if (WiFi.softAPgetStationNum() == 0) return "";
   wifi_sta_list_t staList;
   if (esp_wifi_ap_get_sta_list(&staList) != ESP_OK) return "";
-  esp_netif_sta_list_t netifList;
-  if (esp_netif_get_sta_list(&staList, &netifList) != ESP_OK) return "";
+  // IDF 5: esp_netif_get_sta_list()/esp_netif_sta_list_t wurden entfernt.
+  // Ersatz ist esp_wifi_ap_get_sta_list_with_ip() mit wifi_sta_mac_ip_list_t —
+  // identische Semantik (MAC-Liste -> DHCP-IP-Zuordnung des AP-Netifs).
+  wifi_sta_mac_ip_list_t netifList;
+  if (esp_wifi_ap_get_sta_list_with_ip(&staList, &netifList) != ESP_OK) return "";
   for (int i = 0; i < netifList.num; i++) {
     esp_ip4_addr_t ip = netifList.sta[i].ip;
     if (ip.addr != 0) {   // gueltige (bereits vergebene) IP
@@ -1247,7 +1250,7 @@ void handleApiConfigPost() {
   if (cfg_ble_auto_erpm_on < 10)    cfg_ble_auto_erpm_on = 10;
   if (cfg_ble_pin < 0 || cfg_ble_pin > 999999) cfg_ble_pin = 123456;  // 6-stelliger Passkey
   // BLE-Security sofort uebernehmen (gilt fuer kuenftige Kopplungen, kein Reboot)
-  if (NimBLEDevice::getInitialized()) applyBleSecurity();
+  if (NimBLEDevice::isInitialized()) applyBleSecurity();   // NimBLE 2.x: getInitialized() -> isInitialized()
   if (cfg_ble_auto_erpm_on > 50000) cfg_ble_auto_erpm_on = 50000;
   if (cfg_ble_auto_off_sec < 5)     cfg_ble_auto_off_sec = 5;
   if (cfg_ble_auto_off_sec > 3600)  cfg_ble_auto_off_sec = 3600;
