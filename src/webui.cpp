@@ -308,7 +308,7 @@ static const char PAGE_HTML[] PROGMEM = R"rawliteral(
         <label id="lbl-ble-pin">BLE pairing PIN (6 digits)</label>
         <input type="text" id="ble_pin" maxlength="6" inputmode="numeric" placeholder="123456">
         <div style="font-size:11px;color:var(--text3);margin-top:6px" id="lbl-ble-pin-hint">
-          Exactly 6 digits required (leading zeros allowed, e.g. 001234). With PIN enabled, unpaired devices cannot communicate — pairing with PIN is enforced (takes effect after restart). Already paired devices stay paired. Without the checkbox, pairing is accepted automatically (Just Works).
+          Exactly 6 digits required (leading zeros allowed, e.g. 001234). With PIN enabled, unpaired devices cannot communicate — pairing with PIN is enforced. Already paired devices stay paired. Without the checkbox, pairing is accepted automatically (Just Works).
         </div>
       </div>
       <label class="checkbox-row" style="margin-top:12px">
@@ -316,7 +316,7 @@ static const char PAGE_HTML[] PROGMEM = R"rawliteral(
         <span id="lbl-ble-fullpwr">Disable BLE power saving (full performance)</span>
       </label>
       <div style="font-size:11px;color:var(--text3);margin-top:6px" id="lbl-ble-fullpwr-hint">
-        Without the checkbox, advertising slows down after 15s idle to give WiFi more airtime (BLE and WiFi share one radio). With the checkbox, advertising stays permanently at the fast interval (20-40ms) — the device is always instantly discoverable and connects fastest, but WiFi throughput may suffer. Takes effect immediately, no restart needed.
+        Without the checkbox, advertising slows down after 15s idle to give WiFi more airtime (BLE and WiFi share one radio). With the checkbox, advertising stays permanently at the fast interval (20-40ms) — the device is always instantly discoverable and connects fastest, but WiFi throughput may suffer.
       </div>
     </div>
     <div class="section">
@@ -439,6 +439,7 @@ static const char PAGE_HTML[] PROGMEM = R"rawliteral(
 
     </div>
     <button class="btn" onclick="saveConfig()" id="saveBtn">Save</button>
+    <div id="lbl-save-note" style="margin-top:6px;font-size:11px;color:var(--text3)">Saving restarts the ESP so that all settings take effect.</div>
     <button class="btn" style="margin-top:8px;background:#e0a030" onclick="restartDevice()" id="restartBtn">Restart</button>
     <button class="btn red" style="margin-top:8px" onclick="factoryReset()" id="factoryBtn">Factory Reset</button>
   </div>
@@ -564,9 +565,9 @@ function applyTranslations(){
   s('lbl-blemode-title',    'BLE Mode',                                      'BLE Modus');
   s('lbl-ble-pin-en',       'Require PIN for BLE pairing',                   'PIN beim BLE-Koppeln verlangen');
   s('lbl-ble-pin',          'BLE pairing PIN (6 digits)',                    'BLE-Kopplungs-PIN (6 Ziffern)');
-  s('lbl-ble-pin-hint',     'Exactly 6 digits required (leading zeros allowed, e.g. 001234). With PIN enabled, unpaired devices cannot communicate — pairing with PIN is enforced (takes effect after restart). Already paired devices stay paired. Without the checkbox, pairing is accepted automatically (Just Works).', 'Genau 6 Ziffern erforderlich (fuehrende Nullen erlaubt, z.B. 001234). Mit PIN koennen ungekoppelte Geraete nicht kommunizieren — Kopplung mit PIN wird erzwungen (greift nach Neustart). Bereits gekoppelte Geraete bleiben gekoppelt. Ohne Haken wird die Kopplung automatisch angenommen (Just Works).');
+  s('lbl-ble-pin-hint',     'Exactly 6 digits required (leading zeros allowed, e.g. 001234). With PIN enabled, unpaired devices cannot communicate — pairing with PIN is enforced. Already paired devices stay paired. Without the checkbox, pairing is accepted automatically (Just Works).', 'Genau 6 Ziffern erforderlich (fuehrende Nullen erlaubt, z.B. 001234). Mit PIN koennen ungekoppelte Geraete nicht kommunizieren — Kopplung mit PIN wird erzwungen. Bereits gekoppelte Geraete bleiben gekoppelt. Ohne Haken wird die Kopplung automatisch angenommen (Just Works).');
   s('lbl-ble-fullpwr',      'Disable BLE power saving (full performance)',   'BLE-Energiesparmodus deaktivieren (volle Leistung)');
-  s('lbl-ble-fullpwr-hint', 'Without the checkbox, advertising slows down after 15s idle to give WiFi more airtime (BLE and WiFi share one radio). With the checkbox, advertising stays permanently at the fast interval (20-40ms) — the device is always instantly discoverable and connects fastest, but WiFi throughput may suffer. Takes effect immediately, no restart needed.', 'Ohne Haken wird das Advertising nach 15s Leerlauf verlangsamt, damit das WLAN mehr Airtime bekommt (BLE und WLAN teilen sich ein Funkmodul). Mit Haken bleibt das Advertising dauerhaft im schnellen Intervall (20-40ms) — der ESP ist jederzeit sofort auffindbar und verbindet am schnellsten, das WLAN kann dafuer langsamer werden. Greift sofort, kein Neustart noetig.');
+  s('lbl-ble-fullpwr-hint', 'Without the checkbox, advertising slows down after 15s idle to give WiFi more airtime (BLE and WiFi share one radio). With the checkbox, advertising stays permanently at the fast interval (20-40ms) — the device is always instantly discoverable and connects fastest, but WiFi throughput may suffer.', 'Ohne Haken wird das Advertising nach 15s Leerlauf verlangsamt, damit das WLAN mehr Airtime bekommt (BLE und WLAN teilen sich ein Funkmodul). Mit Haken bleibt das Advertising dauerhaft im schnellen Intervall (20-40ms) — der ESP ist jederzeit sofort auffindbar und verbindet am schnellsten, das WLAN kann dafuer langsamer werden.');
   s('lbl-leds-title',       'LEDs',                                         'LEDs');
   s('lbl-leds-enabled',     'Enable WS28XX control',                        'WS28XX Steuerung aktivieren');
   s('lbl-blemode-sel',      'Mode',                                          'Modus');
@@ -582,6 +583,7 @@ function applyTranslations(){
   s('scanBtn',              'Scan',                                         'Scan');
   s('addBtn',               '+ Manual',                                     '+ Manuell');
   s('saveBtn',              'Save',                                         'Speichern');
+  s('lbl-save-note',        'Saving restarts the ESP so that all settings take effect.', 'Speichern startet den ESP neu, damit alle Einstellungen wirksam werden.');
   s('restartBtn',           'Restart',                                      'Neustart');
   s('factoryBtn',           'Factory Reset',                                'Werkseinstellungen');
   s('lbl-server-update',    'Server Update',                                'Server Update');
@@ -669,6 +671,7 @@ function loadInfo(){
       (d.mode!=='ap'?'<div class="info-row"><span>SSID</span><span class="info-val">'+d.ssid+'</span></div>':'')+
       (d.mode!=='ap'?'<div class="info-row"><span>RSSI</span><span class="info-val">'+d.rssi+' dBm</span></div>':'')+
       '<div class="info-row"><span>Free RAM</span><span class="info-val">'+(d.heap>=1024?(d.heap/1024).toFixed(1)+' KB':d.heap+' B')+'</span></div>'+
+      (d.psram_total>0?'<div class="info-row"><span>'+(de()?'PSRAM frei':'Free PSRAM')+'</span><span class="info-val">'+(d.psram_free/1048576).toFixed(2)+' / '+(d.psram_total/1048576).toFixed(1)+' MB</span></div>':'')+
       '<div class="info-row"><span>AP</span><span class="info-val" style="color:'+(d.ap_active?'var(--ok)':'var(--text3)')+'">'+( d.ap_active?(de()?'Aktiv':'Active'):(de()?'Aus':'Off'))+(d.ap_active?' ('+d.ap_ip+')':'')+'</span></div>'+
       (d.ap_client_ip?'<div class="info-row"><span>'+(de()?'AP-Client IP':'AP client IP')+'</span><span class="info-val">'+d.ap_client_ip+'</span></div>':'')+
       (d.ap_active&&d.ap_timeout_remaining>=0?'<div class="info-row"><span>'+(de()?'AP aus in':'AP off in')+'</span><span class="info-val">'+d.ap_timeout_remaining+'s</span></div>':'')+
@@ -853,7 +856,6 @@ function loadConfig(){
     document.getElementById('update_url').value  = d.update_url||'';
     wifiNetworks=(d.wifi||[]).map(function(n){return{ssid:n.ssid||'',pass:n.pass||'',static:n.static||false,ip:n.ip||'',gateway:n.gateway||'',subnet:n.subnet||'255.255.255.0',dns:n.dns||''};});
     renderWifiList();
-    markOriginals();
   });
 }
 
@@ -868,21 +870,16 @@ function showToast(msg, ok, duration){
   t._hide=setTimeout(function(){t.style.opacity='0';},duration||3000);
 }
 
-// Fields that need reboot
-var rebootFields=['ble_name','ap_ssid','ap_pass','vesc_port','rx_pin','tx_pin'];
-function needsReboot(){
-  return rebootFields.some(function(id){
-    var el=document.getElementById(id);
-    return el && el._orig!==undefined && String(el.value)!==String(el._orig);
-  });
-}
-
-function markOriginals(){
-  rebootFields.forEach(function(id){
-    var el=document.getElementById(id);
-    if(el) el._orig=el.value;
-  });
-}
+// EINHEITLICHES SPEICHER-VERHALTEN: Jedes Speichern der Konfiguration startet
+// den ESP neu. Grund: Ein Teil der Einstellungen (BLE-Name, AP-SSID/-Passwort,
+// UART-Pins, TCP-Port, PIN-Schutz, STA-Netzliste) kann technisch nicht sauber
+// im laufenden Betrieb uebernommen werden. Frueher gab es dafuer eine Liste von
+// "reboot-pflichtigen" Feldern und mehrere Sonderwege — das war fuer den Nutzer
+// nicht vorhersehbar (mal Auto-Neustart, mal Hinweis "bitte Neustart druecken",
+// mal stilles Nicht-Wirken, z.B. bei neu hinzugefuegten WLAN-Netzen, die ohne
+// Neustart nicht automatisch verbunden wurden).
+// Jetzt gilt genau eine Regel: Speichern -> speichern + Neustart. Keine
+// Ausnahmen, kein manueller Zusatzschritt, alles greift garantiert.
 
 function saveConfig(){
   if(document.getElementById('ble_pin_enabled').checked && !/^\d{6}$/.test(document.getElementById('ble_pin').value)){
@@ -890,7 +887,6 @@ function saveConfig(){
     return;
   }
   var wifi=wifiNetworks.filter(function(n){return n.ssid.trim().length>0;});
-  var reboot=needsReboot();
   var bodyObj={
     ble_name:    document.getElementById('ble_name').value,
     ble_pin_enabled: document.getElementById('ble_pin_enabled').checked,
@@ -920,23 +916,15 @@ function saveConfig(){
     update_url:  document.getElementById('update_url').value,
     wifi: wifi
   };
-  if(!reboot) bodyObj.noreboot=true;
+  // Kein "noreboot" mehr: der ESP startet nach jedem Speichern neu (siehe
+  // Kommentar oben). Dadurch greift jede Einstellung zuverlaessig — inklusive
+  // neu hinzugefuegter WLAN-Netze, die sich sonst erst viel spaeter (oder gar
+  // nicht) automatisch verbunden haben.
   fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(bodyObj)})
     .then(function(r){
       if(r.ok){
-        if(reboot){
-          showToast(de()?'Gespeichert — ESP startet neu...':'Saved — ESP restarting...',true,8000);
-          setTimeout(function(){location.reload();},5000);
-        } else {
-          var pinChanged=(window.origBlePinEn!==undefined)&&(window.origBlePinEn!==bodyObj.ble_pin_enabled);
-          if(pinChanged){
-            showToast(de()?'Gespeichert ✓ — Neustart noetig, damit der PIN-Schutz greift (Neustart-Button unten)':'Saved ✓ — restart required for PIN protection to take effect (Restart button below)',true,8000);
-            window.origBlePinEn=bodyObj.ble_pin_enabled;
-          } else {
-            showToast(de()?'Gespeichert ✓':'Saved ✓',true,3000);
-          }
-          markOriginals();
-        }
+        showToast(de()?'Gespeichert — ESP startet neu...':'Saved — ESP restarting...',true,8000);
+        setTimeout(function(){location.reload();},5000);
       } else {
         showToast(de()?'Fehler beim Speichern':'Error saving',false,4000);
       }
@@ -1034,8 +1022,11 @@ static String apClientIp() {
   if (WiFi.softAPgetStationNum() == 0) return "";
   wifi_sta_list_t staList;
   if (esp_wifi_ap_get_sta_list(&staList) != ESP_OK) return "";
-  esp_netif_sta_list_t netifList;
-  if (esp_netif_get_sta_list(&staList, &netifList) != ESP_OK) return "";
+  // IDF 5: esp_netif_get_sta_list()/esp_netif_sta_list_t wurden entfernt.
+  // Ersatz ist esp_wifi_ap_get_sta_list_with_ip() mit wifi_sta_mac_ip_list_t —
+  // identische Semantik (MAC-Liste -> DHCP-IP-Zuordnung des AP-Netifs).
+  wifi_sta_mac_ip_list_t netifList;
+  if (esp_wifi_ap_get_sta_list_with_ip(&staList, &netifList) != ESP_OK) return "";
   for (int i = 0; i < netifList.num; i++) {
     esp_ip4_addr_t ip = netifList.sta[i].ip;
     if (ip.addr != 0) {   // gueltige (bereits vergebene) IP
@@ -1069,6 +1060,8 @@ void handleApiInfo() {
   json += "\"ap_ip\":\""+WiFi.softAPIP().toString()+"\",";
   json += "\"ap_client_ip\":\""+apClientIp()+"\",";
   json += "\"heap\":"+String(ESP.getFreeHeap())+",";
+  json += "\"psram_free\":"+String(ESP.getFreePsram())+",";
+  json += "\"psram_total\":"+String(ESP.getPsramSize())+",";
   json += "\"uptime\":\""+uptime+"\",";
   json += "\"build\":\""+String(FIRMWARE_VERSION)+" ("+String(__DATE__)+" "+String(__TIME__)+")\",";
   json += "\"port\":"+String(cfg_port)+",";
@@ -1247,7 +1240,7 @@ void handleApiConfigPost() {
   if (cfg_ble_auto_erpm_on < 10)    cfg_ble_auto_erpm_on = 10;
   if (cfg_ble_pin < 0 || cfg_ble_pin > 999999) cfg_ble_pin = 123456;  // 6-stelliger Passkey
   // BLE-Security sofort uebernehmen (gilt fuer kuenftige Kopplungen, kein Reboot)
-  if (NimBLEDevice::getInitialized()) applyBleSecurity();
+  if (NimBLEDevice::isInitialized()) applyBleSecurity();   // NimBLE 2.x: getInitialized() -> isInitialized()
   if (cfg_ble_auto_erpm_on > 50000) cfg_ble_auto_erpm_on = 50000;
   if (cfg_ble_auto_off_sec < 5)     cfg_ble_auto_off_sec = 5;
   if (cfg_ble_auto_off_sec > 3600)  cfg_ble_auto_off_sec = 3600;
@@ -1280,6 +1273,11 @@ void handleApiConfigPost() {
   }
 
   saveConfig();
+  // Standard: speichern -> Neustart. Die Web-UI sendet "noreboot" NICHT mehr,
+  // damit jede Einstellung garantiert wirksam wird (einheitliches Verhalten).
+  // Die Option bleibt fuer eigene API-Skripte erhalten — dort gilt aber: ohne
+  // Neustart uebernimmt der laufende Betrieb nur einen Teil der Werte
+  // (z.B. neue STA-Netze werden nicht sofort automatisch verbunden).
   bool doReboot = !(otaServer.hasArg("noreboot") || body.indexOf("\"noreboot\":true") >= 0);
   if (!doReboot) {
     // Refresh wifiMulti with new networks without reboot
@@ -1303,6 +1301,37 @@ void handleOTAUpdate() {
 void handleOTAFinish() {
   if (Update.hasError()) otaServer.send(500,"text/plain",Update.errorString());
   else { bootDiagMarkPlannedRestart("Manuelles OTA-Update"); otaServer.send(200,"text/plain","OK"); ledsOff(); delay(500); ESP.restart(); }
+}
+
+// ── WLAN-Scan, AP-schonend (kanalweise) ─────────────────────────────────────
+// Ein kompletter Scan (WiFi.scanNetworks() ohne Kanal-Parameter) haelt das
+// Funkmodul 1,5-4 s AM STUECK von unserem AP-Kanal fern: waehrend der Treiber
+// die 13 Kanaele durchlaeuft, sendet der AP keine Beacons. Ein verbundener
+// Client (z.B. das Handy mit der Web-UI) verpasst dadurch viele Beacons in
+// Folge, wertet den AP als verschwunden und fliegt raus — beim Wiederverbinden
+// zaehlt softAPgetStationNum() dann alte, noch nicht ausgealterte Eintraege
+// mit ("clients=3" bei nur einem Geraet).
+// Loesung: kanalweise scannen. Nach jedem Kanal kehrt der Treiber auf den
+// AP-Kanal zurueck; die kurze Pause dazwischen laesst Beacons und Client-
+// Verkehr durch. Clients verpassen so nur 1-2 Beacons am Stueck und bleiben
+// verbunden. Gesamtdauer ~3,5 s — vergleichbar mit vorher, nur ohne Abriss.
+static void handleApiWifiScan() {
+  String j = "[";
+  bool first = true;
+  for (uint8_t ch = 1; ch <= 13; ch++) {
+    // synchron, keine versteckten SSIDs, aktiver Scan, max. 140 ms pro Kanal
+    int n = WiFi.scanNetworks(false, false, false, 140, ch);
+    for (int i = 0; i < n; i++) {
+      if (!first) j += ",";
+      first = false;
+      j += "{\"ssid\":\""+WiFi.SSID(i)+"\",\"rssi\":"+String(WiFi.RSSI(i))+
+           ",\"secure\":"+String(WiFi.encryptionType(i)!=WIFI_AUTH_OPEN?"true":"false")+"}";
+    }
+    WiFi.scanDelete();
+    delay(120);   // Atempause auf dem AP-Kanal: Beacons raus, Client bedienen
+  }
+  j += "]";
+  otaServer.send(200, "application/json", j);
 }
 
 void handleApiUpdateCheck() {
@@ -1540,7 +1569,7 @@ void setupWebServer() {
     delay(300);
     ESP.restart();
   });
-  otaServer.on("/api/wifi/scan",        HTTP_GET,  [](){ int n=WiFi.scanNetworks();String j="[";for(int i=0;i<n;i++){if(i)j+=",";j+="{\"ssid\":\""+WiFi.SSID(i)+"\",\"rssi\":"+String(WiFi.RSSI(i))+",\"secure\":"+String(WiFi.encryptionType(i)!=WIFI_AUTH_OPEN?"true":"false")+"}";}j+="]";WiFi.scanDelete();otaServer.send(200,"application/json",j); });
+  otaServer.on("/api/wifi/scan",        HTTP_GET,  handleApiWifiScan);   // kanalweise, AP-schonend
   otaServer.on("/api/wifi/disconnect-reasons", HTTP_GET, [](){ otaServer.send(200,"application/json",wifiDisconnectReasonsJson()); });
   otaServer.on("/api/update/status",    HTTP_GET,  [](){ otaServer.send(200,"application/json","{\"current\":\""+String(FIRMWARE_VERSION)+"\",\"available\":\""+updateState.availableVersion+"\",\"update_url\":\""+cfg_update_url+"\",\"version_url\":\""+cfg_version_url+"\",\"error\":\""+updateState.error+"\"}"); });
   otaServer.on("/api/update/check",     HTTP_GET,  handleApiUpdateCheck);

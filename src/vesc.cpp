@@ -170,7 +170,7 @@ void vescLoop() {
   ledsUpdateState(cfg_leds_enabled, vescStatus.erpm);
 
   if (!wifiClient || !wifiClient.connected()) {
-    wifiClient = server.available();
+    wifiClient = server.accept();   // Core 3.x: available() -> accept() (nur Umbenennung, gleiche Funktion)
     if (wifiClient) {
       wifiClient.setNoDelay(true);
       wifiClient.setTimeout(100);

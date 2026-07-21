@@ -8,12 +8,16 @@
 #include "debuglog.h"
 #include "time-service.h"
 #include "wifi-ble.h"
+#include <NimBLEBondMigration.h>   // einmalige Bond-Konvertierung 1.x -> 2.x (vor init!)
 
-// Interne, aber seit Arduino-ESP32 2.x/3.x vorhandene Initialisierungsfunktion.
-// Sie initialisiert Treiber + Netifs, startet den Funk aber noch NICHT. Genau
-// dieses Zeitfenster brauchen wir, um die korrekte AP-SSID VOR dem ersten
-// Beacon in den Treiber zu schreiben. Danach startet WiFi.mode() den Treiber
-// ganz normal und haelt auch seinen internen Status konsistent.
+// Interne Initialisierungsfunktion des Arduino-Cores (in 3.3.9 verifiziert:
+// WiFiGeneric.cpp, externe Linkage, identischer Ablauf wie in 2.x). Sie
+// initialisiert Netzwerk-Grundgeruest + WiFi-Treiber, startet den Funk aber
+// noch NICHT. Genau dieses Zeitfenster brauchen wir, um die korrekte AP-SSID
+// VOR dem ersten Beacon in den Treiber zu schreiben. Danach startet
+// WiFi.mode() den Treiber ganz normal (Netif-Erzeugung uebernehmen in Core 3.x
+// STA.onEnable()/AP.onEnable() innerhalb von mode()) und haelt seinen internen
+// Status konsistent.
 bool wifiLowLevelInit(bool persistent);
 
 
@@ -25,6 +29,10 @@ void applyBleSecurity() {
     // PIN-Pairing: MITM an + "Display only" -> der ESP "zeigt" den statischen
     // Passkey (steht in der Config), die Gegenseite (Windows/Handy) muss ihn
     // beim Koppeln eingeben. Falsche PIN -> Kopplung schlaegt fehl.
+    // NimBLE 2.x: Der tatsaechlich verwendete Passkey kommt beim Pairing aus
+    // MyServerCallbacks::onPassKeyDisplay() (liefert cfg_ble_pin). Der Aufruf
+    // von setSecurityPasskey bleibt zusaetzlich gesetzt (konsistenter
+    // Bibliothekszustand, schadet nicht).
     NimBLEDevice::setSecurityAuth(true /*bonding*/, true /*mitm*/, true /*secure conn*/);
     NimBLEDevice::setSecurityIOCap(BLE_HS_IO_DISPLAY_ONLY);
     NimBLEDevice::setSecurityPasskey((uint32_t)cfg_ble_pin);
@@ -84,9 +92,9 @@ static void advanceStaScanBackoff(unsigned long now) {
   lastReconnectTry = now;
 }
 
-class MyServerCallbacks : public BLEServerCallbacks {
-  void onConnect(NimBLEServer *pServer, ble_gap_conn_desc *desc) {
-    dlog("BLE connected: %s\n", NimBLEAddress(desc->peer_ota_addr).toString().c_str());
+class MyServerCallbacks : public NimBLEServerCallbacks {
+  void onConnect(NimBLEServer *pServer, NimBLEConnInfo &connInfo) override {
+    dlog("BLE connected: %s\n", connInfo.getAddress().toString().c_str());
     deviceConnected = true;
     // BEWUSST KEIN proaktiver Security-Request (startSecurity) beim Connect:
     // Android beantwortet den auf manchen Geraeten mit einer ERSTEN Kopplungs-
@@ -103,33 +111,48 @@ class MyServerCallbacks : public BLEServerCallbacks {
     // Bei "An"-Modus: weiter advertisen (so dass weitere Clients sich verbinden koennen).
     if (cfg_ble_mode == 1) NimBLEDevice::startAdvertising();
   }
-  void onDisconnect(NimBLEServer *pServer) {
-    dlog("BLE disconnected\n");
+  // NimBLE 2.x: onDisconnect liefert zusaetzlich den Trennungsgrund (HCI-Code).
+  // Der Grund landet im Log — hilfreich um z.B. Supervision-Timeouts (0x08/0x13)
+  // von normalen Nutzer-Trennungen (0x16) zu unterscheiden.
+  void onDisconnect(NimBLEServer *pServer, NimBLEConnInfo &connInfo, int reason) override {
+    dlog("BLE disconnected (reason=0x%02X)\n", (unsigned)reason);
     deviceConnected = false;
     // Nur erneut advertisen, wenn der Modus das zulaesst und wir laut Zustand
     // gerade advertisen sollen. Sonst greift handleBleMode() im Loop nach.
+    // (NimBLE 2.x startet Advertising nach Disconnect NICHT mehr automatisch —
+    //  advertiseOnDisconnect ist per Default aus. Genau richtig fuer uns: die
+    //  Kontrolle liegt vollstaendig hier bzw. in handleBleMode().)
     if (cfg_ble_mode == 1 || (cfg_ble_mode == 2 && bleIsAdvertising)) {
       NimBLEDevice::startAdvertising();
     }
   }
-  void onMTUChange(uint16_t MTU, ble_gap_conn_desc *desc) {
+  void onMTUChange(uint16_t MTU, NimBLEConnInfo &connInfo) override {
     MTU_SIZE = MTU; PACKET_SIZE = MTU_SIZE - 3;
+  }
+  // NimBLE 2.x: Bei IOCap DISPLAY_ONLY holt sich der Stack den anzuzeigenden
+  // Passkey ueber DIESEN Callback (nicht mehr ueber setSecurityPasskey!).
+  // Ohne Override wuerde der Bibliotheks-Default 123456 gelten — der Nutzer-PIN
+  // aus der Config waere wirkungslos. Deshalb hier zwingend cfg_ble_pin liefern.
+  uint32_t onPassKeyDisplay() override {
+    return (uint32_t)cfg_ble_pin;
   }
   // Wird nach einem Pairing-Versuch (z.B. von Windows/VESC Tool) aufgerufen.
   // Just-Works nimmt automatisch an — hier nur das Ergebnis loggen, damit man
   // im UART-Log (Status-Filter) sieht, ob die Kopplung geklappt hat.
-  void onAuthenticationComplete(ble_gap_conn_desc *desc) {
+  void onAuthenticationComplete(NimBLEConnInfo &connInfo) override {
     dlog("BLE pairing: %s (encrypted=%d bonded=%d)\n",
-         desc->sec_state.encrypted ? "OK" : "FEHLGESCHLAGEN",
-         desc->sec_state.encrypted, desc->sec_state.bonded);
+         connInfo.isEncrypted() ? "OK" : "FEHLGESCHLAGEN",
+         (int)connInfo.isEncrypted(), (int)connInfo.isBonded());
   }
 };
 
-class MyCallbacks : public BLECharacteristicCallbacks {
-  void onWrite(BLECharacteristic *pCharacteristic) {
-    std::string rx = pCharacteristic->getValue();
+class MyCallbacks : public NimBLECharacteristicCallbacks {
+  void onWrite(NimBLECharacteristic *pCharacteristic, NimBLEConnInfo &connInfo) override {
+    // NimBLE 2.x: getValue() liefert NimBLEAttValue (kein std::string mehr) —
+    // data()/length() funktionieren identisch, ohne Kopie in einen String.
+    NimBLEAttValue rx = pCharacteristic->getValue();
     if (rx.length()>0 && pCharacteristic->getUUID().equals(pCharacteristicVescRx->getUUID())) {
-      if (cfg_debug && (cfg_debug_filter & 1)) { String h="BLE=>VESC: ";for(size_t i=0;i<rx.length();i++){char x[4];snprintf(x,4,"%02X ",(uint8_t)rx[i]);h+=x;} uartLogAdd(h); }
+      if (cfg_debug && (cfg_debug_filter & 1)) { String h="BLE=>VESC: ";for(size_t i=0;i<rx.length();i++){char x[4];snprintf(x,4,"%02X ",(uint8_t)rx.data()[i]);h+=x;} uartLogAdd(h); }
       Serial1.write((const uint8_t*)rx.data(), rx.length());
     }
   }
@@ -863,7 +886,12 @@ void handleBleMode() {
     lastMode = cfg_ble_mode;
     if (cfg_ble_mode == 0) {
       // Aus
-      if (pServer && pServer->getConnectedCount() > 0) { pServer->disconnect(0); delay(50); }
+      // NimBLE 2.x: alle verbundenen Clients ueber ihre echten Conn-Handles
+      // trennen (disconnect(0) hat sich frueher auf Handle 0 verlassen).
+      if (pServer && pServer->getConnectedCount() > 0) {
+        for (uint16_t h : pServer->getPeerDevices()) pServer->disconnect(h);
+        delay(50);
+      }
       NimBLEDevice::stopAdvertising();
       bleIsAdvertising = false;
       dlog("BLE mode: OFF\n");
@@ -1250,8 +1278,26 @@ void handleWiFiReconnect() {
 // ── Modul-Setup ───────────────────────────────────────────────────────────────
 void wifiBleSetup() {
   if (cfg_ble_name.isEmpty()) cfg_ble_name = DEFAULT_BLE_NAME;
+
+  // ── Einmalige Bond-Migration 1.x -> 2.x ─────────────────────────────────────
+  // NimBLE 2.x speichert Bonds in einem NEUEN NVS-Format. Ohne Migration waeren
+  // alle bestehenden Kopplungen (Windows-PCs, Handys) nach dem Firmware-Update
+  // kaputt ("verbunden, aber keine Daten"). Die Bibliothek bringt dafuer einen
+  // offiziellen Konverter mit, der VOR NimBLEDevice::init() laufen muss.
+  // Der Lauf ist idempotent (bereits konvertierte/leere Eintraege werden
+  // uebersprungen); ueber das NVS-Flag laeuft er trotzdem nur genau EINMAL.
+  prefs.begin("vesccfg", false);
+  if (!prefs.getBool("bondmig2", false)) {
+    bool migOk = NimBLEBondMigration::migrateBondStoreToCurrent();
+    prefs.putBool("bondmig2", true);
+    dlog("BLE bond migration 1.x -> 2.x: %s\n", migOk ? "OK" : "FEHLGESCHLAGEN (Neu-Koppeln noetig)");
+  }
+  prefs.end();
+
   NimBLEDevice::init(cfg_ble_name.c_str());
-  NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+  // NimBLE 2.x: setPower nimmt direkt dBm (int8_t) statt esp_power_level_t.
+  // 9 dBm entspricht dem bisherigen ESP_PWR_LVL_P9 (Maximalleistung).
+  NimBLEDevice::setPower(9);
   // Pairing/Bonding fuer VESC Tool unter Windows. Je nach Config-Haken:
   //   - ohne BLE-PIN: "Just Works" -> Kopplung wird automatisch angenommen.
   //   - mit  BLE-PIN: statischer 6-stelliger Passkey muss eingegeben werden.
@@ -1261,8 +1307,13 @@ void wifiBleSetup() {
 
   pServer = NimBLEDevice::createServer();
   pServer->setCallbacks(new MyServerCallbacks());
+  // NimBLE 2.x: automatisches Re-Advertising nach Disconnect ist per Default
+  // AUS (in 1.x war es an). Wir wollen es aus — die Advertising-Steuerung liegt
+  // vollstaendig bei onDisconnect()/handleBleMode(). Explizit setzen, damit die
+  // Absicht dokumentiert ist und ein kuenftiger Default-Wechsel nichts aendert.
+  pServer->advertiseOnDisconnect(false);
 
-  BLEService *pService = pServer->createService(VESC_SERVICE_UUID);
+  NimBLEService *pService = pServer->createService(VESC_SERVICE_UUID);
   // Characteristic-Properties abhaengig vom BLE-PIN-Haken:
   //   PIN AUS -> wie bisher: offene Properties, jede App kann ungekoppelt
   //              verbinden und kommunizieren (Just Works ist rein optional).
@@ -1284,11 +1335,21 @@ void wifiBleSetup() {
   pCharacteristicVescRx = pService->createCharacteristic(VESC_CHARACTERISTIC_UUID_RX, rxProps);
   pCharacteristicVescRx->setCallbacks(new MyCallbacks());
 
-  pService->start();
+  // NimBLE 2.x: pService->start() entfaellt — Services starten automatisch mit
+  // pServer->start(). Der fruehere Aufruf ist als wirkungsloses No-Op deprecated.
   pServer->start();
 
   NimBLEAdvertising *pAdv = NimBLEDevice::getAdvertising();
   pAdv->addServiceUUID(VESC_SERVICE_UUID);
+  // NimBLE 2.x: Der Geraetename wird NICHT mehr automatisch advertised und die
+  // Scan-Response ist per Default AUS (in 1.x war beides automatisch an).
+  // Ohne diese zwei Zeilen sendet das Advertising nur Flags + Service-UUID —
+  // die VESC-App findet das Geraet dann nicht, obwohl es advertised.
+  // Reihenfolge wichtig: erst Scan-Response aktivieren, DANN den Namen setzen —
+  // so landet der Name im Scan-Response-Paket (31 Bytes extra Platz) und
+  // kollidiert auch bei langen Namen nie mit der 128-bit-UUID im Adv-Paket.
+  pAdv->enableScanResponse(true);
+  pAdv->setName(cfg_ble_name.c_str());
   applyAdvInterval(false);   // Start im schnellen Discovery-Intervall
   // Beim Boot Advertising nur starten wenn Modus nicht "Aus" ist.
   // Auto-Modus startet ebenfalls AN (laut Konfig-Wunsch).

@@ -18,7 +18,7 @@
 #include <WiFi.h>
 #include <esp_wifi.h>          // esp_wifi_set_config (Beacon-Intervall, AP-Feintuning)
 #include <esp_netif.h>         // DHCP-Server stoppen/konfigurieren/starten + Lease-Option
-#include <esp_netif_sta_list.h>// IP eines am AP verbundenen Clients ermitteln
+#include <esp_wifi_ap_get_sta_list.h> // IDF 5: IP eines am AP verbundenen Clients (ersetzt esp_netif_sta_list.h)
 #include <WiFiAP.h>
 #include <WiFiMulti.h>
 #include <WebServer.h>
