@@ -416,6 +416,15 @@ static bool startApStaCleanFromOff(int channel) {
     return false;
   }
 
+  // Protokoll (B/G/N) und Bandbreite (HT20) JETZT setzen — vor dem ersten
+  // Treiber-Start. Diese beiden Calls starten unter IDF 5.5 ein bereits
+  // laufendes AP-Interface neu; hier laeuft es aber noch nicht, also
+  // entsteht kein Stop/Start. tuneApDhcp() erkennt spaeter, dass die Werte
+  // schon korrekt sind, und ueberspringt sie -> kein Boot-Flackern.
+  esp_wifi_set_protocol(WIFI_IF_AP,
+      WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
+  esp_wifi_set_bandwidth(WIFI_IF_AP, WIFI_BW_HT20);
+
   // WiFi.mode() sieht intern noch "nicht gestartet", ruft deshalb den normalen
   // Arduino-Startpfad auf. Der IDF-Treiber besitzt zu diesem Zeitpunkt aber
   // bereits unsere SSID/Passwort-Konfiguration. Es entsteht nur EIN AP_START.
@@ -487,18 +496,33 @@ static void tuneApDhcp() {
   // den Update-Check zu stoeren -- Ursache war aber DNS, daher wieder aktiv.)
   esp_wifi_set_max_tx_power(80);
 
-  // WiFi-Protokoll explizit auf 802.11 B/G/N setzen (statt IDF-Default). B als
-  // Basis macht Beacons/Management-Frames mit der robustesten Modulation --
-  // manche Handys verbinden sich damit zuverlaessiger, gerade bei schwachem
-  // Signal oder Stoerungen. Kostet nichts, N bleibt fuer den Datendurchsatz.
-  esp_wifi_set_protocol(WIFI_IF_AP,
-      WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
+  // WiFi-Protokoll (B/G/N) und Kanalbreite (HT20) setzen — ABER nur, wenn sie
+  // nicht ohnehin schon korrekt sind. Wichtig unter IDF 5.5 / Core 3.x:
+  // esp_wifi_set_protocol() und esp_wifi_set_bandwidth() starten das AP-
+  // Interface NEU, wenn sie auf einen laufenden AP angewendet werden (unter
+  // IDF 4.4 war das ein stiller In-Place-Wechsel). Da tuneApDhcp() nach JEDEM
+  // erfolgreichen ensureAP() laeuft, verursachte das ein sichtbares AP-Stop/
+  // Start-Flackern bei jedem Aufruf. Die Werte aendern sich nie -> nur beim
+  // ersten Mal (oder nach echtem Abweichen) setzen, danach ueberspringen.
+  //
+  // B als Basis macht Beacons/Management-Frames mit der robustesten Modulation
+  // (manche Handys verbinden sich damit zuverlaessiger). HT20 ist auf 2,4 GHz
+  // stabiler als HT40 (Repeater/Router-Vertraeglichkeit).
+  const uint8_t wantProto = WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N;
+  uint8_t curProto = 0;
+  bool protoOk = (esp_wifi_get_protocol(WIFI_IF_AP, &curProto) == ESP_OK) && (curProto == wantProto);
+  if (!protoOk) {
+    esp_wifi_set_protocol(WIFI_IF_AP, wantProto);
+  }
 
-  // Kanalbreite fest auf 20 MHz (HT20). Auf 2,4 GHz bringt 40 MHz kaum etwas,
-  // macht aber oft Verbindungsaerger (Repeater/Router) -> HT20 ist stabiler.
-  esp_wifi_set_bandwidth(WIFI_IF_AP, WIFI_BW_HT20);
+  wifi_bandwidth_t curBw = WIFI_BW_HT40;
+  bool bwOk = (esp_wifi_get_bandwidth(WIFI_IF_AP, &curBw) == ESP_OK) && (curBw == WIFI_BW_HT20);
+  if (!bwOk) {
+    esp_wifi_set_bandwidth(WIFI_IF_AP, WIFI_BW_HT20);
+  }
 
-  dlog("AP tune: ps=MIN_MODEM (BT-Koexistenz), TX-power max, proto=BGN, bw=HT20\n");
+  dlog("AP tune: ps=MIN_MODEM (BT-Koexistenz), TX-power max, proto=%s, bw=%s\n",
+       protoOk ? "BGN(ok)" : "BGN(set)", bwOk ? "HT20(ok)" : "HT20(set)");
 }
 
 bool ensureAP(bool force) {
@@ -540,8 +564,17 @@ bool ensureAP(bool force) {
   // wuerde ensureAP() diesen Default-AP faelschlich fuer "unseren" halten und
   // softAP() mit der eigenen SSID nie aufrufen -> es bleibt dauerhaft bei
   // "ESP-XXXX". Deshalb hier die laufende AP-SSID mit cfg_ap_ssid vergleichen.
+  //
+  // SONDERFALL leere SSID (Core 3.x / IDF 5.5): Direkt nach dem Preconfig-Pfad
+  // (esp_wifi_set_config vor dem ersten Start) hat der Treiber unsere SSID zwar
+  // schon, der Arduino-Wrapper-Cache liefert bei softAPSSID() aber noch "".
+  // Das ist NICHT dasselbe wie ein fremder "ESP-XXXX"-AP — es ist unser eigener
+  // AP im Hochlauf. Ein leerer String wird daher als "unserer" gewertet, sonst
+  // wuerde ensureAP() einen ueberfluessigen softAP()-Neustart ausloesen (samt
+  // irritierender "wrong SSID"-Logzeile). Die ESP-XXXX-Absicherung bleibt voll
+  // erhalten, weil dieser Default-AP eine NICHT-leere SSID hat.
   String runningSsid = WiFi.softAPSSID();
-  bool ssidOk = (runningSsid == cfg_ap_ssid);
+  bool ssidOk = (runningSsid == cfg_ap_ssid) || (runningSsid.length() == 0);
 
   if (!force && apLooksUp && ssidOk && WiFi.softAPgetStationNum() >= 0) {
     int curCh = WiFi.channel();   // aktueller Betriebs-Channel
@@ -620,7 +653,7 @@ bool startAccessPointManual() {
 
   wifi_mode_t mode = WiFi.getMode();
   bool apModeEnabled = (mode == WIFI_AP || mode == WIFI_AP_STA);
-  bool ssidOk = (WiFi.softAPSSID() == cfg_ap_ssid);
+  bool ssidOk = (WiFi.softAPSSID() == cfg_ap_ssid) || (WiFi.softAPSSID().length() == 0);
   bool ipOk = (WiFi.softAPIP() != IPAddress(0, 0, 0, 0));
   bool alreadyHealthy = apModeEnabled && apStartedByEvent && ssidOk && ipOk;
 
@@ -741,7 +774,14 @@ static void staBegin(const String &ssid, const String &pass) {
 bool setupWiFiClient() {
   if (cfg_wifi.empty()) { dlog("WiFi: no networks configured\n"); return false; }
   dlog("WiFi Client: connecting...\n");
-  WiFi.mode(WIFI_AP_STA);
+  // Modus NUR setzen, wenn er nicht ohnehin schon AP_STA ist. Unter Core 3.x
+  // (IDF 5.5) loest ein WiFi.mode(WIFI_AP_STA) auch dann einen Netif-Durchlauf
+  // aus, wenn der Modus bereits AP_STA ist — und das stoppt/startet den AP kurz
+  // (sichtbares AP-Flackern beim Boot). Der AP wurde oben bereits via
+  // startApStaCleanFromOff() + setupAccessPoint() korrekt auf AP_STA gebracht,
+  // hier ist der erneute Aufruf also ueberfluessig. Unter IDF 4.4 war er ein
+  // No-Op; unter Core 3.x nicht mehr, daher die Abfrage.
+  if (WiFi.getMode() != WIFI_AP_STA) WiFi.mode(WIFI_AP_STA);
   WiFi.setHostname(cfg_hostname.c_str());
   esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT20);   // 20 MHz auch fuer STA (Stabilitaet)
   for (auto &n : cfg_wifi) { wifiMulti.addAP(n.ssid.c_str(), n.pass.c_str()); Serial.printf("  + %s\n", n.ssid.c_str()); }
@@ -1401,8 +1441,15 @@ void wifiBleSetup() {
   // Boot-Verbindungsversuchs. Danach gilt 20 -> 40 -> 60 -> 120 -> 120 ...
   resetStaScanBackoff(millis(), true);
 
-  // AP nach STA-Connect nochmal absichern (STA-Connect kann Channel ändern).
-  ensureAP(false);
+  // AP nach STA-Connect nochmal absichern — ABER nur, wenn STA tatsaechlich
+  // verbunden ist. Nur dann kann sich der AP-Channel verschoben haben (eine
+  // Funkeinheit = ein Channel), was ein AP-Neustart auf dem STA-Channel
+  // erfordert. Ohne STA-Verbindung laeuft der AP nach setupAccessPoint() bereits
+  // korrekt auf Channel 1 — ein weiterer ensureAP()-Aufruf wuerde hier nur ein
+  // ueberfluessiges AP-Stop/Start ausloesen (sichtbares Boot-Flackern).
+  if (WiFi.status() == WL_CONNECTED) {
+    ensureAP(false);
+  }
 }
 
 // ── Modul-Loop ────────────────────────────────────────────────────────────────
