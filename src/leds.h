@@ -7,6 +7,12 @@
 // Webserver. Wird einmal in setup() aus main.cpp aufgerufen.
 void ledsSetup(WebServer *server);
 
+// Blankt die LED-Strips so frueh wie moeglich in setup() (VOR WiFi/BLE), um
+// den WS2812-Einschalt-Glitch zu minimieren. Registriert KEINE HTTP-Routes.
+// Idempotent: mehrfach aufrufbar (No-Op nach dem 1. Mal). ledsSetup() ruft es
+// spaeter ohnehin auf, falls es hier nicht schon geschehen ist.
+void ledsInitStripsEarly();
+
 // Wird im loop() aus main.cpp aufgerufen. Bekommt den aktuellen ERPM-Wert
 // uebergeben (fuer spaetere bewegungsabhaengige Effekte). Treibt die
 // non-blocking Animation (z.B. Knight Rider) voran.

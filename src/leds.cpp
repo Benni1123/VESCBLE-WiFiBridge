@@ -49,6 +49,7 @@ static int        channelCount = 1;
 static SemaphoreHandle_t ledsMutex      = nullptr;
 static TaskHandle_t      ledsTaskHandle = nullptr;
 static volatile bool     ledsEnabled    = false;
+static bool              ledsStripsReady = false;   // Strips schon frueh initialisiert + geblankt?
 static volatile int32_t  ledsLatestErpm = 0;
 
 static inline void ledsLock()   { if (ledsMutex) xSemaphoreTake(ledsMutex, portMAX_DELAY); }
@@ -559,6 +560,11 @@ void ledsStartTask() {
 }
 
 void ledsOff() {
+  // Belt-and-suspenders: den Task SOFORT stoppen, nicht erst beim naechsten
+  // vescLoop()-Sync. So kann zwischen "aus" und dem Clear kein einzelner
+  // Frame des alten Effekts mehr durchrutschen. vescLoop() korrigiert den
+  // Flag ohnehin wieder auf cfg_leds_enabled, falls doch noch aktiv.
+  ledsEnabled = false;
   if (ledSavePending) { ledSavePending = false; ledsSaveConfig(); }
   ledsLock();   
   for (int i = 0; i < LED_MAX_CHANNELS; i++) {
@@ -918,15 +924,25 @@ load();
 )ledslit";
 
 // ── Setup API-Endpoints ───────────────────────────────────────────────────────
+// Blankt die Strips so frueh wie moeglich (in setup(), noch VOR WiFi/BLE), damit
+// die WS2812 nach dem Power-On nicht bis zur spaeten ledsSetup()-Initialisierung
+// zufaelligen Muell zeigen. initStripFor() macht clear()+show() -> Strip physisch
+// dunkel. Registriert KEINE HTTP-Routes (der Webserver existiert hier noch nicht).
+void ledsInitStripsEarly() {
+  if (ledsStripsReady) return;                       // idempotent: nur einmal wirksam
+  if (!ledsMutex) ledsMutex = xSemaphoreCreateMutex();
+  ledsLoadConfig();
+  for (int i = 0; i < LED_MAX_CHANNELS; i++) ch[i].effect = 0;
+  for (int i = 0; i < channelCount; i++) { initStripFor(i); applyChannel(i); }
+  ledsStripsReady = true;
+}
+
 void ledsSetup(WebServer *server) {
   ledServer = server;
   if (!ledServer) return;
 
-  if (!ledsMutex) ledsMutex = xSemaphoreCreateMutex();
-  ledsLoadConfig();
-
-  for (int i = 0; i < LED_MAX_CHANNELS; i++) ch[i].effect = 0;
-  for (int i = 0; i < channelCount; i++) { initStripFor(i); applyChannel(i); }
+  // Strips initialisieren + blanken (idempotent; i.d.R. schon frueh in setup() erledigt).
+  ledsInitStripsEarly();
 
   ledServer->on("/leds", HTTP_GET, [](){
     ledServer->send(200, "text/html", LEDS_PAGE_HTML);

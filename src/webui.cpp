@@ -276,13 +276,13 @@ static const char PAGE_HTML[] PROGMEM = R"rawliteral(
 <button class="theme-btn" onclick="toggleTheme()" id="themeBtn">☀️</button>
 <button class="lang-btn" onclick="toggleLang()" id="langBtn">DE</button>
 <div class="wrap">
-  <h1>&#x1F6F4; VESC BLE/WiFi</h1>
+  <h1 id="appTitle" style="cursor:default;user-select:none">&#x1F6F4; VESC BLE/WiFi</h1>
   <div class="sub" id="statusBar">Loading...</div>
   <div class="tabs">
     <div class="tab active" onclick="showTab('info')">Info</div>
     <div class="tab" onclick="showTab('config')">Config</div>
     <div class="tab" onclick="showTab('ota')">OTA Flash</div>
-    <div class="tab" onclick="showTab('api')">API</div>
+    <div class="tab" id="tab-api-link" style="display:none" onclick="showTab('api')">API</div>
     <div class="tab" id="tab-leds-link" style="display:none" onclick="location.href='/leds'">LED</div>
   </div>
 
@@ -597,6 +597,7 @@ function applyTranslations(){
 }
 
 function showTab(name){
+  if(name==='api' && !apiUnlocked) return;   // gesperrt bis Debug-Unlock (8x Titel tippen)
   document.querySelectorAll('.tab').forEach(function(t,i){t.classList.toggle('active',['info','config','ota','api'][i]===name);});
   document.querySelectorAll('.panel').forEach(function(p){p.classList.remove('active');});
   document.getElementById('tab-'+name).classList.add('active');
@@ -617,9 +618,66 @@ document.getElementById('langBtn').textContent=de()?'EN':'DE';
 applyTranslations();
 
 // Wenn ueber ?tab=xyz aufgerufen (z.B. von der LED-Seite), den Tab oeffnen.
+// 'api' wird erst nach dem Unlock-Check (checkApiUnlock) geoeffnet.
+var pendingTab='';
 (function(){
   var m=location.search.match(/[?&]tab=([a-z]+)/);
-  if(m && ['info','config','ota','api'].indexOf(m[1])>=0) showTab(m[1]);
+  if(m && ['info','config','ota','api'].indexOf(m[1])>=0){
+    if(m[1]==='api') pendingTab='api'; else showTab(m[1]);
+  }
+})();
+
+// ── Debug-Unlock: API-Tab (inkl. UART-Log "alles ab letztem Start") ──────────
+// Freischaltung gilt bis zum naechsten ESP-Neustart (Server haelt den Zustand
+// im RAM). 8x auf die Ueberschrift tippen schaltet frei.
+var apiUnlocked=false;
+function revealApiTab(show){
+  apiUnlocked=!!show;
+  var link=document.getElementById('tab-api-link');
+  if(link) link.style.display=show?'':'none';
+  if(!show){
+    var panel=document.getElementById('tab-api');
+    if(panel && panel.classList.contains('active')) showTab('info');
+  }
+  // Info-Seite sofort aktualisieren, damit der "Letzter Start"-Block direkt kommt/geht.
+  var info=document.getElementById('tab-info');
+  if(info && info.classList.contains('active')) loadInfo();
+}
+async function checkApiUnlock(){
+  try{
+    var r=await fetch('/api/debug/unlock',{cache:'no-store'});
+    if(!r.ok) return;
+    var j=await r.json();
+    revealApiTab(!!j.unlocked);
+    if(apiUnlocked && pendingTab==='api'){ pendingTab=''; showTab('api'); }
+  }catch(e){}
+}
+async function unlockApiTab(){
+  try{
+    await fetch('/api/debug/unlock',{method:'POST'});
+  }catch(e){}
+  revealApiTab(true);   // schaltet API-Tab frei + rendert Info-Seite sofort neu
+  // Auf der aktuellen Seite (Startseite) bleiben, nur kurz Bescheid geben.
+  showToast(de()?'🔓 Debug aktiv – bis Neustart':'🔓 Debug active – until reboot', true, 3000);
+}
+checkApiUnlock();
+
+// 8x auf die Ueberschrift tippen (Zaehler resettet nach 1,5s Pause).
+(function(){
+  var title=document.getElementById('appTitle');
+  if(!title) return;
+  var taps=0, timer=null;
+  title.addEventListener('click',function(){
+    if(apiUnlocked) return;            // schon frei -> nichts zu tun
+    taps++;
+    if(timer) clearTimeout(timer);
+    timer=setTimeout(function(){ taps=0; },1500);
+    if(taps>=8){
+      taps=0;
+      if(timer){ clearTimeout(timer); timer=null; }
+      unlockApiTab();
+    }
+  });
 })();
 
 // Im reinen AP-Betrieb gibt es eventuell weder Heimnetz/NTP noch eine App,
@@ -688,6 +746,8 @@ function loadInfo(){
       '<div class="info-row"><span>'+(de()?'Systemzeit':'System time')+'</span><span class="info-val" style="color:'+(d.time_valid?'var(--text2)':'#e0a030')+'">'+(d.time_valid?esc(d.time_local)+(d.time_source?' ('+esc(timeSourceLabel(d.time_source))+')':''):(de()?'Nicht synchronisiert':'Not synchronized'))+'</span></div>'+
       '<div class="info-row"><span>Uptime</span><span class="info-val">'+d.uptime+'</span></div>'+
       '<div class="info-row"><span>Build</span><span class="info-val">'+d.build+'</span></div>'+
+      // Ab hier nur sichtbar, wenn Debug freigeschaltet ist (8x auf den Titel tippen).
+      (apiUnlocked?(
       '<div style="margin:10px 0 6px;font-size:11px;color:#666;text-transform:uppercase;letter-spacing:1px">'+(de()?'Letzter Start':'Last boot')+'</div>'+
       '<div class="info-row"><span>'+(de()?'Resetgrund':'Reset reason')+'</span><span class="info-val" style="color:'+(d.reset_brownout||d.reset_panic||d.reset_watchdog?'#e57373':(d.reset_reason==='SOFTWARE_RESTART'?'#e0a030':'var(--ok)'))+'">'+d.reset_reason+' ('+d.reset_reason_code+')</span></div>'+
       (d.planned_restart?'<div class="info-row"><span>'+(de()?'Neustart-Ausloeser':'Restart source')+'</span><span class="info-val">'+esc(d.planned_restart)+'</span></div>':'')+
@@ -700,7 +760,8 @@ function loadInfo(){
       '<div class="info-row"><span>'+(de()?'Loop max (ms)':'Loop max (ms)')+'</span><span class="info-val" style="color:'+(d.diag_loop_max_us>50000?'#e57373':(d.diag_loop_max_us>10000?'#e0a030':'var(--ok)'))+'">'+(d.diag_loop_max_us/1000).toFixed(1)+'</span></div>'+
       '<div class="info-row"><span>'+(de()?'Loops/Sek':'Loops/sec')+'</span><span class="info-val">'+d.diag_loops_per_sec+'</span></div>'+
       '<div class="info-row"><span>'+(de()?'Heap-Tiefstand':'Min free heap')+'</span><span class="info-val">'+(d.diag_min_heap>=1024?(d.diag_min_heap/1024).toFixed(1)+' KB':d.diag_min_heap+' B')+'</span></div>'+
-      '<div class="info-row"><span>'+(de()?'Probe-Requests (RSSI)':'Probe requests (RSSI)')+'</span><span class="info-val">'+d.diag_probe_reqs+(d.diag_probe_reqs>0?' ('+d.diag_probe_rssi+' dBm)':'')+'</span></div>';
+      '<div class="info-row"><span>'+(de()?'Probe-Requests (RSSI)':'Probe requests (RSSI)')+'</span><span class="info-val">'+d.diag_probe_reqs+(d.diag_probe_reqs>0?' ('+d.diag_probe_rssi+' dBm)':'')+'</span></div>'
+      ):'');
   }).catch(function(){document.getElementById('infoContent').innerHTML='<div style="color:#e57373;font-size:13px">'+(de()?'Fehler':'Error')+'</div>';});
 }
 loadInfo();
@@ -922,12 +983,19 @@ function saveConfig(){
   // nicht) automatisch verbunden haben.
   fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(bodyObj)})
     .then(function(r){
-      if(r.ok){
-        showToast(de()?'Gespeichert — ESP startet neu...':'Saved — ESP restarting...',true,8000);
-        setTimeout(function(){location.reload();},5000);
-      } else {
-        showToast(de()?'Fehler beim Speichern':'Error saving',false,4000);
-      }
+      if(!r.ok){ showToast(de()?'Fehler beim Speichern':'Error saving',false,4000); return; }
+      return r.text().then(function(t){
+        if(t.indexOf('"reboot":false')>=0){
+          // Es hat sich (ausser evtl. der WS28XX-Steuerung) nichts geaendert, das
+          // einen Neustart braucht -> live uebernommen, kein Reboot. LED-Reiter
+          // sofort passend ein-/ausblenden.
+          document.getElementById('tab-leds-link').style.display = document.getElementById('leds_enabled').checked ? '' : 'none';
+          showToast(de()?'Gespeichert — kein Neustart nötig':'Saved — no reboot needed',true,4000);
+        } else {
+          showToast(de()?'Gespeichert — ESP startet neu...':'Saved — ESP restarting...',true,8000);
+          setTimeout(function(){location.reload();},5000);
+        }
+      });
     }).catch(function(){showToast('Connection error',false,4000);});
 }
 
@@ -1154,6 +1222,22 @@ void handleApiConfigGet() {
 
 void handleApiConfigPost() {
   String body = otaServer.arg("plain");
+
+  // ── Snapshot aller Nicht-LED-Felder VOR dem Parsen ──────────────────────────
+  // Wenn sich beim Speichern AUSSER der WS28XX-Steuerung (leds_enabled) nichts
+  // aendert, sparen wir uns den Neustart: Die LED-Umschaltung greift ohnehin
+  // live (der LED-Task synct sich in vescLoop an cfg_leds_enabled, die Strips
+  // sind seit dem Boot initialisiert). Aendert sich etwas anderes -> Neustart.
+  String old_ble_name=cfg_ble_name, old_ap_ssid=cfg_ap_ssid, old_ap_pass=cfg_ap_pass;
+  String old_update_url=cfg_update_url, old_version_url=cfg_version_url;
+  int  old_port=cfg_port, old_ap_timeout=cfg_ap_timeout, old_rx_pin=cfg_rx_pin, old_tx_pin=cfg_tx_pin;
+  int  old_autoreboot_time=cfg_autoreboot_time, old_roam_threshold=cfg_roam_threshold, old_roam_hysteresis=cfg_roam_hysteresis;
+  int  old_autopoll_interval=cfg_autopoll_interval, old_ble_mode=cfg_ble_mode, old_ble_auto_erpm_on=cfg_ble_auto_erpm_on;
+  int  old_ap_mode=cfg_ap_mode, old_ble_pin=cfg_ble_pin, old_ble_auto_off_sec=cfg_ble_auto_off_sec;
+  bool old_vesc_poll=cfg_vesc_poll, old_autoreboot=cfg_autoreboot, old_autoreboot_no_wifi=cfg_autoreboot_no_wifi;
+  bool old_roam_enabled=cfg_roam_enabled, old_autopoll_enabled=cfg_autopoll_enabled;
+  bool old_ble_pin_enabled=cfg_ble_pin_enabled, old_ble_full_power=cfg_ble_full_power;
+  std::vector<WiFiEntry> old_wifi = cfg_wifi;
   auto extract = [&](String key) -> String {
     String s = "\""+key+"\":\"";
     int st = body.indexOf(s); if (st<0) return "";
@@ -1273,19 +1357,67 @@ void handleApiConfigPost() {
   }
 
   saveConfig();
-  // Standard: speichern -> Neustart. Die Web-UI sendet "noreboot" NICHT mehr,
-  // damit jede Einstellung garantiert wirksam wird (einheitliches Verhalten).
-  // Die Option bleibt fuer eigene API-Skripte erhalten — dort gilt aber: ohne
-  // Neustart uebernimmt der laufende Betrieb nur einen Teil der Werte
-  // (z.B. neue STA-Netze werden nicht sofort automatisch verbunden).
-  bool doReboot = !(otaServer.hasArg("noreboot") || body.indexOf("\"noreboot\":true") >= 0);
+
+  // ── Hat sich AUSSER der WS28XX-Steuerung etwas geaendert? ────────────────────
+  // Nein -> kein Neustart (LED-Umschaltung greift live). Ja -> Neustart wie bisher,
+  // damit die geaenderte Einstellung zuverlaessig wirkt. Im Zweifel (irgendein
+  // Feld unterscheidet sich) wird neugestartet -> sichere Richtung.
+  bool nonLedChanged =
+       cfg_ble_name          != old_ble_name           ||
+       cfg_ap_ssid           != old_ap_ssid            ||
+       cfg_ap_pass           != old_ap_pass            ||
+       cfg_update_url        != old_update_url         ||
+       cfg_version_url       != old_version_url        ||
+       cfg_port              != old_port               ||
+       cfg_ap_timeout        != old_ap_timeout         ||
+       cfg_rx_pin            != old_rx_pin             ||
+       cfg_tx_pin            != old_tx_pin             ||
+       cfg_autoreboot_time   != old_autoreboot_time    ||
+       cfg_roam_threshold    != old_roam_threshold     ||
+       cfg_roam_hysteresis   != old_roam_hysteresis    ||
+       cfg_autopoll_interval != old_autopoll_interval  ||
+       cfg_ble_mode          != old_ble_mode           ||
+       cfg_ble_auto_erpm_on  != old_ble_auto_erpm_on   ||
+       cfg_ap_mode           != old_ap_mode            ||
+       cfg_ble_pin           != old_ble_pin            ||
+       cfg_ble_auto_off_sec  != old_ble_auto_off_sec   ||
+       cfg_vesc_poll         != old_vesc_poll          ||
+       cfg_autoreboot        != old_autoreboot         ||
+       cfg_autoreboot_no_wifi!= old_autoreboot_no_wifi ||
+       cfg_roam_enabled      != old_roam_enabled       ||
+       cfg_autopoll_enabled  != old_autopoll_enabled   ||
+       cfg_ble_pin_enabled   != old_ble_pin_enabled    ||
+       cfg_ble_full_power    != old_ble_full_power;
+  if (!nonLedChanged) {
+    if (cfg_wifi.size() != old_wifi.size()) nonLedChanged = true;
+    else for (size_t i = 0; i < cfg_wifi.size(); i++) {
+      const WiFiEntry &a = cfg_wifi[i]; const WiFiEntry &b = old_wifi[i];
+      if (a.ssid!=b.ssid || a.pass!=b.pass || a.staticIp!=b.staticIp ||
+          a.ip!=b.ip || a.gateway!=b.gateway || a.subnet!=b.subnet || a.dns!=b.dns) {
+        nonLedChanged = true; break;
+      }
+    }
+  }
+  bool onlyLedsChanged = !nonLedChanged;   // nur WS28XX-Steuerung (oder gar nichts)
+
+  bool explicitNoReboot = otaServer.hasArg("noreboot") || body.indexOf("\"noreboot\":true") >= 0;
+  bool doReboot = !explicitNoReboot;
+  if (onlyLedsChanged) doReboot = false;   // WS28XX greift live -> kein Neustart noetig
+
   if (!doReboot) {
-    // Refresh wifiMulti with new networks without reboot
+    // Ohne Neustart: neue WLAN-Netze in wifiMulti uebernehmen (bei reiner
+    // LED-Umschaltung unveraendert, schadet aber nicht).
     wifiMulti = WiFiMulti();
     for (auto &n : cfg_wifi) wifiMulti.addAP(n.ssid.c_str(), n.pass.c_str());
+    // Antwort: fuer noreboot-Skripte bleibt es beim alten "OK". Beim Auto-Skip
+    // (nur LED / nichts geaendert) sagen wir dem Browser explizit Bescheid.
+    if (explicitNoReboot) otaServer.send(200, "text/plain", "OK");
+    else                  otaServer.send(200, "application/json", "{\"ok\":true,\"reboot\":false}");
+    return;
   }
   otaServer.send(200, "text/plain", "OK");
-  if (doReboot) { bootDiagMarkPlannedRestart("Konfiguration gespeichert"); ledsOff(); delay(500); ESP.restart(); }
+  bootDiagMarkPlannedRestart("Konfiguration gespeichert");
+  ledsOff(); delay(500); ESP.restart();
 }
 
 void handleOTAUpdate() {
@@ -1590,6 +1722,13 @@ void setupWebServer() {
     otaServer.send(200, "text/plain", "OK");
   });
   otaServer.on("/api/debug/status", HTTP_GET, [](){ otaServer.send(200,"application/json","{\"enabled\":"+String(cfg_debug?"true":"false")+",\"filter\":"+String(cfg_debug_filter)+"}"); });
+  // API-Tab-Freischaltung: reiner RAM-Zustand, gilt bis zum naechsten Neustart.
+  // GET liefert den Zustand, POST schaltet frei (POST ?en=0 sperrt wieder).
+  otaServer.on("/api/debug/unlock", HTTP_GET,  [](){ otaServer.send(200,"application/json","{\"unlocked\":"+String(debugUnlocked?"true":"false")+"}"); });
+  otaServer.on("/api/debug/unlock", HTTP_POST, [](){
+    debugUnlocked = (otaServer.arg("en") != "0");   // Default: freischalten
+    otaServer.send(200,"application/json","{\"unlocked\":"+String(debugUnlocked?"true":"false")+"}");
+  });
   otaServer.on("/api/boot/status",  HTTP_GET, [](){ otaServer.send(200,"application/json",bootStatusJson()); });
   otaServer.on("/api/time", HTTP_GET, [](){
     otaServer.send(200, "application/json", timeServiceJson());

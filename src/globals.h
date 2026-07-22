@@ -128,6 +128,10 @@ NimBLECharacteristic *pCharacteristicVescRx = nullptr;
 
 bool deviceConnected    = false;
 bool oldDeviceConnected = false;
+
+// Runtime-Freischaltung des API-Tabs (8x auf die Ueberschrift tippen).
+// Bewusst NICHT in NVS: gilt nur bis zum naechsten ESP-Neustart.
+bool debugUnlocked      = false;
 int  MTU_SIZE           = 128;
 int  PACKET_SIZE        = MTU_SIZE - 3;
 

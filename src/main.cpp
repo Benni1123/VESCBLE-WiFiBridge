@@ -20,6 +20,14 @@
 // ── Setup ─────────────────────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
+
+  // WS2812 SO FRUEH WIE MOEGLICH blanken: noch vor dem Startup-Delay und vor
+  // WiFi/BLE. So zeigen die Strips nach dem Power-On nicht sekundenlang den
+  // zufaelligen Einschalt-Zustand, bis die spaete LED-Init sie loescht.
+  // ledsInitStripsEarly() ist unabhaengig von loadConfig() (eigene "leds"-NVS)
+  // und idempotent -> ledsSetup() ruft es spaeter erneut auf (dann No-Op).
+  ledsInitStripsEarly();
+
   delay(2000);
   Serial.println("\n=== VESC BLE/WiFi Bridge ===");
 
