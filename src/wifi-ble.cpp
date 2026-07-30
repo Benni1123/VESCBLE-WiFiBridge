@@ -36,12 +36,12 @@ void applyBleSecurity() {
     NimBLEDevice::setSecurityAuth(true /*bonding*/, true /*mitm*/, true /*secure conn*/);
     NimBLEDevice::setSecurityIOCap(BLE_HS_IO_DISPLAY_ONLY);
     NimBLEDevice::setSecurityPasskey((uint32_t)cfg_ble_pin);
-    dlog("BLE security: PIN-Pairing aktiv\n");
+    dlog("BLE security: PIN pairing active\n");
   } else {
     // Just Works: Kopplungsanfragen werden automatisch angenommen (wie bisher).
     NimBLEDevice::setSecurityAuth(true /*bonding*/, false /*mitm*/, true /*secure conn*/);
     NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT);
-    dlog("BLE security: Just-Works-Pairing (ohne PIN)\n");
+    dlog("BLE security: Just-Works pairing (no PIN)\n");
   }
 }
 
@@ -141,7 +141,7 @@ class MyServerCallbacks : public NimBLEServerCallbacks {
   // im UART-Log (Status-Filter) sieht, ob die Kopplung geklappt hat.
   void onAuthenticationComplete(NimBLEConnInfo &connInfo) override {
     dlog("BLE pairing: %s (encrypted=%d bonded=%d)\n",
-         connInfo.isEncrypted() ? "OK" : "FEHLGESCHLAGEN",
+         connInfo.isEncrypted() ? "OK" : "FAILED",
          (int)connInfo.isEncrypted(), (int)connInfo.isBonded());
   }
 };
@@ -358,11 +358,11 @@ static bool buildConfiguredApWifiConfig(wifi_config_t &conf, int channel) {
   size_t ssidLen = cfg_ap_ssid.length();
   size_t passLen = cfg_ap_pass.length();
   if (ssidLen == 0 || ssidLen > sizeof(conf.ap.ssid)) {
-    dlog("AP preconfig: ungueltige SSID-Laenge %u\n", (unsigned)ssidLen);
+    dlog("AP preconfig: invalid SSID length %u\n", (unsigned)ssidLen);
     return false;
   }
   if (passLen > sizeof(conf.ap.password) - 1 || (passLen > 0 && passLen < 8)) {
-    dlog("AP preconfig: ungueltige Passwort-Laenge %u\n", (unsigned)passLen);
+    dlog("AP preconfig: invalid password length %u\n", (unsigned)passLen);
     return false;
   }
 
@@ -400,19 +400,19 @@ static bool startApStaCleanFromOff(int channel) {
   if (!buildConfiguredApWifiConfig(apConf, channel)) return false;
 
   if (!wifiLowLevelInit(false)) {
-    dlog("AP preconfig: wifiLowLevelInit fehlgeschlagen\n");
+    dlog("AP preconfig: wifiLowLevelInit failed\n");
     return false;
   }
 
   esp_err_t err = esp_wifi_set_mode(WIFI_MODE_APSTA);
   if (err != ESP_OK) {
-    dlog("AP preconfig: esp_wifi_set_mode fehlgeschlagen (%d)\n", (int)err);
+    dlog("AP preconfig: esp_wifi_set_mode failed (%d)\n", (int)err);
     return false;
   }
 
   err = esp_wifi_set_config(WIFI_IF_AP, &apConf);
   if (err != ESP_OK) {
-    dlog("AP preconfig: esp_wifi_set_config fehlgeschlagen (%d)\n", (int)err);
+    dlog("AP preconfig: esp_wifi_set_config failed (%d)\n", (int)err);
     return false;
   }
 
@@ -429,11 +429,11 @@ static bool startApStaCleanFromOff(int channel) {
   // Arduino-Startpfad auf. Der IDF-Treiber besitzt zu diesem Zeitpunkt aber
   // bereits unsere SSID/Passwort-Konfiguration. Es entsteht nur EIN AP_START.
   if (!WiFi.mode(WIFI_AP_STA)) {
-    dlog("AP preconfig: WiFi.mode(AP_STA) fehlgeschlagen\n");
+    dlog("AP preconfig: WiFi.mode(AP_STA) failed\n");
     return false;
   }
 
-  dlog("AP preconfig: '%s' vor erstem WiFi-Start gesetzt\n", cfg_ap_ssid.c_str());
+  dlog("AP preconfig: '%s' set before first WiFi start\n", cfg_ap_ssid.c_str());
   return true;
 }
 
@@ -449,7 +449,7 @@ static bool startApStaCleanFromOff(int channel) {
 static void tuneApDhcp() {
   esp_netif_t *ap = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
   if (ap == nullptr) {
-    dlog("AP tune: kein AP-netif gefunden\n");
+    dlog("AP tune: no AP netif found\n");
     return;
   }
 
@@ -521,7 +521,7 @@ static void tuneApDhcp() {
     esp_wifi_set_bandwidth(WIFI_IF_AP, WIFI_BW_HT20);
   }
 
-  dlog("AP tune: ps=MIN_MODEM (BT-Koexistenz), TX-power max, proto=%s, bw=%s\n",
+  dlog("AP tune: ps=MIN_MODEM (BT coexistence), TX-power max, proto=%s, bw=%s\n",
        protoOk ? "BGN(ok)" : "BGN(set)", bwOk ? "HT20(ok)" : "HT20(set)");
 }
 
@@ -749,7 +749,7 @@ static void staApplyIpConfig(const String &ssid) {
     if (w.ssid == ssid) {
       if (w.staticIp && w.ip.length() > 0 &&
           applyStaticConfig(w.ip, w.gateway, w.subnet, w.dns)) {
-        dlog("WiFi: static IP %s fuer '%s' gesetzt (vor begin)\n",
+        dlog("WiFi: static IP %s set for '%s' (before begin)\n",
                       w.ip.c_str(), ssid.c_str());
       } else {
         // kein/ungueltiges Static -> DHCP erzwingen (0.0.0.0 = DHCP-Client an)
@@ -817,7 +817,7 @@ bool setupWiFiClient() {
     if (n.ssid==csid && n.staticIp && n.ip.length()>0) {
       // wifiMulti hat per DHCP verbunden. Static NACHtraeglich zu setzen ist
       // unzuverlaessig -> einmal sauber neu verbinden MIT config vor begin.
-      dlog("WiFi: static IP -> sauberer Reconnect (config vor begin)\n");
+      dlog("WiFi: static IP -> clean reconnect (config before begin)\n");
       WiFi.disconnect(false, false);
       delay(50);
       staBegin(csid, n.pass);
@@ -887,7 +887,7 @@ static void manageAdvInterval() {
       NimBLEDevice::stopAdvertising();
       applyAdvInterval(false);
       if (bleIsAdvertising) NimBLEDevice::startAdvertising();
-      dlog("BLE adv: Energiesparmodus AUS -> dauerhaft schnelles Intervall\n");
+      dlog("BLE adv: power-save OFF -> permanently fast interval\n");
     }
     return;
   }
@@ -913,7 +913,7 @@ static void manageAdvInterval() {
     NimBLEDevice::stopAdvertising();
     applyAdvInterval(true);
     NimBLEDevice::startAdvertising();
-    dlog("BLE adv: idle -> langsames Intervall (WiFi-Airtime)\n");
+    dlog("BLE adv: idle -> slow interval (WiFi airtime)\n");
   }
 }
 
@@ -1293,7 +1293,7 @@ void handleWiFiReconnect() {
     // Kein bekanntes Netz in Reichweite (typisch: unterwegs). Exakte Stufen:
     // 20s -> 40s -> 60s -> 120s -> 120s -> 120s ...
     advanceStaScanBackoff(now);
-    dlog("WiFi: kein bekanntes Netz -> naechster Scan in %lus (Stufe %u/%u)\n",
+    dlog("WiFi: no known network -> next scan in %lus (stage %u/%u)\n",
          (unsigned long)(staScanInterval / 1000),
          (unsigned)(staScanBackoffStage + 1),
          (unsigned)(STA_SCAN_BACKOFF_LAST + 1));
@@ -1330,7 +1330,7 @@ void wifiBleSetup() {
   if (!prefs.getBool("bondmig2", false)) {
     bool migOk = NimBLEBondMigration::migrateBondStoreToCurrent();
     prefs.putBool("bondmig2", true);
-    dlog("BLE bond migration 1.x -> 2.x: %s\n", migOk ? "OK" : "FEHLGESCHLAGEN (Neu-Koppeln noetig)");
+    dlog("BLE bond migration 1.x -> 2.x: %s\n", migOk ? "OK" : "FAILED (re-pairing required)");
   }
   prefs.end();
 
@@ -1421,7 +1421,7 @@ void wifiBleSetup() {
   if (!startApStaCleanFromOff(1)) {
     // Sicherheits-Fallback: sollte die interne Arduino-Initialisierung in einer
     // kuenftigen Core-Version geaendert werden, bleibt der AP trotzdem erreichbar.
-    dlog("AP preconfig: Fallback auf normalen WiFi-Start\n");
+    dlog("AP preconfig: fallback to normal WiFi start\n");
     WiFi.mode(WIFI_AP_STA);
   }
   // WiFi-Powersave: MIN_MODEM ist bei gleichzeitigem BLE (VESC) auf dem ESP32-S3
@@ -1466,7 +1466,7 @@ void wifiBleLoop() {
     apWanted       = true;
     apOffByTimeout = false;
     if (!apActive) {
-      dlog("AP-Safety: Werkszustand (unkonfiguriert) -> AP erzwingen\n");
+      dlog("AP safety: factory state (unconfigured) -> forcing AP\n");
       if (WiFi.getMode() != WIFI_AP_STA) WiFi.mode(WIFI_AP_STA);
       ensureAP(true);
     }
@@ -1567,7 +1567,7 @@ void wifiBleLoop() {
       if (ensureAP(true)) {
         apOffByTimeout = false;
       } else {
-        dlog("AP wake: Start fehlgeschlagen -> Retry im naechsten Loop\n");
+        dlog("AP wake: start failed -> retry next loop\n");
       }
     }
   }
@@ -1617,7 +1617,7 @@ void wifiBleLoop() {
       if (!apReallyRunning) {
         apWatchdogFails++;
         diagApWatchdogFires++;
-        dlog("AP reconcile: soll AN, ist nicht gesund (mode=%d/%d event=%d ssid='%s', fail #%d) -> ensureAP\n",
+        dlog("AP reconcile: should be ON, not healthy (mode=%d/%d event=%d ssid='%s', fail #%d) -> ensureAP\n",
              (int)arduinoMode,
              (idfModeResult == ESP_OK) ? (int)idfMode : -1,
              apStartedByEvent ? 1 : 0,
@@ -1637,7 +1637,7 @@ void wifiBleLoop() {
       // Probleme, ohne bei korrekt ausgeschaltetem AP ständig erneut auszulösen.
       if (apModeEnabled) {
         diagApWatchdogFires++;
-        dlog("AP reconcile: soll AUS, AP-Modus noch aktiv (arduino=%d idf=%d event=%d) -> AP abschalten\n",
+        dlog("AP reconcile: should be OFF, AP mode still active (arduino=%d idf=%d event=%d) -> shutting down AP\n",
              (int)arduinoMode,
              (idfModeResult == ESP_OK) ? (int)idfMode : -1,
              apStartedByEvent ? 1 : 0);
@@ -1677,7 +1677,7 @@ void wifiBleLoop() {
     if (anyConnected) lastConnected = millis();
     else if (millis() - lastConnected > (unsigned long)cfg_autoreboot_time * 1000UL) {
       Serial.println("Auto reboot: no client connected");
-      bootDiagMarkPlannedRestart("Auto-Reboot: kein Client verbunden");
+      bootDiagMarkPlannedRestart("Auto reboot: no client connected");
       ledsOff();
       delay(500);
       ESP.restart();

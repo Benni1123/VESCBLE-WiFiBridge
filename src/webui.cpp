@@ -717,6 +717,21 @@ function timeSourceLabel(source){
   return source?source.toUpperCase():'';
 }
 
+// Uebersetzt die (englischen) Neustart-Ausloeser-Strings fuer die Anzeige in der
+// deutschen UI. Basis/Default ist Englisch; unbekannte Werte werden 1:1 gezeigt.
+function reasonDE(s){
+  var m={
+    'Configuration saved':'Konfiguration gespeichert',
+    'Manual OTA update':'Manuelles OTA-Update',
+    'Server OTA update':'Server-OTA-Update',
+    'Factory reset / NVS cleared':'Factory Reset / NVS geloescht',
+    'API restart':'API-Neustart',
+    'Emergency OTA on port 8080':'Emergency-OTA auf Port 8080',
+    'Auto reboot: no client connected':'Auto-Reboot: kein Client verbunden',
+    'Software restart':'Software-Neustart'
+  };
+  return m[s]||s;
+}
 function loadInfo(){
   fetch('/api/info').then(function(r){return r.json();}).then(function(d){
     document.getElementById('statusBar').textContent=d.mode==='ap'&&!d.ssid?'AP: '+d.ip:'WiFi: '+d.ssid+' ('+d.ip+')';
@@ -728,7 +743,7 @@ function loadInfo(){
       '<div class="info-row"><span>IP</span><span class="info-val">'+d.ip+'</span></div>'+
       (d.mode!=='ap'?'<div class="info-row"><span>SSID</span><span class="info-val">'+d.ssid+'</span></div>':'')+
       (d.mode!=='ap'?'<div class="info-row"><span>RSSI</span><span class="info-val">'+d.rssi+' dBm</span></div>':'')+
-      '<div class="info-row"><span>Free RAM</span><span class="info-val">'+(d.heap>=1024?(d.heap/1024).toFixed(1)+' KB':d.heap+' B')+'</span></div>'+
+      '<div class="info-row"><span>'+(de()?'Freier RAM':'Free RAM')+'</span><span class="info-val">'+(d.heap>=1024?(d.heap/1024).toFixed(1)+' KB':d.heap+' B')+'</span></div>'+
       (d.psram_total>0?'<div class="info-row"><span>'+(de()?'PSRAM frei':'Free PSRAM')+'</span><span class="info-val">'+(d.psram_free/1048576).toFixed(2)+' / '+(d.psram_total/1048576).toFixed(1)+' MB</span></div>':'')+
       '<div class="info-row"><span>AP</span><span class="info-val" style="color:'+(d.ap_active?'var(--ok)':'var(--text3)')+'">'+( d.ap_active?(de()?'Aktiv':'Active'):(de()?'Aus':'Off'))+(d.ap_active?' ('+d.ap_ip+')':'')+'</span></div>'+
       (d.ap_client_ip?'<div class="info-row"><span>'+(de()?'AP-Client IP':'AP client IP')+'</span><span class="info-val">'+d.ap_client_ip+'</span></div>':'')+
@@ -750,7 +765,7 @@ function loadInfo(){
       (apiUnlocked?(
       '<div style="margin:10px 0 6px;font-size:11px;color:#666;text-transform:uppercase;letter-spacing:1px">'+(de()?'Letzter Start':'Last boot')+'</div>'+
       '<div class="info-row"><span>'+(de()?'Resetgrund':'Reset reason')+'</span><span class="info-val" style="color:'+(d.reset_brownout||d.reset_panic||d.reset_watchdog?'#e57373':(d.reset_reason==='SOFTWARE_RESTART'?'#e0a030':'var(--ok)'))+'">'+d.reset_reason+' ('+d.reset_reason_code+')</span></div>'+
-      (d.planned_restart?'<div class="info-row"><span>'+(de()?'Neustart-Ausloeser':'Restart source')+'</span><span class="info-val">'+esc(d.planned_restart)+'</span></div>':'')+
+      (d.planned_restart?'<div class="info-row"><span>'+(de()?'Neustart-Ausloeser':'Restart source')+'</span><span class="info-val">'+esc(de()?reasonDE(d.planned_restart):d.planned_restart)+'</span></div>':'')+
       '<div style="margin:10px 0 6px;font-size:11px;color:#666;text-transform:uppercase;letter-spacing:1px">'+(de()?'Diagnose (WLAN/Loop)':'Diagnostics (WiFi/Loop)')+'</div>'+
       '<div class="info-row"><span>'+(de()?'STA-Scans':'STA scans')+'</span><span class="info-val">'+d.diag_scans+'</span></div>'+
       '<div class="info-row"><span>'+(de()?'STA verbunden':'STA connects')+'</span><span class="info-val">'+d.diag_sta_conn+'</span></div>'+
@@ -1416,7 +1431,7 @@ void handleApiConfigPost() {
     return;
   }
   otaServer.send(200, "text/plain", "OK");
-  bootDiagMarkPlannedRestart("Konfiguration gespeichert");
+  bootDiagMarkPlannedRestart("Configuration saved");
   ledsOff(); delay(500); ESP.restart();
 }
 
@@ -1432,7 +1447,7 @@ void handleOTAUpdate() {
 
 void handleOTAFinish() {
   if (Update.hasError()) otaServer.send(500,"text/plain",Update.errorString());
-  else { bootDiagMarkPlannedRestart("Manuelles OTA-Update"); otaServer.send(200,"text/plain","OK"); ledsOff(); delay(500); ESP.restart(); }
+  else { bootDiagMarkPlannedRestart("Manual OTA update"); otaServer.send(200,"text/plain","OK"); ledsOff(); delay(500); ESP.restart(); }
 }
 
 // ── WLAN-Scan, AP-schonend (kanalweise) ─────────────────────────────────────
@@ -1489,7 +1504,7 @@ void handleApiUpdateCheck() {
     // Ein TLS-Handshake braucht ~40 KB am Stueck; bei zu wenig gar nicht erst
     // versuchen, sondern kurz warten (evtl. gibt der Stack Speicher frei).
     if (ESP.getMaxAllocHeap() < 45000) {
-      Serial.printf("UpdateCheck: zu wenig zusammenh. Heap (%u), warte...\n",
+      Serial.printf("UpdateCheck: too little contiguous heap (%u), waiting...\n",
                     (unsigned)ESP.getMaxAllocHeap());
       delay(400);
     }
@@ -1512,7 +1527,7 @@ void handleApiUpdateCheck() {
     http.end();   // TLS-Ressourcen sofort freigeben (wichtig gegen Fragmentierung)
 
     if (!ok) {
-      Serial.printf("UpdateCheck: Versuch %d fehlgeschlagen (HTTP %d)\n", attempt, code);
+      Serial.printf("UpdateCheck: attempt %d failed (HTTP %d)\n", attempt, code);
       if (attempt < MAX_TRIES) delay(600);   // kurz beruhigen, dann neu
     }
   }
@@ -1535,7 +1550,7 @@ void handleApiUpdateInstall() {
   if (cfg_update_url.isEmpty()){otaServer.send(400,"text/plain","No URL");return;}
   otaServer.send(200,"text/plain","OK"); delay(500);
   ledsOff();   // LEDs aus vor dem Server-Flash (sonst frieren sie ein)
-  bootDiagMarkPlannedRestart("Server-OTA-Update");
+  bootDiagMarkPlannedRestart("Server OTA update");
   int updateResult;
   if (cfg_update_url.startsWith("https")) {
     WiFiClientSecure sc; sc.setInsecure();
@@ -1548,7 +1563,7 @@ void handleApiUpdateInstall() {
   // Bei Erfolg startet HTTPUpdate normalerweise direkt neu und kehrt nicht
   // zurueck. Kommt die Funktion zurueck, darf kein veralteter Marker bleiben.
   bootDiagClearPlannedRestart();
-  dlog("Server-OTA beendet/fehlgeschlagen, Rueckgabecode: %d\n", updateResult);
+  dlog("Server OTA finished/failed, return code: %d\n", updateResult);
 }
 
 // Liest ein einfaches String-Feld aus einem JSON-Body, z.B.
@@ -1697,7 +1712,7 @@ void setupWebServer() {
     nvs_flash_deinit();          // NVS freigeben (sonst "in use")
     nvs_flash_erase();           // GESAMTE NVS-Partition loeschen
     nvs_flash_init();            // frisch initialisieren (sauberer Zustand)
-    bootDiagMarkPlannedRestart("Factory Reset / NVS geloescht");
+    bootDiagMarkPlannedRestart("Factory reset / NVS cleared");
     delay(300);
     ESP.restart();
   });
@@ -1711,7 +1726,7 @@ void setupWebServer() {
     bool ok = startAccessPointManual();
     otaServer.send(ok ? 200 : 500, "application/json", accessPointStatusJson(ok));
   });
-  otaServer.on("/api/restart",          HTTP_POST, [](){ bootDiagMarkPlannedRestart("API-Neustart"); otaServer.send(200,"text/plain","OK");ledsOff();delay(500);ESP.restart(); });
+  otaServer.on("/api/restart",          HTTP_POST, [](){ bootDiagMarkPlannedRestart("API restart"); otaServer.send(200,"text/plain","OK");ledsOff();delay(500);ESP.restart(); });
   otaServer.on("/api/debug", HTTP_POST, [](){
     cfg_debug = (otaServer.arg("en") == "1");
     if (otaServer.hasArg("filter")) cfg_debug_filter = otaServer.arg("filter").toInt();
@@ -1777,7 +1792,7 @@ void setupWebServer() {
   emergencyServer.on("/update", HTTP_POST, [](){
     emergencyServer.sendHeader("Connection","close");
     emergencyServer.send(200,"text/plain",Update.hasError()?"Update failed!":"Update successful. ESP restarting...");
-    if (!Update.hasError()) bootDiagMarkPlannedRestart("Emergency-OTA auf Port 8080");
+    if (!Update.hasError()) bootDiagMarkPlannedRestart("Emergency OTA on port 8080");
     ledsOff(); delay(100); ESP.restart();
   }, [](){
     HTTPUpload &u=emergencyServer.upload();

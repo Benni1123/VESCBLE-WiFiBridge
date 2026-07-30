@@ -68,11 +68,11 @@ void bootDiagMarkPlannedRestart(const char *reason) {
   rtcRestartMarker.magic = 0;
   memset(rtcRestartMarker.reason, 0, sizeof(rtcRestartMarker.reason));
   snprintf(rtcRestartMarker.reason, sizeof(rtcRestartMarker.reason), "%s",
-           (reason && reason[0]) ? reason : "Software-Neustart");
+           (reason && reason[0]) ? reason : "Software restart");
   rtcRestartMarker.checksum = restartMarkerChecksum(rtcRestartMarker.reason);
   rtcRestartMarker.magic = RESTART_MARKER_MAGIC;
 
-  String line = String("[SYSTEM] Geplanter Neustart: ") + rtcRestartMarker.reason;
+  String line = String("[SYSTEM] Planned restart: ") + rtcRestartMarker.reason;
   Serial.println(timeServiceLogStamp() + " " + line);
   uartLogAdd(line); // unabhaengig vom Status-Filter, sofern Debug aktiv ist
 }
@@ -93,7 +93,7 @@ static String consumePlannedRestartReason(esp_reset_reason_t resetReason) {
 // ── Reset-/Boot-Diagnose ──────────────────────────────────────────────────────
 static esp_reset_reason_t bootResetReason = ESP_RST_UNKNOWN;
 static String bootResetName = "UNKNOWN";
-static String bootResetDescription = "Unbekannter Resetgrund";
+static String bootResetDescription = "Unknown reset reason";
 static String bootPlannedReason;
 static std::vector<String> bootDiagnosticLines;
 
@@ -128,18 +128,18 @@ static const char *resetReasonName(esp_reset_reason_t reason) {
 
 static const char *resetReasonDescription(esp_reset_reason_t reason) {
   switch (reason) {
-    case ESP_RST_POWERON:   return "Normales Einschalten / Versorgung angelegt";
-    case ESP_RST_EXT:       return "Externer Reset-Pin oder Reset-Taster";
-    case ESP_RST_SW:        return "Software-Neustart durch Firmware, API oder Update";
-    case ESP_RST_PANIC:     return "Absturz durch Panic, Exception oder abort()";
-    case ESP_RST_INT_WDT:   return "Interrupt-Watchdog: Interrupts/CPU zu lange blockiert";
-    case ESP_RST_TASK_WDT:  return "Task-Watchdog: Task oder Loop zu lange blockiert";
-    case ESP_RST_WDT:       return "Anderer Watchdog-Reset";
-    case ESP_RST_DEEPSLEEP: return "Aufgewacht aus Deep Sleep";
-    case ESP_RST_BROWNOUT:  return "Spannungseinbruch / Versorgung unter Brownout-Schwelle";
-    case ESP_RST_SDIO:      return "Reset ueber SDIO";
+    case ESP_RST_POWERON:   return "Normal power-on / supply applied";
+    case ESP_RST_EXT:       return "External reset pin or reset button";
+    case ESP_RST_SW:        return "Software restart by firmware, API or update";
+    case ESP_RST_PANIC:     return "Crash by panic, exception or abort()";
+    case ESP_RST_INT_WDT:   return "Interrupt watchdog: interrupts/CPU blocked too long";
+    case ESP_RST_TASK_WDT:  return "Task watchdog: task or loop blocked too long";
+    case ESP_RST_WDT:       return "Other watchdog reset";
+    case ESP_RST_DEEPSLEEP: return "Woke from deep sleep";
+    case ESP_RST_BROWNOUT:  return "Voltage sag / supply below brownout threshold";
+    case ESP_RST_SDIO:      return "Reset via SDIO";
     case ESP_RST_UNKNOWN:
-    default:                return "Unbekannter oder von dieser Core-Version nicht aufgeloester Reset";
+    default:                return "Unknown reset or not resolved by this core version";
   }
 }
 
@@ -177,41 +177,41 @@ void captureBootDiagnostics() {
   bootResetDescription = resetReasonDescription(bootResetReason);
   bootPlannedReason = consumePlannedRestartReason(bootResetReason);
 
-  bootDiagAdd("Resetgrund: " + bootResetName + " (Code " + String((int)bootResetReason) + ") - " + bootResetDescription);
+  bootDiagAdd("Reset reason: " + bootResetName + " (Code " + String((int)bootResetReason) + ") - " + bootResetDescription);
 
   if (bootResetReason == ESP_RST_BROWNOUT) {
     bootDiagAdd("!!! BROWNOUT erkannt: Versorgungsspannung ist eingebrochen. Akku/DC-DC, Kabel, Stecker und Kondensatoren pruefen.");
   } else if (bootResetReason == ESP_RST_PANIC) {
-    bootDiagAdd("!!! PANIC/EXCEPTION erkannt. Exakte Exception und Backtrace sind nach dem Neustart ohne Core-Dump nicht mehr abrufbar.");
+    bootDiagAdd("!!! PANIC/EXCEPTION detected. Exact exception and backtrace are not retrievable after the restart without a core dump.");
   } else if (bootIsWatchdog()) {
     bootDiagAdd("!!! WATCHDOG erkannt: Typ=" + bootWatchdogType() + ". Hohe Loop-Zeiten und blockierende Netzwerk-/BLE-Aufrufe pruefen.");
   } else if (bootResetReason == ESP_RST_SW) {
     if (!bootPlannedReason.isEmpty())
-      bootDiagAdd("Geplanter Software-Neustart: " + bootPlannedReason);
+      bootDiagAdd("Planned software restart: " + bootPlannedReason);
     else
-      bootDiagAdd("Software-Neustart ohne Bridge-Marker: moeglich durch Bibliothek, Update-System oder fremden esp_restart()-Aufruf.");
+      bootDiagAdd("Software restart without bridge marker: possibly by a library, the update system or an external esp_restart() call.");
   } else if (bootResetReason == ESP_RST_POWERON) {
-    bootDiagAdd("Power-On: normales Einschalten; kein vorheriger Software-Absturz erkannt.");
+    bootDiagAdd("Power-on: normal start; no previous software crash detected.");
   } else if (bootResetReason == ESP_RST_DEEPSLEEP) {
     bootDiagAdd("Deep-Sleep-Wakeup-Code: " + String((int)esp_sleep_get_wakeup_cause()));
   }
 
   bootDiagAdd("Firmware: " + String(FIRMWARE_VERSION) + " | Build: " + String(__DATE__) + " " + String(__TIME__) + " | ESP-IDF: " + String(ESP.getSdkVersion()));
   bootDiagAdd("Chip: " + String(ESP.getChipModel()) + " Rev " + String(ESP.getChipRevision()) +
-              " | Kerne: " + String(ESP.getChipCores()) + " | CPU: " + String(ESP.getCpuFreqMHz()) + " MHz");
+              " | Cores: " + String(ESP.getChipCores()) + " | CPU: " + String(ESP.getCpuFreqMHz()) + " MHz");
 
   uint64_t chipId = ESP.getEfuseMac();
   char idBuf[24];
   snprintf(idBuf, sizeof(idBuf), "%04X%08X",
            (uint16_t)(chipId >> 32), (uint32_t)chipId);
-  bootDiagAdd("Chip-ID: " + String(idBuf) + " | Heap frei/min/maxBlock: " +
+  bootDiagAdd("Chip-ID: " + String(idBuf) + " | Heap free/min/maxBlock: " +
               String(ESP.getFreeHeap()) + "/" + String(ESP.getMinFreeHeap()) + "/" + String(ESP.getMaxAllocHeap()) + " B");
 
   bootDiagAdd("Flash: " + String(ESP.getFlashChipSize()) + " B @ " + String(ESP.getFlashChipSpeed()) +
-              " Hz | Sketch: " + String(ESP.getSketchSize()) + " B | OTA frei: " + String(ESP.getFreeSketchSpace()) + " B");
+              " Hz | Sketch: " + String(ESP.getSketchSize()) + " B | OTA free: " + String(ESP.getFreeSketchSpace()) + " B");
 
   if (ESP.getPsramSize() > 0) {
-    bootDiagAdd("PSRAM: " + String(ESP.getFreePsram()) + " / " + String(ESP.getPsramSize()) + " B frei");
+    bootDiagAdd("PSRAM: " + String(ESP.getFreePsram()) + " / " + String(ESP.getPsramSize()) + " B free");
   }
 
   // Boot-Meldungen bleiben separat gespeichert und werden von /api/uart/log

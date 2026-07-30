@@ -151,7 +151,7 @@ static void timeStartNtp() {
   configTzTime(TIME_TZ_POSIX, TIME_NTP_1, TIME_NTP_2, TIME_NTP_3);
   timeNtpConfigured = true;
   timeNtpAwaitingFirstValid = true;
-  dlog("Zeit: NTP gestartet (%s, %s, %s)\n", TIME_NTP_1, TIME_NTP_2, TIME_NTP_3);
+  dlog("Time: NTP started (%s, %s, %s)\n", TIME_NTP_1, TIME_NTP_2, TIME_NTP_3);
 }
 
 void timeServiceSetup() {
@@ -202,7 +202,7 @@ bool timeServiceSetEpoch(uint64_t epochValue, String &error, const String &sourc
   timeNtpAwaitingFirstValid = false;
   error = "";
 
-  dlog("Zeit: per %s gesetzt: %s\n",
+  dlog("Time: set via %s: %s\n",
        timeSourceLogLabel(timeSourceName),
        timeServiceLocalString().c_str());
   return true;
@@ -237,7 +237,7 @@ void timeServiceLoop() {
       timeSourceName = "ntp";
       timeNtpAwaitingFirstValid = false;
       timePreviouslyValid = true;
-      dlog("Zeit: NTP synchronisiert: %s\n", timeServiceLocalString().c_str());
+      dlog("Time: NTP synchronized: %s\n", timeServiceLocalString().c_str());
     }
   }
 #else
@@ -248,7 +248,7 @@ void timeServiceLoop() {
     timeLastSync = time(nullptr);
     timeSourceName = "ntp";
     timeNtpAwaitingFirstValid = false;
-    dlog("Zeit: NTP synchronisiert: %s\n", timeServiceLocalString().c_str());
+    dlog("Time: NTP synchronized: %s\n", timeServiceLocalString().c_str());
   }
   timePreviouslyValid = validNow;
 #endif

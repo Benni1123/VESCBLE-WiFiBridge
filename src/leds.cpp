@@ -619,7 +619,7 @@ static const char LEDS_PAGE_HTML[] PROGMEM = R"ledslit(
     <div class="tab" onclick="location.href='/?tab=info'">Info</div>
     <div class="tab" onclick="location.href='/?tab=config'">Config</div>
     <div class="tab" onclick="location.href='/?tab=ota'">OTA Flash</div>
-    <div class="tab" onclick="location.href='/?tab=api'">API</div>
+    <div class="tab" id="tab-api-link" style="display:none" onclick="location.href='/?tab=api'">API</div>
     <div class="tab active" onclick="location.href='/leds'">LED</div>
   </div>
 
@@ -917,6 +917,14 @@ function applyHw(){
   }).catch(function(){msg.textContent='Error';msg.className='msg err';});
 }
 
+// API-Tab nur anzeigen, wenn Debug freigeschaltet ist (serverseitiges RAM-Flag,
+// per 8x-Tippen auf den Titel der Hauptseite; gilt bis zum ESP-Neustart).
+function checkApiUnlock(){
+  fetch('/api/debug/unlock',{cache:'no-store'}).then(function(r){return r.ok?r.json():null;}).then(function(j){
+    if(j&&j.unlocked){var el=document.getElementById('tab-api-link');if(el)el.style.display='';}
+  }).catch(function(){});
+}
+checkApiUnlock();
 load();
 </script>
 </body>
