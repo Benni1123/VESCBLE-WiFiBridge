@@ -26,6 +26,7 @@ struct LedChannel {
   int  krWidth = 3;     // Universal-Parameter (Breite, Menge, Dichte, Höhe)
   int  polHz   = 4;     // Zyklus-Frequenz
   bool swapColors = false; // Tauscht bei US-Police Links/Rechts
+  int  colorOrder = 0;     // Index in LED_COLOR_ORDERS (0=GRB Default, 1=RGB, ...)
   Adafruit_NeoPixel *strip = nullptr;
   
   // Animationszustände
@@ -76,10 +77,15 @@ static void fadePixel(Adafruit_NeoPixel *strip, int p, uint8_t fadeBy) {
 }
 
 // ── Clamp ─────────────────────────────────────────────────────────────────────
+// Farb-Reihenfolgen (Byte-Order) des LED-Chips. Index == LedChannel.colorOrder.
+static const uint16_t LED_COLOR_ORDERS[] = { NEO_GRB, NEO_RGB, NEO_BRG, NEO_RBG, NEO_GBR, NEO_BGR };
+#define LED_COLOR_ORDER_COUNT 6
+
 static void clampChannel(int i) {
   LedChannel &c = ch[i];
   if (c.pin   < PIN_MIN) c.pin = PIN_MIN;  if (c.pin   > PIN_MAX) c.pin = PIN_MAX;
   if (c.count < CNT_MIN) c.count = CNT_MIN; if (c.count > CNT_MAX) c.count = CNT_MAX;
+  if (c.colorOrder < 0 || c.colorOrder >= LED_COLOR_ORDER_COUNT) c.colorOrder = 0;
   if (c.effect < 0 || c.effect > 10) c.effect = 0;
   if (c.r < 0) c.r = 0; if (c.r > 255) c.r = 255;
   if (c.g < 0) c.g = 0; if (c.g > 255) c.g = 255;
@@ -112,6 +118,7 @@ static void ledsLoadConfig() {
     ch[i].polHz     = ledPrefs.getInt ((p + "phz").c_str(), 4);
     ch[i].synced    = ledPrefs.getBool((p + "syn").c_str(), false);
     ch[i].swapColors = ledPrefs.getBool((p + "swp").c_str(), false);
+    ch[i].colorOrder = ledPrefs.getInt ((p + "co").c_str(), 0);
   }
   ledPrefs.end();
   clampAll();
@@ -135,6 +142,7 @@ static void ledsSaveConfig() {
     ledPrefs.putInt ((p + "phz").c_str(), ch[i].polHz);
     ledPrefs.putBool((p + "syn").c_str(), ch[i].synced);
     ledPrefs.putBool((p + "swp").c_str(), ch[i].swapColors);
+    ledPrefs.putInt ((p + "co").c_str(), ch[i].colorOrder);
   }
   ledPrefs.end();
 }
@@ -173,7 +181,8 @@ static void initStripFor(int i) {
     c.strip->clear(); c.strip->show();
     delete c.strip; c.strip = nullptr;
   }
-  c.strip = new Adafruit_NeoPixel(c.count, c.pin, NEO_GRB + NEO_KHZ800);
+  uint16_t colOrder = LED_COLOR_ORDERS[(c.colorOrder >= 0 && c.colorOrder < LED_COLOR_ORDER_COUNT) ? c.colorOrder : 0];
+  c.strip = new Adafruit_NeoPixel(c.count, c.pin, colOrder + NEO_KHZ800);
   c.strip->begin();
   c.strip->setBrightness(c.bright);
   c.strip->clear(); c.strip->show();
@@ -679,6 +688,11 @@ function load(){
 
 function render(){ renderHw(); renderControls(); }
 
+function coOpts(sel){
+  var names=['GRB','RGB','BRG','RBG','GBR','BGR'], o='';
+  for(var k=0;k<names.length;k++) o+='<option value="'+k+'"'+((k===sel)?' selected':'')+'>'+names[k]+'</option>';
+  return o;
+}
 function renderHw(){
   var h='';
   h+='<div class="cnt-ctrl">';
@@ -694,6 +708,7 @@ function renderHw(){
     h+='<div><label>GPIO</label><input type="text" id="hwpin'+i+'" maxlength="2" value="'+c.pin+'"></div>';
     h+='<div><label>'+(de()?'Anzahl':'Count')+'</label><input type="text" id="hwcnt'+i+'" maxlength="3" value="'+c.count+'"></div>';
     h+='</div>';
+    h+='<div style="margin-top:8px"><label>'+(de()?'Farb-Reihenfolge':'Color order')+'</label><select id="hwco'+i+'">'+coOpts(c.colororder)+'</select></div>';
     h+='<label class="checkbox-row" style="margin-top:8px"><input type="checkbox" '+(c.synced?'checked':'')+' onchange="toggleSync('+i+',this.checked)">'+(de()?'Synchronisiert':'Synced')+'</label>';
     h+='</div>';
   }
@@ -906,7 +921,8 @@ function applyHw(){
   for(var i=0;i<cfg.count;i++){
     var pin=parseInt(gv('hwpin'+i))||4;
     var cnt=parseInt(gv('hwcnt'+i))||30;
-    qs.push('p'+i+'='+pin+'&n'+i+'='+cnt);
+    var co=parseInt(gv('hwco'+i))||0;
+    qs.push('p'+i+'='+pin+'&n'+i+'='+cnt+'&o'+i+'='+co);
   }
   var msg=gid('hwmsg');
   fetch('/api/led/hw?'+qs.join('&'),{method:'POST'}).then(function(r){
@@ -962,6 +978,7 @@ void ledsSetup(WebServer *server) {
       if (i) j += ",";
       j += "{\"pin\":"       + String(ch[i].pin);
       j += ",\"count\":"     + String(ch[i].count);
+      j += ",\"colororder\":"+ String(ch[i].colorOrder);
       j += ",\"synced\":"    + String(ch[i].synced ? "true" : "false");
       j += ",\"effect\":"    + String(ch[i].effect);
       j += ",\"r\":"         + String(ch[i].r);
@@ -1098,9 +1115,10 @@ void ledsSetup(WebServer *server) {
 
   ledServer->on("/api/led/hw", HTTP_POST, [](){
     for (int i = 0; i < channelCount; i++) {
-      String pk = "p" + String(i), nk = "n" + String(i);
-      if (ledServer->hasArg(pk.c_str())) ch[i].pin   = ledServer->arg(pk.c_str()).toInt();
-      if (ledServer->hasArg(nk.c_str())) ch[i].count = ledServer->arg(nk.c_str()).toInt();
+      String pk = "p" + String(i), nk = "n" + String(i), ok = "o" + String(i);
+      if (ledServer->hasArg(pk.c_str())) ch[i].pin        = ledServer->arg(pk.c_str()).toInt();
+      if (ledServer->hasArg(nk.c_str())) ch[i].count      = ledServer->arg(nk.c_str()).toInt();
+      if (ledServer->hasArg(ok.c_str())) ch[i].colorOrder = ledServer->arg(ok.c_str()).toInt();
     }
     clampAll();
     ledsSaveConfig();
