@@ -14,7 +14,7 @@
 static volatile uint32_t ledsFrameNow = 0;
 
 struct LedChannel {
-  int  pin     = 4;     
+  int  pin     = -1;     
   int  count   = 30;    
   bool synced  = false; 
   int  effect  = 0;     // 0=Aus, 1=Solid, 2=KR, 3=Pol(EU), 4=Pol(US Weiß), 5=Pol(US WigWag), 6=Rainbow, 7=Breath, 8=Sparkle, 9=Meteor, 10=Fire
@@ -27,6 +27,7 @@ struct LedChannel {
   int  polHz   = 4;     // Zyklus-Frequenz
   bool swapColors = false; // Tauscht bei US-Police Links/Rechts
   int  colorOrder = 0;     // Index in LED_COLOR_ORDERS (0=GRB Default, 1=RGB, ...)
+  int  polRole    = 0;     // Police-Rolle: 0=Teilen (intern), 1=Links, 2=Rechts
   Adafruit_NeoPixel *strip = nullptr;
   
   // Animationszustände
@@ -45,6 +46,7 @@ struct LedChannel {
 
 static LedChannel ch[LED_MAX_CHANNELS];
 static int        channelCount = 1;
+static unsigned long ledKeepaliveMs = 150;   // 0 = aus; Keepalive-Intervall (in HW-Config einstellbar)
 
 // ── LED-Task auf Kern 1 ───────────────────────────────────────────────────────
 static SemaphoreHandle_t ledsMutex      = nullptr;
@@ -83,9 +85,11 @@ static const uint16_t LED_COLOR_ORDERS[] = { NEO_GRB, NEO_RGB, NEO_BRG, NEO_RBG,
 
 static void clampChannel(int i) {
   LedChannel &c = ch[i];
-  if (c.pin   < PIN_MIN) c.pin = PIN_MIN;  if (c.pin   > PIN_MAX) c.pin = PIN_MAX;
+  if (c.pin < 0) c.pin = -1;                  // < 0 = unbelegt (leeres GPIO-Feld)
+  else if (c.pin > PIN_MAX) c.pin = PIN_MAX;  // gueltige Pins auf 0..PIN_MAX begrenzen
   if (c.count < CNT_MIN) c.count = CNT_MIN; if (c.count > CNT_MAX) c.count = CNT_MAX;
   if (c.colorOrder < 0 || c.colorOrder >= LED_COLOR_ORDER_COUNT) c.colorOrder = 0;
+  if (c.polRole < 0 || c.polRole > 2) c.polRole = 0;
   if (c.effect < 0 || c.effect > 10) c.effect = 0;
   if (c.r < 0) c.r = 0; if (c.r > 255) c.r = 255;
   if (c.g < 0) c.g = 0; if (c.g > 255) c.g = 255;
@@ -102,11 +106,12 @@ static void clampAll() { for (int i = 0; i < LED_MAX_CHANNELS; i++) clampChannel
 static void ledsLoadConfig() {
   ledPrefs.begin("leds", false);
   channelCount = ledPrefs.getInt("chcnt", 1);
+  ledKeepaliveMs = (unsigned long) ledPrefs.getInt("kams", 150);
   if (channelCount < 1) channelCount = 1;
   if (channelCount > LED_MAX_CHANNELS) channelCount = LED_MAX_CHANNELS;
   for (int i = 0; i < LED_MAX_CHANNELS; i++) {
     String p = "c" + String(i);
-    ch[i].pin       = ledPrefs.getInt ((p + "pin").c_str(), 4);
+    ch[i].pin       = ledPrefs.getInt ((p + "pin").c_str(), -1);
     ch[i].count     = ledPrefs.getInt ((p + "cnt").c_str(), 30);
     ch[i].effect    = ledPrefs.getInt ((p + "eff").c_str(), 0);
     ch[i].r         = ledPrefs.getInt ((p + "r").c_str(),   0);
@@ -119,6 +124,7 @@ static void ledsLoadConfig() {
     ch[i].synced    = ledPrefs.getBool((p + "syn").c_str(), false);
     ch[i].swapColors = ledPrefs.getBool((p + "swp").c_str(), false);
     ch[i].colorOrder = ledPrefs.getInt ((p + "co").c_str(), 0);
+    ch[i].polRole    = ledPrefs.getInt ((p + "prl").c_str(), 0);
   }
   ledPrefs.end();
   clampAll();
@@ -128,6 +134,7 @@ static void ledsSaveConfig() {
   clampAll();
   ledPrefs.begin("leds", false);
   ledPrefs.putInt("chcnt", channelCount);
+  ledPrefs.putInt("kams", (int) ledKeepaliveMs);
   for (int i = 0; i < LED_MAX_CHANNELS; i++) {
     String p = "c" + String(i);
     ledPrefs.putInt ((p + "pin").c_str(), ch[i].pin);
@@ -143,6 +150,7 @@ static void ledsSaveConfig() {
     ledPrefs.putBool((p + "syn").c_str(), ch[i].synced);
     ledPrefs.putBool((p + "swp").c_str(), ch[i].swapColors);
     ledPrefs.putInt ((p + "co").c_str(), ch[i].colorOrder);
+    ledPrefs.putInt ((p + "prl").c_str(), ch[i].polRole);
   }
   ledPrefs.end();
 }
@@ -156,6 +164,12 @@ static const unsigned long LED_FRAME_MS = 25;
 static bool          ledDirty[LED_MAX_CHANNELS]     = { false };
 static bool          ledForceShow[LED_MAX_CHANNELS] = { false }; // umgeht die 25ms-Drosselung (nur fuer event-getriebene Effekte wie Police)
 static unsigned long ledLastShow = 0;
+// Keepalive-Refresh: statische Frames (Aus / Feste Farbe) werden nach dem einmaligen
+// Zeichnen nicht mehr gesendet. Durch EMV/knappen Datenpegel verfaelschte Pixel bleiben
+// dadurch stehen. Wir senden das aktuelle Frame darum alle ledKeepaliveMs ms erneut ->
+// ein Stoerpixel wird spaetestens dann wieder ueberschrieben (geheilt).
+// (ledKeepaliveMs ist oben bei den Config-Globals deklariert, damit Load/Save es sehen.)
+static unsigned long ledLastKeepalive = 0;
 
 // Normales Markieren: wird von ledsShowDirty() auf LED_FRAME_MS gedrosselt gezeigt.
 static void markDirty(int i)    { if (i >= 0 && i < LED_MAX_CHANNELS) ledDirty[i] = true; }
@@ -180,6 +194,16 @@ static void initStripFor(int i) {
   if (c.strip) {
     c.strip->clear(); c.strip->show();
     delete c.strip; c.strip = nullptr;
+  }
+  if (c.pin < 0) return;   // unbelegter Kanal (leeres GPIO-Feld) -> kein Strip
+  // Schutz vor RMT-Konflikt: nie zwei Kanaele auf denselben GPIO. Belegt ein
+  // frueherer aktiver Kanal denselben Pin, erzeugen wir hier KEINEN Strip -
+  // sonst klauen sich die NeoPixel-Objekte den RMT-Kanal ("not attached").
+  for (int j = 0; j < i; j++) {
+    if (ch[j].strip && ch[j].pin == c.pin) {
+      Serial.printf("LEDs ch%d: GPIO %d bereits von ch%d belegt -> kein Strip\n", i, c.pin, j);
+      return;
+    }
   }
   uint16_t colOrder = LED_COLOR_ORDERS[(c.colorOrder >= 0 && c.colorOrder < LED_COLOR_ORDER_COUNT) ? c.colorOrder : 0];
   c.strip = new Adafruit_NeoPixel(c.count, c.pin, colOrder + NEO_KHZ800);
@@ -306,7 +330,19 @@ static void policeChannel(int i) {
       uint32_t cLeft  = c.swapColors ? cBlue : cRed;
       uint32_t cRight = c.swapColors ? cRed  : cBlue;
 
-      if (c.effect == 3) {
+      if (c.polRole == 1 || c.polRole == 2) {
+        // Ganzer Streifen = eine physische Seite. Links leuchtet in Phase 0,
+        // Rechts in Phase 1, Weiss (nur Effekt 4) in Phase 2 auf beiden Seiten.
+        bool leftPhase  = (currentPhase == 0);
+        bool rightPhase = (currentPhase == 1);
+        bool whitePhase = (c.effect == 4 && currentPhase == 2);
+        uint32_t col = 0; bool draw = false;
+        if (c.polRole == 1 && leftPhase)  { col = (c.effect == 3) ? cUser : cLeft;  draw = true; }
+        if (c.polRole == 2 && rightPhase) { col = (c.effect == 3) ? cUser : cRight; draw = true; }
+        if (whitePhase)                   { col = cWht; draw = true; }
+        if (draw) for (int p = 0; p < c.count; p++) c.strip->setPixelColor(p, col);
+      }
+      else if (c.effect == 3) {
         if (currentPhase == 0) for (int p = 0; p < half; p++) c.strip->setPixelColor(p, cUser);
         else                   for (int p = half; p < c.count; p++) c.strip->setPixelColor(p, cUser);
       }
@@ -541,6 +577,14 @@ void ledsLoop(int32_t erpm) {
     else if (ch[i].effect == 9)                   meteorChannel(i);
     else if (ch[i].effect == 10)                  fireChannel(i);
   }
+  // Keepalive: statische Frames (Aus/Feste Farbe) periodisch erneut senden, damit durch
+  // Stoerungen verfaelschte Pixel geheilt werden. Animierte Effekte (>=2) senden ohnehin
+  // jeden Frame neu und brauchen das nicht.
+  if (ledKeepaliveMs && ledsFrameNow - ledLastKeepalive >= ledKeepaliveMs) {
+    ledLastKeepalive = ledsFrameNow;
+    for (int i = 0; i < channelCount; i++)
+      if (ch[i].strip && ch[i].effect <= 1) ledForceShow[i] = true;   // Re-Transmit des aktuellen Buffers erzwingen
+  }
   ledsShowDirty();          
   ledsFlushPendingSave();   
 }
@@ -661,9 +705,12 @@ gid('langBtn').textContent=de()?'EN':'DE';
   var sb=gid('statusBar'); if(sb && sb.textContent==='Loading...') sb.textContent=de()?'Lädt...':'Loading...';
 })();
 
+var vescRx=-1, vescTx=-1;
 function loadStatus(){
   fetch('/api/info').then(function(r){return r.json();}).then(function(d){
     gid('statusBar').textContent=d.mode==='ap'&&!d.ssid?'AP: '+d.ip:'WiFi: '+d.ssid+' ('+d.ip+')';
+    if(d.rx_pin!==undefined) vescRx=parseInt(d.rx_pin);
+    if(d.tx_pin!==undefined) vescTx=parseInt(d.tx_pin);
   }).catch(function(){});
 }
 loadStatus();
@@ -700,16 +747,21 @@ function renderHw(){
   h+='<button class="btn red sm" onclick="chCountDelta(-1)" '+(cfg.count<=1?'disabled':'')+'>&#8722;</button>';
   h+='<button class="btn green sm" onclick="chCountDelta(1)" '+(cfg.count>=4?'disabled':'')+'>+</button>';
   h+='</div>';
+  h+='<div class="chrow"><label>'+(de()?'LED-Refresh (Keepalive)':'LED refresh (keepalive)')+'</label><div style="display:flex;gap:8px;align-items:center;margin-top:4px"><input type="text" id="hwka" maxlength="4" value="'+(cfg.keepalive!==undefined?cfg.keepalive:150)+'" style="flex:1"><span style="color:var(--text2);font-size:12px">ms (0='+(de()?'aus':'off')+')</span></div><div style="color:var(--text2);font-size:11px;margin-top:4px">'+(de()?'Sendet statische Frames (Aus/Feste Farbe) periodisch neu.':'Periodically re-sends static frames (off/solid).')+'</div></div>';
   for(var i=0;i<cfg.count;i++){
     var c=cfg.channels[i];
     h+='<div class="chrow">';
     h+='<div style="font-size:12px;color:var(--text2);margin-bottom:6px">'+(de()?'Kanal':'Channel')+' '+(i+1)+'</div>';
     h+='<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">';
-    h+='<div><label>GPIO</label><input type="text" id="hwpin'+i+'" maxlength="2" value="'+c.pin+'"></div>';
+    h+='<div><label>GPIO</label><input type="text" id="hwpin'+i+'" maxlength="2" placeholder="'+(de()?'Pin?':'Pin?')+'" value="'+(c.pin>=0?c.pin:'')+'"></div>';
     h+='<div><label>'+(de()?'Anzahl':'Count')+'</label><input type="text" id="hwcnt'+i+'" maxlength="3" value="'+c.count+'"></div>';
     h+='</div>';
     h+='<div style="margin-top:8px"><label>'+(de()?'Farb-Reihenfolge':'Color order')+'</label><select id="hwco'+i+'">'+coOpts(c.colororder)+'</select></div>';
     h+='<label class="checkbox-row" style="margin-top:8px"><input type="checkbox" '+(c.synced?'checked':'')+' onchange="toggleSync('+i+',this.checked)">'+(de()?'Synchronisiert':'Synced')+'</label>';
+    h+='<div style="margin-top:8px;display:flex;gap:6px;align-items:center;flex-wrap:wrap"><label style="margin:0">'+(de()?'Police-Seite':'Police side')+'</label>'+
+       '<button class="btn sm'+(c.polrole==0?' green':'')+'" onclick="onPolRole('+i+',0)">'+(de()?'Teilen':'Split')+'</button>'+
+       '<button class="btn sm'+(c.polrole==1?' green':'')+'" onclick="onPolRole('+i+',1)">L</button>'+
+       '<button class="btn sm'+(c.polrole==2?' green':'')+'" onclick="onPolRole('+i+',2)">R</button></div>';
     h+='</div>';
   }
   gid('hwrows').innerHTML=h;
@@ -909,6 +961,11 @@ function toggleSync(i,on){
   send('/api/led/sync?ch='+i+'&on='+(on?1:0));
   renderControls();
 }
+function onPolRole(i,role){
+  cfg.channels[i].polrole=role;
+  send('/api/led/polrole?ch='+i+'&role='+role);
+  renderHw();
+}
 
 function chCountDelta(d){
   var n=cfg.count+d; if(n<1)n=1; if(n>4)n=4;
@@ -917,15 +974,24 @@ function chCountDelta(d){
 }
 
 function applyHw(){
-  var qs=[];
+  var qs=[], usedPins={}, em=gid('hwmsg');
+  function belegt(pin,by){ em.textContent=(de()?'GPIO '+pin+' bereits belegt ('+by+')':'GPIO '+pin+' already in use ('+by+')'); em.className='msg err'; }
   for(var i=0;i<cfg.count;i++){
-    var pin=parseInt(gv('hwpin'+i))||4;
+    var pv=(gv('hwpin'+i)||'').trim();
+    var pin=(pv==='')?-1:parseInt(pv); if(isNaN(pin))pin=-1;
     var cnt=parseInt(gv('hwcnt'+i))||30;
     var co=parseInt(gv('hwco'+i))||0;
+    if(pin>=0){
+      if(pin===vescRx){ belegt(pin,'VESC RX'); return; }
+      if(pin===vescTx){ belegt(pin,'VESC TX'); return; }
+      if(usedPins[pin]!==undefined){ belegt(pin,(de()?'Kanal ':'Channel ')+(usedPins[pin]+1)); return; }
+      usedPins[pin]=i;
+    }
     qs.push('p'+i+'='+pin+'&n'+i+'='+cnt+'&o'+i+'='+co);
   }
+  var ka=parseInt(gv('hwka')); if(isNaN(ka)||ka<0)ka=150; if(ka>5000)ka=5000;
   var msg=gid('hwmsg');
-  fetch('/api/led/hw?'+qs.join('&'),{method:'POST'}).then(function(r){
+  fetch('/api/led/hw?'+qs.join('&')+'&ka='+ka,{method:'POST'}).then(function(r){
     if(r.ok){msg.textContent=de()?'Übernommen':'Applied';msg.className='msg ok';}
     else{msg.textContent='Error';msg.className='msg err';}
     setTimeout(function(){msg.className='msg';},2000);
@@ -973,12 +1039,13 @@ void ledsSetup(WebServer *server) {
   });
 
   ledServer->on("/api/led/config", HTTP_GET, [](){
-    String j = "{\"count\":" + String(channelCount) + ",\"channels\":[";
+    String j = "{\"count\":" + String(channelCount) + ",\"keepalive\":" + String(ledKeepaliveMs) + ",\"channels\":[";
     for (int i = 0; i < LED_MAX_CHANNELS; i++) {
       if (i) j += ",";
       j += "{\"pin\":"       + String(ch[i].pin);
       j += ",\"count\":"     + String(ch[i].count);
       j += ",\"colororder\":"+ String(ch[i].colorOrder);
+      j += ",\"polrole\":"   + String(ch[i].polRole);
       j += ",\"synced\":"    + String(ch[i].synced ? "true" : "false");
       j += ",\"effect\":"    + String(ch[i].effect);
       j += ",\"r\":"         + String(ch[i].r);
@@ -1008,7 +1075,10 @@ void ledsSetup(WebServer *server) {
       }
       int old = channelCount;
       channelCount = n;
-      if (n > old) for (int i = old; i < n; i++) { initStripFor(i); applyChannel(i); }
+      if (n > old) for (int i = old; i < n; i++) {
+        ch[i].pin = -1;   // neuer Kanal startet ohne GPIO (leeres Feld) - bewusst vergeben
+        initStripFor(i); applyChannel(i);
+      }
       ledsSaveConfig();
       ledsUnlock();
     }
@@ -1020,6 +1090,20 @@ void ledsSetup(WebServer *server) {
       int i = ledServer->arg("ch").toInt();
       if (i >= 0 && i < channelCount) {
         ch[i].synced = (ledServer->arg("on") == "1");
+        ledsSaveConfig();
+      }
+    }
+    ledServer->send(200, "text/plain", "OK");
+  });
+
+  ledServer->on("/api/led/polrole", HTTP_POST, [](){
+    if (ledServer->hasArg("ch") && ledServer->hasArg("role")) {
+      int i = ledServer->arg("ch").toInt();
+      if (i >= 0 && i < channelCount) {
+        int r = ledServer->arg("role").toInt();
+        if (r < 0 || r > 2) r = 0;
+        ch[i].polRole  = r;
+        ch[i].polForce = true;   // Police sofort mit neuer Rolle neu zeichnen
         ledsSaveConfig();
       }
     }
@@ -1119,6 +1203,11 @@ void ledsSetup(WebServer *server) {
       if (ledServer->hasArg(pk.c_str())) ch[i].pin        = ledServer->arg(pk.c_str()).toInt();
       if (ledServer->hasArg(nk.c_str())) ch[i].count      = ledServer->arg(nk.c_str()).toInt();
       if (ledServer->hasArg(ok.c_str())) ch[i].colorOrder = ledServer->arg(ok.c_str()).toInt();
+    }
+    if (ledServer->hasArg("ka")) {
+      long v = ledServer->arg("ka").toInt();
+      if (v < 0) v = 0; if (v > 5000) v = 5000;
+      ledKeepaliveMs = (unsigned long) v;
     }
     clampAll();
     ledsSaveConfig();
