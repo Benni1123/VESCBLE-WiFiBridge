@@ -28,6 +28,7 @@ struct LedChannel {
   bool swapColors = false; // Tauscht bei US-Police Links/Rechts
   int  colorOrder = 0;     // Index in LED_COLOR_ORDERS (0=GRB Default, 1=RGB, ...)
   int  polRole    = 0;     // Police-Rolle: 0=Teilen (intern), 1=Links, 2=Rechts
+  bool pinLow     = false; // true = Datenleitung als GPIO aktiv LOW (RMT abgekoppelt, Aus)
   Adafruit_NeoPixel *strip = nullptr;
   
   // Animationszustände
@@ -214,13 +215,14 @@ static void initStripFor(int i) {
   c.polSide = 0; c.polFlash = 0; c.polOn = false; c.polForce = false; c.polSig = -1;
   c.rbHue = 0; c.fireT = 0.0f;
   ledDirty[i] = false; ledForceShow[i] = false;
+  c.pinLow = false;   // frischer Strip -> Pin wieder an RMT gebunden
   Serial.printf("LEDs ch%d: init pin=%d count=%d\n", i, c.pin, c.count);
 }
 
 // ── Effekt Reset & Anwenden ──────────────────────────────────────────────────
 static void applyChannel(int i) {
   LedChannel &c = ch[i];
-  if (!c.strip) return;
+  if (!c.strip) return;   // unbelegt oder LOW (Strip freigegeben) -> nichts zeichnen; ledsLoop holt den Pin zurueck
   c.strip->setBrightness(c.bright);
   
   if (c.effect == 0) {
@@ -564,11 +566,40 @@ static void ledsShowDirty() {
   if (didThrottledShow) ledLastShow = millis();
 }
 
+// Schaltet einen Kanal echt "aus": letztes Frame schwarz (noch ueber RMT), dann
+// die Datenleitung als GPIO aktiv auf LOW. So kann der WS2815 im gestoerten/
+// floatenden Zustand kein Geisterleuchten mehr zeigen. Der Pin ist danach NICHT
+// mehr an RMT gebunden -> vor dem naechsten show() muss initStripFor() ihn zurueck-
+// holen (passiert in ledsLoop / applyChannel).
+static void ledsPullLow(int i) {
+  LedChannel &c = ch[i];
+  if (c.pin < 0 || c.pinLow) return;
+  if (c.strip) { delete c.strip; c.strip = nullptr; }   // echten Strip freigeben (RMT frei)
+  // Temporaerer Strip mit count+10 (gedeckelt auf CNT_MAX), um auch physisch ueberzaehlige
+  // LEDs sicher zu loeschen. 3x schwarz senden (Redundanz gegen gestoerte Frames), jeweils
+  // komplett rausschieben BEVOR wir den Pin uebernehmen.
+  int n = c.count + 10; if (n > CNT_MAX) n = CNT_MAX; if (n < 1) n = 1;
+  uint16_t ord = LED_COLOR_ORDERS[(c.colorOrder >= 0 && c.colorOrder < LED_COLOR_ORDER_COUNT) ? c.colorOrder : 0];
+  Adafruit_NeoPixel *bs = new Adafruit_NeoPixel(n, c.pin, ord + NEO_KHZ800);
+  bs->begin(); bs->clear();
+  for (int r = 0; r < 3; r++) {
+    bs->show();
+    delay(2 + ((unsigned long)n * 30UL) / 1000UL);   // Frame KOMPLETT rausschieben
+  }
+  delete bs;                        // RMT nach vollstaendigem TX sauber freigeben
+  pinMode(c.pin, OUTPUT);           // dann Datenleitung aktiv LOW
+  digitalWrite(c.pin, LOW);
+  c.pinLow = true;
+  ledDirty[i] = false; ledForceShow[i] = false;
+}
+
 void ledsLoop(int32_t erpm) {
   (void)erpm;
   ledsFrameNow = millis();
 
   for (int i = 0; i < channelCount; i++) {
+    if (ch[i].effect == 0) { ledsPullLow(i); continue; }   // Aus -> Datenleitung aktiv LOW
+    if (ch[i].pinLow) { initStripFor(i); applyChannel(i); }   // zurueck aus LOW: RMT zurueckholen + Basiszustand (nur hier, unter Task-Lock)
     if (ch[i].effect == 2)                        knightRiderChannel(i);
     else if (ch[i].effect >= 3 && ch[i].effect <= 5)   policeChannel(i);
     else if (ch[i].effect == 6)                   rainbowChannel(i);
@@ -583,7 +614,7 @@ void ledsLoop(int32_t erpm) {
   if (ledKeepaliveMs && ledsFrameNow - ledLastKeepalive >= ledKeepaliveMs) {
     ledLastKeepalive = ledsFrameNow;
     for (int i = 0; i < channelCount; i++)
-      if (ch[i].strip && ch[i].effect <= 1) ledForceShow[i] = true;   // Re-Transmit des aktuellen Buffers erzwingen
+      if (ch[i].strip && ch[i].effect == 1 && !ch[i].pinLow) ledForceShow[i] = true;   // nur feste Farbe; "Aus" ist ueber aktiv-LOW schon stoerungsimmun
   }
   ledsShowDirty();          
   ledsFlushPendingSave();   
@@ -622,12 +653,7 @@ void ledsOff() {
   ledsLock();   
   for (int i = 0; i < LED_MAX_CHANNELS; i++) {
     ch[i].effect = 0;
-    if (ch[i].strip) {
-      ch[i].strip->clear();
-      ch[i].strip->show();
-    }
-    ledDirty[i]     = false;
-    ledForceShow[i] = false;
+    ledsPullLow(i);   // 3x schwarz (count+10) rausschieben + Datenleitung aktiv LOW
   }
   ledsUnlock();
 }
@@ -681,6 +707,7 @@ static const char LEDS_PAGE_HTML[] PROGMEM = R"ledslit(
     <div id="hwrows"></div>
     <button class="btn" onclick="applyHw()" id="btn-hw">Apply hardware</button>
     <div class="msg" id="hwmsg"></div>
+    <button id="bigOff" onclick="ledsBigToggle()" style="display:none;width:100%;padding:22px 12px;margin:14px 0 2px;font-size:30px;font-weight:800;letter-spacing:6px;color:#fff;background:linear-gradient(#d32f2f,#8e0000);border:2px solid #ff5a5a;border-radius:12px;box-shadow:0 4px 16px rgba(0,0,0,.3);cursor:pointer">AUS</button>
   </div>
 
   <div id="controls"></div>
@@ -711,6 +738,7 @@ function loadStatus(){
     gid('statusBar').textContent=d.mode==='ap'&&!d.ssid?'AP: '+d.ip:'WiFi: '+d.ssid+' ('+d.ip+')';
     if(d.rx_pin!==undefined) vescRx=parseInt(d.rx_pin);
     if(d.tx_pin!==undefined) vescTx=parseInt(d.tx_pin);
+    var bo=gid('bigOff'); if(bo){ bo.style.display=(d.ble_name==='Headcrash366')?'':'none'; updateBigOff(); }
   }).catch(function(){});
 }
 loadStatus();
@@ -733,7 +761,7 @@ function load(){
   });
 }
 
-function render(){ renderHw(); renderControls(); }
+function render(){ renderHw(); renderControls(); updateBigOff(); }
 
 function coOpts(sel){
   var names=['GRB','RGB','BRG','RBG','GBR','BGR'], o='';
@@ -881,6 +909,28 @@ function applyLocal(idx,fn){
   else if(cfg.channels[idx]) fn(cfg.channels[idx]);
 }
 
+function bigIsOn(){   // true wenn irgendein Kanal an ist (Effekt != 0)
+  if(!cfg||!cfg.channels) return false;
+  for(var i=0;i<cfg.channels.length;i++) if(cfg.channels[i].effect!==0) return true;
+  return false;
+}
+function updateBigOff(){
+  var b=gid('bigOff'); if(!b) return;
+  var on=bigIsOn();
+  b.textContent=on?'AUS':'AN';
+  b.style.background=on?'linear-gradient(#d32f2f,#8e0000)':'linear-gradient(#2e7d32,#1b5e20)';
+  b.style.borderColor=on?'#ff5a5a':'#5aff7a';
+}
+function ledsBigToggle(){
+  if(bigIsOn()){
+    send('/api/led/alloff');
+    if(cfg&&cfg.channels) for(var i=0;i<cfg.channels.length;i++) cfg.channels[i].effect=0;
+  } else {
+    send('/api/led/allon');
+    if(cfg&&cfg.channels) for(var i=0;i<cfg.channels.length;i++) cfg.channels[i].effect=1;
+  }
+  renderControls(); updateBigOff();
+}
 function onEff(idx){
   var p=pfx(idx),e=+gv(p+'_eff');
   updateVis(idx); 
@@ -1023,7 +1073,13 @@ void ledsInitStripsEarly() {
   if (!ledsMutex) ledsMutex = xSemaphoreCreateMutex();
   ledsLoadConfig();
   for (int i = 0; i < LED_MAX_CHANNELS; i++) ch[i].effect = 0;
-  for (int i = 0; i < channelCount; i++) { initStripFor(i); applyChannel(i); }
+  // 1) Datenleitungen SOFORT definiert LOW (noch vor jedem Strip), damit zwischen
+  //    Power-On und Init kein floatender Pin Stoerungen als Daten latcht.
+  for (int i = 0; i < channelCount; i++)
+    if (ch[i].pin >= 0) { pinMode(ch[i].pin, OUTPUT); digitalWrite(ch[i].pin, LOW); }
+  // 2) Boot-Zustand = aus: 3x schwarz (count+10) senden + Pin wieder aktiv LOW.
+  //    ledsPullLow legt dafuer selbst einen temporaeren Strip an.
+  for (int i = 0; i < channelCount; i++) ledsPullLow(i);
   ledsStripsReady = true;
 }
 
@@ -1110,8 +1166,35 @@ void ledsSetup(WebServer *server) {
     ledServer->send(200, "text/plain", "OK");
   });
 
+  // Not-Aus: alle Kanaele auf Effekt 0 + Strips blanken (grosser AUS-Button).
+  ledServer->on("/api/led/alloff", HTTP_POST, [](){
+    ledsLock();
+    for (int i = 0; i < channelCount; i++) {
+      ch[i].effect = 0;
+      if (ch[i].strip) { ch[i].strip->clear(); ch[i].strip->show(); }
+      ledDirty[i] = false; ledForceShow[i] = false;
+    }
+    ledsUnlock();
+    ledsSaveConfig();
+    ledServer->send(200, "text/plain", "OK");
+  });
+
+  // Alles AN = feste Farbe (Effekt 1). Gegenstueck zum AUS-Toggle.
+  ledServer->on("/api/led/allon", HTTP_POST, [](){
+    ledsLock();
+    for (int i = 0; i < channelCount; i++) {
+      ch[i].effect = 1;    // feste Farbe
+      clampChannel(i);
+      applyChannel(i);     // zeichnet die Farbe (No-Op wenn Pin LOW -> ledsLoop holt zurueck + zeichnet)
+    }
+    ledsUnlock();
+    ledsSaveConfig();
+    ledServer->send(200, "text/plain", "OK");
+  });
+
   ledServer->on("/api/led/color", HTTP_POST, [](){
     int tg[LED_MAX_CHANNELS]; int n = resolveTargets(tg);
+    ledsLock();
     for (int k = 0; k < n; k++) {
       int i = tg[k];
       if (ledServer->hasArg("r")) ch[i].r = ledServer->arg("r").toInt();
@@ -1121,12 +1204,14 @@ void ledsSetup(WebServer *server) {
       if (ch[i].effect == 1) applyChannel(i); 
       else if (ch[i].effect >= 3 && ch[i].effect <= 5) ch[i].polForce = true;
     }
+    ledsUnlock();
     ledsRequestSave();   
     ledServer->send(200, "text/plain", "OK");
   });
 
   ledServer->on("/api/led/bright", HTTP_POST, [](){
     int tg[LED_MAX_CHANNELS]; int n = resolveTargets(tg);
+    ledsLock();
     for (int k = 0; k < n; k++) {
       int i = tg[k];
       if (ledServer->hasArg("v")) ch[i].bright = ledServer->arg("v").toInt();
@@ -1135,6 +1220,7 @@ void ledsSetup(WebServer *server) {
       if (ch[i].effect == 1) applyChannel(i);
       else if (ch[i].effect >= 3 && ch[i].effect <= 5) ch[i].polForce = true;
     }
+    ledsUnlock();
     ledsRequestSave();   
     ledServer->send(200, "text/plain", "OK");
   });
@@ -1187,12 +1273,14 @@ void ledsSetup(WebServer *server) {
 
   ledServer->on("/api/led/effect", HTTP_POST, [](){
     int tg[LED_MAX_CHANNELS]; int n = resolveTargets(tg);
+    ledsLock();
     for (int k = 0; k < n; k++) {
       int i = tg[k];
       if (ledServer->hasArg("e")) ch[i].effect = ledServer->arg("e").toInt();
       clampChannel(i);
       applyChannel(i);
     }
+    ledsUnlock();
     ledsSaveConfig();
     ledServer->send(200, "text/plain", "OK");
   });
