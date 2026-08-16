@@ -1,7 +1,9 @@
 #include "leds.h"
+#include "debuglog.h"
 #include <Arduino.h>
 #include <Adafruit_NeoPixel.h>
 #include <Preferences.h>
+#include <stdarg.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/semphr.h>
@@ -44,7 +46,7 @@ struct LedChannel {
 
 static LedChannel ch[LED_MAX_CHANNELS];
 static int        channelCount = 1;
-static unsigned long ledKeepaliveMs = 150;   // 0 = aus; Keepalive-Intervall (in HW-Config einstellbar)
+static unsigned long ledKeepaliveMs = 0;     // 0 = aus (Default); nur im Debug-Modus einstellbar, wird in NVS persistiert
 
 static const int PIN_MIN = 0, PIN_MAX = 48;
 static const int CNT_MIN = 1, CNT_MAX = 300;
@@ -201,6 +203,47 @@ static inline void ledsUnlock() { if (ledsMutex) xSemaphoreGive(ledsMutex); }
 static Preferences ledPrefs;
 static WebServer  *ledServer = nullptr;
 
+// ── Debug-Log aus dem LED-Task ───────────────────────────────────────────────
+// dlog()/uartLogAdd() haengen an einem std::vector ohne eigenen Mutex. Der
+// LED-Task laeuft auf Kern 1, die Web-Endpunkte auf Kern 0 - ein direkter
+// dlog()-Aufruf von hier waere also ein Datenrennen auf dem Log-Vektor.
+// Darum werden Meldungen nur unter ledsLock() gepuffert und spaeter aus dem
+// Hauptloop (ledsUpdateState) ausgegeben.
+#define LED_LOG_QUEUE 16
+#define LED_LOG_LINE  72
+static char    ledLogQueue[LED_LOG_QUEUE][LED_LOG_LINE];
+static uint8_t ledLogHead = 0, ledLogTail = 0;
+
+static void ledLogPush(const char *fmt, ...) {
+  char buf[LED_LOG_LINE];
+  va_list ap; va_start(ap, fmt);
+  vsnprintf(buf, sizeof(buf), fmt, ap);
+  va_end(ap);
+  uint8_t next = (uint8_t)((ledLogHead + 1) % LED_LOG_QUEUE);
+  if (next == ledLogTail) ledLogTail = (uint8_t)((ledLogTail + 1) % LED_LOG_QUEUE);  // voll -> aeltesten verwerfen
+  strncpy(ledLogQueue[ledLogHead], buf, LED_LOG_LINE);
+  ledLogQueue[ledLogHead][LED_LOG_LINE - 1] = 0;
+  ledLogHead = next;
+}
+
+// Aus dem Hauptloop aufgerufen. Nimmt den Mutex NICHT blockierend: haelt der
+// LED-Task ihn gerade (z.B. waehrend der Blackout-Delays in ledsPullLow),
+// wird einfach beim naechsten Durchlauf geleert - der Loop stockt nie.
+static void ledsFlushLog() {
+  if (!ledsMutex) return;
+  if (xSemaphoreTake(ledsMutex, 0) != pdTRUE) return;
+  char lines[LED_LOG_QUEUE][LED_LOG_LINE];
+  int n = 0;
+  while (ledLogTail != ledLogHead && n < LED_LOG_QUEUE) {
+    strncpy(lines[n], ledLogQueue[ledLogTail], LED_LOG_LINE);
+    lines[n][LED_LOG_LINE - 1] = 0;
+    ledLogTail = (uint8_t)((ledLogTail + 1) % LED_LOG_QUEUE);
+    n++;
+  }
+  ledsUnlock();
+  for (int i = 0; i < n; i++) dlog("%s\n", lines[i]);
+}
+
 // ── FASTLED-Style Helper: Sanftes, organisches Ausfaden (Fade to Black) ────────
 static void fadePixel(Adafruit_NeoPixel *strip, int p, uint8_t fadeBy) {
   uint32_t col = strip->getPixelColor(p);
@@ -305,7 +348,7 @@ static void clampAll() { for (int i = 0; i < LED_MAX_CHANNELS; i++) clampChannel
 static void ledsLoadConfig() {
   ledPrefs.begin("leds", false);
   channelCount = ledPrefs.getInt("chcnt", 1);
-  ledKeepaliveMs = (unsigned long) ledPrefs.getInt("kams", 150);
+  ledKeepaliveMs = (unsigned long) ledPrefs.getInt("kams", 0);
   if (channelCount < 1) channelCount = 1;
   if (channelCount > LED_MAX_CHANNELS) channelCount = LED_MAX_CHANNELS;
 
@@ -454,7 +497,7 @@ static void initStripFor(int i) {
   // sonst klauen sich die NeoPixel-Objekte den RMT-Kanal ("not attached").
   for (int j = 0; j < i; j++) {
     if (ch[j].strip && ch[j].pin == c.pin) {
-      Serial.printf("LEDs ch%d: GPIO %d already used by ch%d -> no strip\n", i, c.pin, j);
+      ledLogPush("LEDs ch%d: GPIO %d already used by ch%d -> no strip", i, c.pin, j);
       return;
     }
   }
@@ -468,7 +511,7 @@ static void initStripFor(int i) {
   c.rbHue = 0;
   ledDirty[i] = false; ledForceShow[i] = false;
   c.pinLow = false;   // frischer Strip -> Pin wieder an RMT gebunden
-  Serial.printf("LEDs ch%d: init pin=%d count=%d\n", i, c.pin, c.count);
+  ledLogPush("LEDs ch%d: GPIO %d UP (RMT attached, count=%d)", i, c.pin, c.count);
 }
 
 // ── Eigenes Muster: Renderer + Animationen ───────────────────────────────────
@@ -906,6 +949,7 @@ static void ledsPullLow(int i) {
   digitalWrite(c.pin, LOW);
   c.pinLow = true;
   ledDirty[i] = false; ledForceShow[i] = false;
+  ledLogPush("LEDs ch%d: GPIO %d DOWN (blanked, data LOW, RMT released)", i, c.pin);
 }
 
 void ledsLoop(int32_t erpm) {
@@ -942,6 +986,7 @@ void ledsLoop(int32_t erpm) {
 void ledsUpdateState(bool enabled, int32_t erpm) {
   ledsEnabled    = enabled;
   ledsLatestErpm = erpm;
+  ledsFlushLog();   // laeuft im Hauptloop -> dlog() hier gefahrlos moeglich
 }
 
 static void ledsTaskFn(void *) {
@@ -1376,13 +1421,22 @@ static const char LEDS_PAGE_HTML[] PROGMEM = R"ledslit(
     .info-note{display:none;margin-top:7px;padding:7px 9px;border-left:2px solid var(--accent);border-radius:4px;background:rgba(77,163,255,.07);color:var(--text2);font-size:11px;line-height:1.4}
     body.show-info .info-note:not([data-relevant="0"]){display:block}
     .hwbtns{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+    .info-btn{position:fixed;top:12px;right:100px;padding:4px 10px;background:var(--bg2);border:1px solid var(--border);border-radius:4px;color:var(--text2);font-family:'Ndot47',system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;font-size:12px;cursor:pointer}
+    .info-btn:hover{border-color:var(--accent);color:var(--accent)}
+    .info-btn.on{border-color:var(--accent);color:var(--accent)}
+    .sechead{display:flex;justify-content:space-between;align-items:center;gap:8px;cursor:pointer;user-select:none;-webkit-tap-highlight-color:transparent}
+    .sechead h3{margin:0}
+    .sechead:hover .chev{color:var(--accent)}
+    .chev{color:var(--text2);font-size:20px;line-height:1;padding:2px 6px;flex:0 0 auto;transition:transform .15s ease}
+    .chev.closed{transform:rotate(-90deg)}
   </style>
 </head>
 <body>
+<button class="info-btn" onclick="toggleInfo()" id="btn-info" title="Info">i</button>
 <button class="theme-btn" onclick="toggleTheme()" id="themeBtn">&#9728;&#65039;</button>
 <button class="lang-btn" onclick="toggleLang()" id="langBtn">DE</button>
 <div class="wrap">
-  <h1>&#x1F6F4; VESC BLE/WiFi</h1>
+  <h1 id="appTitle">&#x1F6F4; VESC BLE/WiFi</h1>
   <div class="sub" id="statusBar">Loading...</div>
   <div class="tabs">
     <div class="tab" onclick="location.href='/?tab=info'">Info</div>
@@ -1393,13 +1447,14 @@ static const char LEDS_PAGE_HTML[] PROGMEM = R"ledslit(
   </div>
 
   <div class="section">
-    <h3 id="lbl-hw">Channels</h3>
-    <div id="hwrows"></div>
-    <div class="hwbtns">
-      <button class="btn" onclick="applyHw()" id="btn-hw">Apply hardware</button>
-      <button class="btn sm" onclick="toggleInfo()" id="btn-info">i</button>
+    <div class="sechead" onclick="toggleSec('hw')"><h3 id="lbl-hw">Channels</h3><span class="chev" id="hw_chev">&#9660;</span></div>
+    <div id="hw_body">
+      <div id="hwrows"></div>
+      <div class="hwbtns">
+        <button class="btn" onclick="applyHw()" id="btn-hw">Apply hardware</button>
+      </div>
+      <div class="msg" id="hwmsg"></div>
     </div>
-    <div class="msg" id="hwmsg"></div>
     <button id="bigOff" onclick="ledsBigToggle()" style="display:none;width:100%;padding:22px 12px;margin:14px 0 2px;font-size:30px;font-weight:800;letter-spacing:6px;color:#fff;background:linear-gradient(#d32f2f,#8e0000);border:2px solid #ff5a5a;border-radius:12px;box-shadow:0 4px 16px rgba(0,0,0,.3);cursor:pointer">AUS</button>
   </div>
 
@@ -1424,7 +1479,10 @@ try{infoVisible=localStorage.getItem('ledInfoVisible')==='1';}catch(e){}
 function applyInfoState(){
   if(document.body) document.body.classList.toggle('show-info',infoVisible);
   var b=gid('btn-info');
-  if(b){b.textContent=infoVisible?'i \u2713':'i';b.title=infoVisible?L('Hinweise ausblenden','Hide notes'):L('Hinweise einblenden','Show notes');}
+  if(b){
+    if(infoVisible)b.classList.add('on');else b.classList.remove('on');
+    b.title=infoVisible?L('Hinweise ausblenden','Hide notes'):L('Hinweise einblenden','Show notes');
+  }
 }
 function toggleInfo(){
   infoVisible=!infoVisible;
@@ -1454,6 +1512,9 @@ function gv(id){var e=gid(id);return e?e.value:0;}
 function setText(id,v){var e=gid(id);if(e)e.textContent=v;}
 function toHex(n){var h=(+n).toString(16);return h.length<2?'0'+h:h;}
 function rgbToHex(r,g,b){return '#'+toHex(r)+toHex(g)+toHex(b);}
+// Helligkeit: intern 0..255 (NeoPixel/NVS), in der Oberflaeche 0..100 %.
+function briPct(raw){var v=Math.round((+raw||0)*100/255);return v<0?0:(v>100?100:v);}
+function briRaw(pct){var v=Math.round((+pct||0)*255/100);return v<0?0:(v>255?255:v);}
 function pfx(idx){return idx<0?'sync':'ch'+idx;}
 function tgt(idx){return idx<0?'sync=1':'ch='+idx;}
 function targetQuery(idx){return tgt(idx);}
@@ -1483,6 +1544,43 @@ function load(){
 
 function render(){ renderHw(); renderControls(); updateBigOff(); }
 
+// ── Ein-/Ausklappbare Abschnitte ────────────────────────────────────────────
+// Der Zustand liegt nur im Browser (localStorage), nicht auf dem ESP.
+var secOpen={};
+// Ist mindestens ein Kanal mit GPIO eingerichtet?
+function hwConfigured(){
+  if(!cfg||!cfg.channels)return false;
+  for(var i=0;i<cfg.count;i++){var c=cfg.channels[i];if(c&&c.pin>=0)return true;}
+  return false;
+}
+function secIsOpen(key){
+  if(secOpen[key]===undefined){
+    var v=null;
+    try{v=localStorage.getItem('ledSec_'+key);}catch(e){}
+    // Ohne gespeicherte Wahl: Hardware nur aufgeklappt, solange nichts
+    // eingerichtet ist. Die Kanalsteuerungen starten immer offen.
+    if(v===null)secOpen[key]=(key==='hw')?!hwConfigured():true;
+    else secOpen[key]=(v==='1');
+  }
+  return secOpen[key];
+}
+function setSec(key,open){
+  secOpen[key]=!!open;
+  try{localStorage.setItem('ledSec_'+key,open?'1':'0');}catch(e){}
+  applySecState(key);
+}
+function applySecState(key){
+  var open=secIsOpen(key);
+  var body=gid(key+'_body'), chev=gid(key+'_chev');
+  if(body)body.style.display=open?'':'none';
+  if(chev){if(open)chev.classList.remove('closed');else chev.classList.add('closed');}
+}
+function toggleSec(key){
+  secOpen[key]=!secIsOpen(key);
+  try{localStorage.setItem('ledSec_'+key,secOpen[key]?'1':'0');}catch(e){}
+  applySecState(key);
+}
+
 function coOpts(sel){
   var names=['GRB','RGB','BRG','RBG','GBR','BGR'], o='';
   for(var k=0;k<names.length;k++) o+='<option value="'+k+'"'+((k===sel)?' selected':'')+'>'+names[k]+'</option>';
@@ -1495,7 +1593,7 @@ function renderHw(){
   h+='<button class="btn red sm" onclick="chCountDelta(-1)" '+(cfg.count<=1?'disabled':'')+'>&#8722;</button>';
   h+='<button class="btn green sm" onclick="chCountDelta(1)" '+(cfg.count>=4?'disabled':'')+'>+</button>';
   h+='</div>';
-  h+='<div class="chrow"><label>'+L('LED-Refresh (Keepalive)','LED refresh (keepalive)')+'</label><div style="display:flex;gap:8px;align-items:center;margin-top:4px"><input type="text" id="hwka" maxlength="4" value="'+(cfg.keepalive!==undefined?cfg.keepalive:150)+'" style="flex:1"><span style="color:var(--text2);font-size:12px">ms (0='+L('aus','off')+')</span></div><div style="color:var(--text2);font-size:11px;margin-top:4px">'+L('Sendet statische Frames (Aus/Feste Farbe) periodisch neu.','Periodically re-sends static frames (off/solid).')+'</div></div>';
+  h+='<div class="chrow" id="karow" style="display:none"><label>'+L('LED-Refresh (Keepalive)','LED refresh (keepalive)')+'</label><div style="display:flex;gap:8px;align-items:center;margin-top:4px"><input type="text" id="hwka" maxlength="4" value="'+(cfg.keepalive!==undefined?cfg.keepalive:0)+'" style="flex:1"><span style="color:var(--text2);font-size:12px">ms (0='+L('aus','off')+')</span></div><div style="color:var(--text2);font-size:11px;margin-top:4px">'+L('Nur fuer den Notfall. Sendet statische Frames (Aus/Feste Farbe) periodisch neu, um durch Stoerungen verfaelschte Pixel zu heilen. Standard 0 = aus. Der Wert bleibt nach einem Neustart erhalten.','Emergency use only. Periodically re-sends static frames (off/solid) to heal pixels corrupted by interference. Default 0 = off. The value is kept across a reboot.')+'</div></div>';
   for(var i=0;i<cfg.count;i++){
     var c=cfg.channels[i];
     h+='<div class="chrow">';
@@ -1513,6 +1611,8 @@ function renderHw(){
     h+='</div>';
   }
   gid('hwrows').innerHTML=h;
+  applyDebugState();
+  applySecState('hw');
 }
 
 function updateVis(idx) {
@@ -1564,13 +1664,15 @@ function renderControls(){
   }
   gid('controls').innerHTML=out;
 
-  if(synced.length>0) updateVis(-1);
-  for(var i=0;i<cfg.count;i++) if(!cfg.channels[i].synced) updateVis(i);
+  if(synced.length>0){ applySecState('sync'); updateVis(-1); }
+  for(var i=0;i<cfg.count;i++) if(!cfg.channels[i].synced){ applySecState('ch'+i); updateVis(i); }
 }
 
 function buildBlock(idx,title,s){
   var p=pfx(idx);
-  var h='<div class="section"><h3>'+title+'</h3>';
+  var h='<div class="section">';
+  h+='<div class="sechead" onclick="toggleSec(\''+p+'\')"><h3>'+title+'</h3><span class="chev" id="'+p+'_chev">&#9660;</span></div>';
+  h+='<div id="'+p+'_body">';
   h+='<label>'+L('Effekt','Effect')+'</label>';
   h+='<select id="'+p+'_eff" onchange="onEff('+idx+')">';
   h+='<option value="0"'+(s.effect==0?' selected':'')+'>'+L('Aus','Off')+'</option>';
@@ -1596,7 +1698,7 @@ function buildBlock(idx,title,s){
 
   h+='<div id="'+p+'_wrap_bri">';
   h+='<label style="margin-top:10px">'+L('Helligkeit','Brightness')+'</label>';
-  h+='<div class="rng-row"><span>&#9788;</span><input type="range" id="'+p+'_br" min="0" max="255" value="'+s.bright+'" oninput="onBri('+idx+')"><div class="rng-val" id="'+p+'_brv">'+s.bright+'</div></div>';
+  h+='<div class="rng-row"><span>&#9788;</span><input type="range" id="'+p+'_br" min="0" max="100" value="'+briPct(s.bright)+'" oninput="onBri('+idx+')"><div class="rng-val" id="'+p+'_brv">'+briPct(s.bright)+'%</div></div>';
   h+='</div>';
 
   h+='<div id="'+p+'_wrap_kr">';
@@ -1668,8 +1770,9 @@ function buildBlock(idx,title,s){
   h+='<div class="info-note">'+L('Farben können auch während einer Animation live geändert werden.','Colors can also be edited live while an animation is running.')+'</div>';
   h+='<div class="pixel-grid" id="'+p+'_pixels"><span style="color:var(--text2);font-size:11px">'+L('Lade LEDs...','Loading LEDs...')+'</span></div>';
   h+='</div>';
-  
-  h+='</div>';
+
+  h+='</div>';   // _body
+  h+='</div>';   // section
   return h;
 }
 
@@ -1953,10 +2056,10 @@ function onPick(idx){
   applyLocal(idx,function(c){c.r=r;c.g=g;c.b=b;});
 }
 function onBri(idx){
-  var p=pfx(idx),v=+gv(p+'_br');
-  setText(p+'_brv',v);
-  debSend('/api/led/bright?'+tgt(idx)+'&v='+v);
-  applyLocal(idx,function(c){c.bright=v;});
+  var p=pfx(idx),pct=+gv(p+'_br'),raw=briRaw(pct);
+  setText(p+'_brv',pct+'%');
+  debSend('/api/led/bright?'+tgt(idx)+'&v='+raw);
+  applyLocal(idx,function(c){c.bright=raw;});
 }
 function onSpd(idx){
   var p=pfx(idx),v=+gv(p+'_spd');
@@ -2029,23 +2132,69 @@ function applyHw(){
     }
     qs.push('p'+i+'='+pin+'&n'+i+'='+cnt+'&o'+i+'='+co);
   }
-  var ka=parseInt(gv('hwka')); if(isNaN(ka)||ka<0)ka=150; if(ka>5000)ka=5000;
+  var anyPin=false; for(var uk in usedPins){anyPin=true;break;}
+  // Keepalive: leeres Feld oder nicht sichtbar (Debug gesperrt) = 0 = aus.
+  var kaEl=gid('hwka');
+  var ka=kaEl?parseInt(kaEl.value):0;
+  if(isNaN(ka)||ka<0)ka=0; if(ka>5000)ka=5000;
   var msg=gid('hwmsg');
   fetch('/api/led/hw?'+qs.join('&')+'&ka='+ka,{method:'POST'}).then(function(r){
-    if(r.ok){msg.textContent=L('Übernommen','Applied');msg.className='msg ok';}
+    if(r.ok){
+      msg.textContent=L('Übernommen','Applied');msg.className='msg ok';
+      // Eingerichtet -> Konfiguration zuklappen, das schafft Platz fuer die LEDs.
+      if(anyPin)setSec('hw',false);
+    }
     else{msg.textContent='Error';msg.className='msg err';}
     setTimeout(function(){msg.className='msg';},2000);
     load();
   }).catch(function(){msg.textContent='Error';msg.className='msg err';});
 }
 
-// API-Tab nur anzeigen, wenn Debug freigeschaltet ist (serverseitiges RAM-Flag,
-// per 8x-Tippen auf den Titel der Hauptseite; gilt bis zum ESP-Neustart).
+// Debug-Freischaltung: serverseitiges RAM-Flag, per 8x-Tippen auf den Titel.
+// Gilt bis zum ESP-Neustart und schaltet hier den API-Tab sowie das
+// Keepalive-Notfallfeld frei.
+var dbgUnlocked=false;
+function applyDebugState(){
+  var el=gid('tab-api-link'); if(el)el.style.display=dbgUnlocked?'':'none';
+  var ka=gid('karow');        if(ka)ka.style.display=dbgUnlocked?'':'none';
+}
+function ledToast(msg){
+  var t=gid('ledToast');
+  if(!t){
+    t=document.createElement('div'); t.id='ledToast';
+    t.style.cssText='position:fixed;top:12px;left:50%;transform:translateX(-50%);padding:10px 18px;border-radius:6px;font-family:inherit;font-size:13px;z-index:9999;transition:opacity .3s;pointer-events:none;background:var(--bg3);border:1px solid var(--accent);color:var(--text)';
+    document.body.appendChild(t);
+  }
+  t.textContent=msg; t.style.opacity='1';
+  clearTimeout(t._h); t._h=setTimeout(function(){t.style.opacity='0';},3000);
+}
 function checkApiUnlock(){
   fetch('/api/debug/unlock',{cache:'no-store'}).then(function(r){return r.ok?r.json():null;}).then(function(j){
-    if(j&&j.unlocked){var el=document.getElementById('tab-api-link');if(el)el.style.display='';}
+    dbgUnlocked=!!(j&&j.unlocked); applyDebugState();
   }).catch(function(){});
 }
+function unlockDebug(){
+  fetch('/api/debug/unlock',{method:'POST'}).then(function(){
+    dbgUnlocked=true; applyDebugState();
+    ledToast(de()?'\uD83D\uDD13 Debug aktiv \u2013 bis Neustart':'\uD83D\uDD13 Debug active \u2013 until reboot');
+  }).catch(function(){});
+}
+// 8x auf die Ueberschrift tippen (Zaehler resettet nach 1,5s Pause).
+(function(){
+  var title=gid('appTitle'); if(!title) return;
+  var taps=0, timer=null;
+  title.addEventListener('click',function(){
+    if(dbgUnlocked) return;
+    taps++;
+    if(timer) clearTimeout(timer);
+    timer=setTimeout(function(){ taps=0; },1500);
+    if(taps>=8){
+      taps=0;
+      if(timer){ clearTimeout(timer); timer=null; }
+      unlockDebug();
+    }
+  });
+})();
 applyInfoState();
 checkApiUnlock();
 load();
@@ -2322,5 +2471,5 @@ void ledsSetup(WebServer *server) {
   ledServer->on("/api/led/pattern/delete", HTTP_POST, handlePatternDelete);
   ledServer->on("/api/led/pattern/alloff", HTTP_POST, handlePatternAllOff);
 
-  Serial.println("LEDs: multi-channel /leds page + API registered");
+  dlog("LEDs: multi-channel /leds page + API registered\n");
 }
