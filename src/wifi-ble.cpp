@@ -1805,7 +1805,41 @@ void wifiBleLoop() {
   // AP-Modus — und Auto darf dann auch OHNE STA-Netz abschalten.
   // Zugleich der "darf der AP ueberhaupt aus?"-Check: nur wenn konfiguriert UND
   // Auto-Modus. Sonst niemals.
-  bool apMayShutOff = cfg_configured && (cfg_ap_mode == 2);
+  // ── Ist die VESC-Verbindung weg? ──────────────────────────────────────────
+  // Der Rueckweg des Auto-Modus haengt vollstaendig an ERPM, und ERPM kommt
+  // ausschliesslich vom VESC. Antwortet der ueber UART nicht mehr, kann der
+  // AP per Bewegung NIE wieder zurueckkommen — man waere ausgesperrt, ohne
+  // dass irgendetwas am WLAN defekt waere. In diesem Zustand ist der AP
+  // deshalb bedingungslos an, unabhaengig vom eingestellten Modus.
+  //
+  // Die 60s sind bewusst grosszuegig: ein einzelner verpasster Poll oder eine
+  // kurze Unterbrechung soll den AP nicht sofort hochreissen. Der Zeitvergleich
+  // laeuft erst ab 60s Laufzeit, damit der Start nicht faelschlich als Ausfall
+  // gilt (lastUpdate ist bis zur ersten Antwort 0).
+  bool vescLinkLost = (millis() > 60000UL) &&
+                      (!vescStatus.connected ||
+                       (millis() - vescStatus.lastUpdate > 60000UL));
+
+  static bool vescLostLogged = false;
+  if (vescLinkLost) {
+    apWanted       = true;
+    apOffByTimeout = false;
+    if (!apActive) {
+      if (!vescLostLogged) {
+        dlog("AP safety: no VESC data for >60s -> AP forced on (wake by movement impossible)\n");
+        vescLostLogged = true;
+      }
+      if (WiFi.getMode() != WIFI_AP_STA) WiFi.mode(WIFI_AP_STA);
+      ensureAP(true);
+    }
+  } else if (vescLostLogged) {
+    dlog("AP safety: VESC data back -> normal AP mode again\n");
+    vescLostLogged = false;
+  }
+
+  // Abschalten im Auto-Modus ist nur erlaubt, wenn der Rueckweg auch traegt:
+  // Geraet eingerichtet, Auto gewaehlt UND der VESC liefert Daten.
+  bool apMayShutOff = cfg_configured && (cfg_ap_mode == 2) && !vescLinkLost;
   if (!cfg_configured) {
     apWanted       = true;
     apOffByTimeout = false;
@@ -2097,14 +2131,39 @@ void wifiBleLoop() {
   // Periodischer Zustands-Schnappschuss fuer den Log-Server
   logShipHeartbeat();
 
-  // Auto reboot
+  // ── Auto reboot ─────────────────────────────────────────────────────────────
+  // Die Wartezeit laeuft ab der LETZTEN Aktivitaet, nicht ab dem Boot. Jede
+  // Form von Nutzung frischt sie auf; erst danach beginnt die Uhr von vorn.
   if (cfg_autoreboot && cfg_autoreboot_time > 0) {
     static unsigned long lastConnected = millis();
+
     bool anyConnected = deviceConnected || (wifiClient && wifiClient.connected());
     if (!cfg_autoreboot_no_wifi && WiFi.status() == WL_CONNECTED) anyConnected = true;
     if (WiFi.softAPgetStationNum() > 0) anyConnected = true;
-    if (anyConnected) lastConnected = millis();
-    else if (millis() - lastConnected > (unsigned long)cfg_autoreboot_time * 1000UL) {
+    // Offene Weboberflaeche zaehlt ebenfalls als Nutzung. Fehlte bisher: wer
+    // ueber das Heimnetz auf der Seite arbeitet, waehrend "auch ohne WLAN"
+    // gesetzt ist, wurde nicht erkannt — der ESP startete ihm unter den
+    // Haenden weg. webUiActive() ist der /api/ping-Herzschlag der Seite.
+    if (webUiActive()) anyConnected = true;
+
+    // Leuchten gerade LEDs, wird der Neustart aufgeschoben. Ein Neustart
+    // reisst das Licht fuer mehrere Sekunden weg — das gehoert nicht in einen
+    // Moment, in dem die Beleuchtung offensichtlich gebraucht wird. Behandelt
+    // wie Aktivitaet: die Wartezeit beginnt erst NACH dem Ausschalten neu,
+    // damit der Neustart nicht in derselben Sekunde kommt, in der man die
+    // LEDs ausmacht.
+    bool ledsBusy = ledsAreOn();
+
+    static bool deferLogged = false;
+    if (anyConnected || ledsBusy) {
+      if (ledsBusy && !anyConnected && !deferLogged) {
+        dlog("Auto reboot: postponed, LEDs are on\n");
+        deferLogged = true;
+      }
+      if (!ledsBusy) deferLogged = false;
+      lastConnected = millis();
+    } else if (millis() - lastConnected > (unsigned long)cfg_autoreboot_time * 1000UL) {
+      deferLogged = false;
       Serial.println("Auto reboot: no client connected");
       bootDiagMarkPlannedRestart("Auto reboot: no client connected");
       ledsOff();

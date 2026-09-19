@@ -27,6 +27,12 @@ void ledsStartTask();
 // direkten ledsLoop()-Aufruf aus dem loop().
 void ledsUpdateState(bool enabled, int32_t erpm);
 
+// Meldet, ob gerade tatsaechlich LEDs leuchten: Steuerung aktiv UND mindestens
+// ein Kanal mit gueltigem Pin, einem Effekt ungleich "Aus" und Helligkeit > 0.
+// Gedacht fuer Aufrufer, die einen Neustart aufschieben wollen, solange Licht
+// brennt (z.B. der Auto-Reboot).
+bool ledsAreOn();
+
 // Schaltet ALLE LED-Kanaele hart aus (alle Pixel schwarz). Muss vor jedem
 // Neustart (ESP.restart) und vor einem OTA-Flash aufgerufen werden, damit die
 // LEDs nicht im letzten Frame haengen bleiben.

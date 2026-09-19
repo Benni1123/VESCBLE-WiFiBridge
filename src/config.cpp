@@ -120,6 +120,26 @@ void loadConfig() {
   if (cfg_ble_auto_off_sec > 3600)  cfg_ble_auto_off_sec = 3600;
   // Ohne Ziel-URL kann nichts gesendet werden -> Haken hat dann keine Wirkung.
   if (cfg_logship_url.isEmpty()) cfg_logship_enabled = false;
+
+  // ── Kein Heimnetz UND AP im Auto-Modus: Aufwecken MUSS funktionieren ──────
+  // Ohne STA ist der AP der einzige Zugang. Wer ihn trotzdem auf Auto stellt,
+  // laesst ihn sich abschalten — und dann haengt alles am Rueckweg ueber
+  // Bewegung. Der braucht frische ERPM-Werte: ohne Polling kein ERPM, ohne
+  // ERPM kein Aufwachen, und man kommt ohne Stromtrennung nicht mehr ins
+  // Geraet. Die dafuer noetigen Einstellungen werden deshalb erzwungen.
+  //
+  // Der MODUS selbst wird bewusst NICHT erzwungen: "An" ist die sicherere
+  // Wahl, die darf man jederzeit treffen. Erzwungen wird nur, was die
+  // gewaehlte Variante tragfaehig macht.
+  if (cfg_wifi.empty() && cfg_ap_mode == 2) {
+    cfg_vesc_poll         = true;   // ohne VESC-Daten gibt es kein ERPM
+    cfg_autopoll_enabled  = true;   // Polling auch ohne offene Weboberflaeche
+    cfg_autopoll_interval = 5;      // alle 5s, damit die Reaktion zuegig bleibt
+    cfg_ble_auto_erpm_on  = 20;     // niedrige Schwelle: Anschieben soll reichen
+    if (cfg_ap_timeout <= 0) cfg_ap_timeout = 120;
+    Serial.println("[CFG] no WiFi networks + AP auto -> VESC polling forced "
+                   "(poll=on, autopoll=5s, erpm=20)");
+  }
 }
 
 void saveConfig() {

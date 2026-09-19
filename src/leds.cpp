@@ -1013,6 +1013,20 @@ void ledsStartTask() {
   xTaskCreatePinnedToCore(ledsTaskFn, "ledsTask", 4096, nullptr, 1, &ledsTaskHandle, 1);
 }
 
+bool ledsAreOn() {
+  // Ohne aktive Steuerung kann nichts leuchten — dann gar nicht erst sperren.
+  if (!ledsEnabled) return false;
+  bool on = false;
+  ledsLock();
+  for (int i = 0; i < LED_MAX_CHANNELS; i++) {
+    // effect 0 heisst "Aus", pin < 0 heisst "Kanal nicht konfiguriert",
+    // bright 0 heisst dunkel trotz laufendem Effekt.
+    if (ch[i].pin >= 0 && ch[i].effect != 0 && ch[i].bright > 0) { on = true; break; }
+  }
+  ledsUnlock();
+  return on;
+}
+
 void ledsOff() {
   // Belt-and-suspenders: den Task SOFORT stoppen, nicht erst beim naechsten
   // vescLoop()-Sync. So kann zwischen "aus" und dem Clear kein einzelner
