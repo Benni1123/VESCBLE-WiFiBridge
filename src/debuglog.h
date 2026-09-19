@@ -15,7 +15,14 @@ const String &bootGetPlannedRestartReason();
 bool bootIsWatchdog();
 
 // Debug-/UART-Log
+// uartLogAdd()    : Zeile landet im UI-Ringpuffer UND im Log-Versandpuffer.
+//                   Fuer Ereignisse (WiFi/AP/BLE/Roaming/System).
+// uartLogAddRaw() : Zeile landet NUR im UI-Ringpuffer, nicht im Versand.
+//                   Fuer die Byte-Dumps der VESC-/BLE-/WiFi-Bruecke: die
+//                   fallen bei aktiver Verbindung im Sekundentakt an und
+//                   wuerden den Versandpuffer sofort ueberlaufen lassen.
 void uartLogAdd(const String &line);
+void uartLogAddRaw(const String &line);
 void dlog(const char *fmt, ...);
 String jsonEscapeDebug(String value);
 String bootStatusJson();

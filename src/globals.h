@@ -14,6 +14,7 @@
 #include <esp_system.h>        // esp_reset_reason()
 #include <esp_sleep.h>         // Deep-Sleep-Wakeup-Ursache
 #include <esp_attr.h>          // RTC_NOINIT_ATTR fuer geplante Neustart-Marker
+#include <esp_random.h>        // esp_random() fuer die Boot-ID des Log-Versands
 #include <NimBLEDevice.h>
 #include <WiFi.h>
 #include <esp_wifi.h>          // esp_wifi_set_config (Beacon-Intervall, AP-Feintuning)
@@ -112,6 +113,16 @@ int    cfg_ble_auto_off_sec   = 120;   // nach X Sekunden ohne Bewegung & Client
 bool   cfg_ble_full_power     = false;
 bool   cfg_leds_enabled       = false; // WS28XX LED-Steuerung aktiv (zeigt LED-Reiter + /leds)
 
+// ── Log-Versand an einen HTTP-Server ─────────────────────────────────────────
+// Die Einstellung ist nur im freigeschalteten API-Tab sichtbar (8x auf den
+// Titel tippen), der Wert selbst liegt aber im NVS und gilt dauerhaft — auch
+// nach einem Neustart und ohne aktiven Debug-Modus. Das ist Absicht: ein
+// WLAN-Aussetzer kuendigt sich nicht an, und wer den Mitschnitt erst danach
+// einschaltet, hat genau nichts im Puffer.
+bool   cfg_logship_enabled    = false;
+String cfg_logship_url;                // leer = aus
+String cfg_logship_token;              // optional, wird als "Authorization: Bearer ..." gesendet
+
 struct WiFiEntry {
   String ssid, pass;
   bool   staticIp = false;
@@ -190,6 +201,22 @@ static const unsigned long STA_SCAN_MIN_MS = 10000;   // 10 s (Start/nach Fund)
 static const unsigned long STA_SCAN_MAX_MS = 60000;   // 60 s (unterwegs)
 static unsigned long staScanInterval  = STA_SCAN_MIN_MS;
 
+// ── Schneller Wiedereinstieg nach einem Abbruch ──────────────────────────────
+// Bei schwachem Empfang reisst die Verbindung meist nicht ab, weil der AP weg
+// waere, sondern weil ein einzelner Handshake verloren ging. Der normale Weg
+// ueber Backoff (20s) plus Scan (5s) plus Verbindungsaufbau dauert dann eine
+// halbe Minute, obwohl derselbe AP noch da ist. Deshalb wird die zuletzt
+// erfolgreiche Assoziation gemerkt und nach einem Abbruch EINMAL sofort und
+// gezielt wieder angesteuert — ohne Scan, also auch ohne den AP zu stoeren.
+// Erst wenn das scheitert, greift der bisherige Weg.
+static String        staLastSsid;
+static uint8_t       staLastBssid[6]   = {0};
+static int32_t       staLastChannel    = 0;
+static bool          staLastValid      = false;   // gibt es ueberhaupt ein Ziel?
+static volatile bool staFastRetry      = false;   // Sofortversuch steht aus
+static uint8_t       staFastRetryFails = 0;       // begrenzt die Sofortversuche
+static const uint8_t STA_FAST_RETRY_MAX = 2;
+
 // Non-blocking STA-Verbindungsaufbau: statt bis zu 8s zu blockieren (in denen der
 // AP steht), wird die Verbindung angestossen und der Status in den folgenden
 // Loop-Durchlaeufen gepollt. Der AP laeuft dabei ununterbrochen weiter.
@@ -231,6 +258,36 @@ static unsigned long weakSince         = 0;     // seit wann RSSI unter Schwelle
 static bool          roamScanRunning   = false;
 static unsigned long roamScanStart     = 0;
 static unsigned long lastRoamSwitch    = 0;
+
+// Referenzwerte der AKTUELLEN Verbindung, eingefroren unmittelbar VOR dem
+// Roam-Scan.
+//
+// Hintergrund: WiFi.SSID(), WiFi.RSSI() und WiFi.BSSID() beziehen ihre Daten
+// alle aus demselben esp_wifi_sta_get_ap_info(). Schlaegt der Aufruf fehl,
+// liefern sie stillschweigend "" / 0 / NULL statt eines Fehlers. Genau nach
+// einem abgeschlossenen Scan ist der Treiberzustand aber am ehesten transient.
+// Wurden die Werte dort gelesen, war die Auswertung wertlos: mit leerer SSID
+// passt kein einziger Scan-Eintrag mehr (alle werden verworfen), und mit
+// RSSI 0 scheitert der Hysterese-Vergleich gegen JEDEN realen AP, weil ein
+// echter Pegel immer negativ ist. Beides sah von aussen wie "Roaming tut
+// nichts" aus. Deshalb werden die Werte jetzt in Phase A gesichert, wo der
+// RSSI ohnehin schon auf Plausibilitaet geprueft wurde.
+// Backoff, wenn ein Roam-Scan KEINEN besseren AP gefunden hat. Ohne das wurde
+// alle ~8s erneut gescannt, solange der Pegel unter der Schwelle lag — bei
+// dauerhaft schwachem Empfang also endlos. Ein Scan klappert alle Kanaele ab
+// und nimmt den SoftAP dabei von seinem Kanal: waehrenddessen ist das Geraet
+// weder ueber den AP noch zuverlaessig ueber das Heimnetz erreichbar. Findet
+// sich nichts Besseres, wird der Abstand deshalb stufenweise groesser.
+static const unsigned long ROAM_RETRY_MS[] = { 30000UL, 60000UL, 120000UL, 300000UL };
+static const uint8_t ROAM_RETRY_LAST =
+    (uint8_t)(sizeof(ROAM_RETRY_MS) / sizeof(ROAM_RETRY_MS[0]) - 1);
+static uint8_t       roamRetryStage   = 0;
+static unsigned long roamNextTry      = 0;   // 0 = keine Sperre aktiv
+
+static String        roamRefSsid;                // SSID zum Zeitpunkt des Scans
+static int           roamRefRssi       = 0;      // RSSI zum Zeitpunkt des Scans
+static uint8_t       roamRefBssid[6]   = {0};    // BSSID zum Zeitpunkt des Scans
+static bool          roamRefBssidValid = false;
 
 const size_t MAX_BUF         = 256;
 const size_t MAX_VESC_BUFFER = 1024;

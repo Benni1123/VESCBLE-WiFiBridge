@@ -7,6 +7,7 @@
 #include "config.h"
 #include "debuglog.h"
 #include "time-service.h"
+#include "logship.h"
 #include "wifi-ble.h"
 #include <NimBLEBondMigration.h>   // einmalige Bond-Konvertierung 1.x -> 2.x (vor init!)
 
@@ -152,17 +153,19 @@ class MyCallbacks : public NimBLECharacteristicCallbacks {
     // data()/length() funktionieren identisch, ohne Kopie in einen String.
     NimBLEAttValue rx = pCharacteristic->getValue();
     if (rx.length()>0 && pCharacteristic->getUUID().equals(pCharacteristicVescRx->getUUID())) {
-      if (cfg_debug && (cfg_debug_filter & 1)) { String h="BLE=>VESC: ";for(size_t i=0;i<rx.length();i++){char x[4];snprintf(x,4,"%02X ",(uint8_t)rx.data()[i]);h+=x;} uartLogAdd(h); }
+      // Byte-Dump: nur ins UI-Log, NICHT in den Log-Versand (Menge).
+      if (cfg_debug && (cfg_debug_filter & 1)) { String h="BLE=>VESC: ";for(size_t i=0;i<rx.length();i++){char x[4];snprintf(x,4,"%02X ",(uint8_t)rx.data()[i]);h+=x;} uartLogAddRaw(h); }
       Serial1.write((const uint8_t*)rx.data(), rx.length());
     }
   }
 };
 
 // ── WiFi Event Handler ────────────────────────────────────────────────────────
-// Schreibt WiFi-Events immer auf Serial und bei aktivem Debug-Modus zusätzlich
-// in den API/UI-Debuglog. Die Meldungen gehoeren zum WiFi-Filter (Bit 2), nicht
-// zum allgemeinen Status-Filter. Dadurch erscheinen AP-Connect/Disconnect usw.
-// im UI, sobald im Debug-Tab "WiFi" aktiviert ist.
+// Schreibt WiFi-Events immer auf Serial, IMMER in den Log-Versandpuffer und bei
+// aktivem Debug-Modus zusätzlich in den API/UI-Debuglog. Die Meldungen gehoeren
+// im UI zum WiFi-Filter (Bit 2), nicht zum allgemeinen Status-Filter. Der
+// Versand laeuft bewusst unabhaengig davon: genau diese Events braucht man nach
+// einem Aussetzer, und Debug erst hinterher einzuschalten hilft dann nicht mehr.
 static void wifiEventLog(const char *fmt, ...) {
   char msg[192];
   va_list args;
@@ -171,9 +174,10 @@ static void wifiEventLog(const char *fmt, ...) {
   va_end(args);
 
   Serial.println(msg);
+  logShipAdd(String(msg));
 
   if (!cfg_debug || !(cfg_debug_filter & 2)) return;
-  uartLogAdd(String(msg));
+  uartLogAddRaw(String(msg));
 }
 
 // Vollstaendige Klartext-Zuordnung fuer ESP-IDF wifi_err_reason_t.
@@ -266,6 +270,56 @@ String wifiDisconnectReasonsJson() {
   return json;
 }
 
+// ── Periodischer Zustands-Schnappschuss fuer den Log-Server ──────────────────
+// Eine Zeile alle 30 s mit genau den Werten, die man nach einem WLAN-Aussetzer
+// braucht: Funkzustand, RSSI, Kanal, AP-Clients, Speicher und Loop-Gesundheit.
+// Ohne diese Zeilen sieht man auf dem Server nur Ereignisse, aber nicht den
+// schleichenden Verlauf davor (z.B. langsam fallender RSSI, sinkender Heap).
+static void logShipHeartbeat() {
+  static unsigned long lastBeat = 0;
+  if (!cfg_logship_enabled) return;
+  if (millis() - lastBeat < 30000UL) return;
+  lastBeat = millis();
+
+  char line[272];   // groesser als LOGSHIP_LINE_MAX (256) in logship.cpp
+  bool staUp = (WiFi.status() == WL_CONNECTED);
+
+  // Letzte drei Oktette der BSSID: im Mesh haengen alle APs an derselben SSID,
+  // erst die BSSID zeigt, auf WELCHEM man gerade sitzt. Nur drei Oktette, damit
+  // die Zeile nicht ueber LOGSHIP_LINE_MAX waechst — die ersten drei sind bei
+  // Geraeten desselben Herstellers ohnehin identisch.
+  char bss[8] = "------";
+  if (staUp) {
+    uint8_t *b = WiFi.BSSID();
+    if (b) snprintf(bss, sizeof(bss), "%02X%02X%02X", b[3], b[4], b[5]);
+  }
+
+  snprintf(line, sizeof(line),
+           "[STAT] sta=%d ssid=%.24s bssid=%s rssi=%d ch=%d ap=%d apcl=%u ble=%d adv=%d "
+           "heap=%u minheap=%u maxblk=%u loopmax=%lums loops=%u "
+           "scans=%u staconn=%u stadisc=%u(%u) apwd=%u",
+           staUp ? 1 : 0,
+           staUp ? WiFi.SSID().c_str() : "-",
+           bss,
+           staUp ? (int)WiFi.RSSI() : 0,
+           (int)WiFi.channel(),
+           apActive ? 1 : 0,
+           (unsigned)WiFi.softAPgetStationNum(),
+           deviceConnected ? 1 : 0,
+           bleIsAdvertising ? 1 : 0,
+           (unsigned)ESP.getFreeHeap(),
+           (unsigned)(diagMinHeap == 0xFFFFFFFF ? 0 : diagMinHeap),
+           (unsigned)ESP.getMaxAllocHeap(),
+           (unsigned long)(diagMaxLoopUs / 1000UL),
+           (unsigned)diagLoopsPerSec,
+           (unsigned)diagScanCount,
+           (unsigned)diagStaConnects,
+           (unsigned)diagStaDisconnects,
+           (unsigned)diagLastDiscReason,
+           (unsigned)diagApWatchdogFires);
+  logShipAdd(String(line));
+}
+
 // Fängt alle relevanten WiFi-Events ab. Der entscheidende Punkt für deinen Bug:
 // bei STA_DISCONNECTED darf der AP NICHT mitsterben. Wir setzen den Mode hart
 // zurück und ziehen den AP sofort wieder hoch, falls er gefallen ist.
@@ -276,9 +330,24 @@ void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
       break;
 
     case ARDUINO_EVENT_WIFI_STA_GOT_IP:
-      wifiEventLog("[evt] STA got IP: %s", WiFi.localIP().toString().c_str());
+      wifiEventLog("[evt] STA got IP: %s (rssi %d dBm, ch %d)",
+                   WiFi.localIP().toString().c_str(), (int)WiFi.RSSI(), (int)WiFi.channel());
       diagStaConnects++;                    // Diagnose: erfolgreiche STA-Verbindung
       staWasConnected = true;
+      // Diese Assoziation hat funktioniert -> als Ziel fuer den schnellen
+      // Wiedereinstieg merken. Hier sind die Werte verlaesslich: die
+      // Verbindung steht gerade, esp_wifi_sta_get_ap_info() liefert also
+      // gueltige Daten (anders als direkt nach einem Scan).
+      {
+        uint8_t *b = WiFi.BSSID();
+        if (b) {
+          memcpy(staLastBssid, b, 6);
+          staLastSsid       = WiFi.SSID();
+          staLastChannel    = WiFi.channel();
+          staLastValid      = !staLastSsid.isEmpty();
+          staFastRetryFails = 0;
+        }
+      }
       // Kein ensureAP() hier (Reentranz vermeiden). Falls der STA-Connect den
       // AP-Channel verschoben hat, korrigiert der Watchdog im loop() das
       // zeitversetzt und ohne Event-Schleife.
@@ -295,6 +364,10 @@ void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
       }
       diagStaDisconnects++;                                 // Diagnose: Abbruch zaehlen
       diagLastDiscReason = info.wifi_sta_disconnected.reason;// Diagnose: Grund merken
+      // Sofortversuch anfordern. Nur ein Flag setzen — der eigentliche
+      // Verbindungsaufbau gehoert NICHT in den Event-Handler (Reentranz in
+      // den WLAN-Stack, genau wie beim AP weiter unten kommentiert).
+      if (staLastValid) staFastRetry = true;
       // WLAN ist weg -> der AP wird als Zugang wieder gebraucht, auch wenn ein
       // vorheriger AP-Timeout ihn abgeschaltet hatte. apWanted reaktivieren.
       // WICHTIG: hier KEIN ensureAP() aufrufen (Reentranz -> Event-Schleife).
@@ -339,6 +412,8 @@ void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
     case ARDUINO_EVENT_WIFI_AP_PROBEREQRECVED:
       // Ein Geraet funkt den AP an (Probe-Request). Zaehlen + RSSI merken.
       // Damit laesst sich unterscheiden: Handy erreicht den AP ueberhaupt?
+      // Bewusst NICHT geloggt: kommt im Sekundentakt und wuerde jeden Puffer
+      // fluten. Die Zaehler landen ueber den [STAT]-Schnappschuss im Log.
       diagProbeReqs++;
       diagLastProbeRssi = info.wifi_ap_probereqrecved.rssi;
       break;
@@ -453,6 +528,20 @@ static void tuneApDhcp() {
     return;
   }
 
+  // Lease-Zeit erst ABFRAGEN. Stimmt sie schon, wird der DHCP-Server gar
+  // nicht angefasst — ein Stop/Start kostet zwar keine Client-Verbindung,
+  // ist aber bei jeder Watchdog-Reparatur unnoetige Unruhe im laufenden AP.
+  uint32_t leaseMinutes = 120;
+  uint32_t leaseCur     = 0;
+  bool leaseOk = (esp_netif_dhcps_option(ap, ESP_NETIF_OP_GET,
+                                         ESP_NETIF_IP_ADDRESS_LEASE_TIME,
+                                         &leaseCur, sizeof(leaseCur)) == ESP_OK) &&
+                 (leaseCur == leaseMinutes);
+  if (leaseOk) {
+    dlog("AP tune: DHCP lease already %lumin -> untouched\n",
+         (unsigned long)leaseMinutes);
+  } else {
+
   // DHCP-Server stoppen (Pflicht, bevor Optionen gesetzt werden duerfen).
   esp_netif_dhcps_stop(ap);
 
@@ -463,7 +552,6 @@ static void tuneApDhcp() {
   // Eine lange Lease heisst: einmal IP holen, dann lange Ruhe -> deutlich weniger
   // DHCP-Verkehr und damit weniger Abbrueche. (Die Geschwindigkeit des ERSTEN
   // IP-Bezugs haengt nicht an der Lease-Dauer, sondern am Paketverlust selbst.)
-  uint32_t leaseMinutes = 120;
   esp_netif_dhcps_option(ap, ESP_NETIF_OP_SET, ESP_NETIF_IP_ADDRESS_LEASE_TIME,
                          &leaseMinutes, sizeof(leaseMinutes));
 
@@ -471,16 +559,29 @@ static void tuneApDhcp() {
   esp_err_t e = esp_netif_dhcps_start(ap);
   dlog("AP tune: DHCP lease=%lumin, dhcps_start=%d\n",
                 (unsigned long)leaseMinutes, (int)e);
+  }
 
   // Beacon-Intervall senken (Default 100ms). 100ms ist schon gut; wir setzen es
   // explizit, damit Clients den AP zuegig sehen. Niedriger = haeufiger Beacons
   // = schnelleres Finden, aber mehr Funklast. 100 ist ein guter Kompromiss.
+  // ── ACHTUNG: esp_wifi_set_config() startet einen LAUFENDEN AP neu ─────────
+  // Genau wie esp_wifi_set_protocol/-bandwidth weiter unten. Im Log war das
+  // als "[evt] AP stopped" / "[evt] AP started" direkt nach jedem AP-Start zu
+  // sehen — bei jeder Watchdog-Reparatur flog damit jeder verbundene Client
+  // raus, voellig ohne Grund: buildConfiguredApWifiConfig() setzt
+  // beacon_interval und max_connection bereits korrekt, bevor der Treiber
+  // ueberhaupt startet. Deshalb hier nur schreiben, wenn wirklich etwas
+  // abweicht.
   wifi_config_t conf;
   if (esp_wifi_get_config(WIFI_IF_AP, &conf) == ESP_OK) {
-    conf.ap.beacon_interval = 100;
+    bool needWrite = false;
+    if (conf.ap.beacon_interval != 100)  { conf.ap.beacon_interval = 100; needWrite = true; }
     // Mehr gleichzeitige Verbindungsversuche zulassen (Default oft niedrig).
-    if (conf.ap.max_connection < 4) conf.ap.max_connection = 4;
-    esp_wifi_set_config(WIFI_IF_AP, &conf);
+    if (conf.ap.max_connection < 4)      { conf.ap.max_connection  = 4;   needWrite = true; }
+    if (needWrite) {
+      dlog("AP tune: beacon/max_conn differ -> writing AP config (restarts AP once)\n");
+      esp_wifi_set_config(WIFI_IF_AP, &conf);
+    }
   }
 
   // WICHTIG: WiFi-Powersave NICHT auf WIFI_PS_NONE setzen! Auf dem ESP32-S3
@@ -765,9 +866,31 @@ static void staApplyIpConfig(const String &ssid) {
 // Einheitlicher STA-Verbindungsaufbau: erst IP-Config (static/DHCP), dann begin.
 // IMMER diesen Helfer statt WiFi.begin() direkt verwenden, damit die statische
 // IP in JEDEM Connect-Pfad (Boot, Reconnect, Roam) zuverlaessig greift.
-static void staBegin(const String &ssid, const String &pass) {
+//
+// bssid/channel: OPTIONAL, aber im Mesh entscheidend. Wird eine BSSID
+// uebergeben, setzt der Core conf.sta.bssid_set = 1 und der ESP assoziiert
+// GENAU mit diesem AP. Ohne BSSID sucht sich der IDF-Treiber selbst einen
+// aus — und zwar nach scan_method. Der Arduino-Core startet mit
+// _scanMethod(WIFI_FAST_SCAN): der Scan bricht beim ERSTEN passenden AP ab,
+// sort_method (BY_SIGNAL) wird dabei gar nicht ausgewertet und
+// threshold.rssi steht auf -127. Das Ergebnis ist der zuerst gesehene AP,
+// auch mit -91 dBm, obwohl drei staerkere derselben SSID in Reichweite sind.
+// Wer die BSSID aus einem Scan bereits kennt, soll sie deshalb hier auch
+// uebergeben, statt den Treiber erneut raten zu lassen.
+static void staBegin(const String &ssid, const String &pass,
+                     const uint8_t *bssid = nullptr, int32_t channel = 0) {
   staApplyIpConfig(ssid);
-  WiFi.begin(ssid.c_str(), pass.c_str());
+  if (bssid) {
+    char m[20];
+    snprintf(m, sizeof(m), "%02X:%02X:%02X:%02X:%02X:%02X",
+             bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5]);
+    dlog("WiFi: connecting pinned to %s (ch %d)\n", m, (int)channel);
+    // Der letzte Parameter (connect) muss true sein, sonst wird die Config nur
+    // gesetzt und nicht verbunden.
+    WiFi.begin(ssid.c_str(), pass.c_str(), channel, bssid, true);
+  } else {
+    WiFi.begin(ssid.c_str(), pass.c_str());
+  }
   esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT20);   // 20 MHz auch fuer STA (Stabilitaet)
 }
 
@@ -815,12 +938,41 @@ bool setupWiFiClient() {
   String csid = WiFi.SSID();
   for (auto &n : cfg_wifi) {
     if (n.ssid==csid && n.staticIp && n.ip.length()>0) {
+      // ── Erst pruefen, ob der Neuaufbau ueberhaupt noetig ist ──────────────
+      // Haeufiger Fall: im Router liegt fuer diese MAC eine feste Zuordnung,
+      // der DHCP-Server vergibt also ohnehin genau die konfigurierte Adresse.
+      // Dann waere der "saubere" Neuaufbau reine Selbstbeschaedigung: er wirft
+      // eine LAUFENDE Verbindung weg, und bei schwachem Empfang dauert es
+      // danach Minuten, sie zurueckzubekommen (im Log als Kette aus
+      // AUTH_FAIL / 4WAY_HANDSHAKE_TIMEOUT sichtbar). Stimmt die Adresse
+      // bereits, bleibt die Verbindung unangetastet.
+      if (WiFi.localIP().toString() == n.ip) {
+        dlog("WiFi: static IP %s already assigned by DHCP -> keeping connection\n",
+             n.ip.c_str());
+        break;
+      }
+
       // wifiMulti hat per DHCP verbunden. Static NACHtraeglich zu setzen ist
       // unzuverlaessig -> einmal sauber neu verbinden MIT config vor begin.
+      //
+      // WICHTIG: wifiMulti hat bereits gescannt und BSSID-gepinnt den
+      // STAERKSTEN AP genommen. Diesen AP hier festhalten und gezielt wieder
+      // auf ihn verbinden. Ohne das Pinning wuerde der Neuaufbau per
+      // FAST_SCAN auf einem beliebigen AP derselben SSID landen — bei einem
+      // Mesh ausgerechnet oft dem schwaechsten. Die statische IP haette man
+      // dann zwar, aber am falschen Zugangspunkt.
+      uint8_t curBssid[6];
+      bool    havePin = false;
+      int32_t curCh   = WiFi.channel();
+      uint8_t *cb = WiFi.BSSID();
+      if (cb) { memcpy(curBssid, cb, 6); havePin = true; }
+
       dlog("WiFi: static IP -> clean reconnect (config before begin)\n");
       WiFi.disconnect(false, false);
       delay(50);
-      staBegin(csid, n.pass);
+      staBegin(csid, n.pass,
+               havePin ? curBssid : nullptr,
+               havePin ? curCh : 0);
       unsigned long t0 = millis();
       while (WiFi.status() != WL_CONNECTED && millis() - t0 < 8000) delay(100);
       break;
@@ -1010,6 +1162,27 @@ void handleRoaming() {
 
   unsigned long now = millis();
 
+  // ── Kein Scan, solange jemand am AP haengt ────────────────────────────────
+  // Der Reconnect-Pfad setzt das schon lange so um; im Roaming fehlte es.
+  // Ein Scan huepft durch alle Kanaele und nimmt den SoftAP dabei von seinem
+  // Kanal — wer gerade per Handy auf der Weboberflaeche ist, verliert genau
+  // dann die Verbindung. Das ist der wichtigere Bedarf: ein laufender Zugriff
+  // schlaegt eine mogliche Verbesserung des Heimnetz-Empfangs.
+  if (WiFi.softAPgetStationNum() > 0) {
+    if (roamScanRunning) {                    // laufenden Scan einsammeln
+      if (WiFi.scanComplete() != WIFI_SCAN_RUNNING) {
+        WiFi.scanDelete();
+        roamScanRunning = false;
+      }
+    }
+    weakSince = 0;                            // Schwaeche-Timer neu beginnen
+    return;
+  }
+
+  // ── Backoff nach erfolglosem Scan ─────────────────────────────────────────
+  // Solange die Sperre laeuft, gar nicht erst in die RSSI-Pruefung gehen.
+  if (!roamScanRunning && roamNextTry != 0 && (long)(now - roamNextTry) < 0) return;
+
   // ── Phase A: RSSI ueberwachen ──
   if (!roamScanRunning) {
     if (now - lastRssiCheck < 3000) return;   // alle 3s pruefen
@@ -1017,8 +1190,12 @@ void handleRoaming() {
 
     int rssi = WiFi.RSSI();
     if (rssi >= cfg_roam_threshold || rssi == 0) {
-      // Signal ok (oder ungueltig) -> Timer zuruecksetzen
-      weakSince = 0;
+      // Signal ok (oder ungueltig) -> Timer zuruecksetzen. Auch das Backoff
+      // faellt zurueck: die Lage hat sich geaendert, beim naechsten Einbruch
+      // darf wieder zuegig gesucht werden.
+      weakSince      = 0;
+      roamRetryStage = 0;
+      roamNextTry    = 0;
       return;
     }
     // Signal zu schwach
@@ -1026,10 +1203,45 @@ void handleRoaming() {
     if (now - weakSince < 15000) return;      // erst nach 15s anhaltender Schwaeche
 
     // Schwelle laenger unterschritten -> Roam-Scan anstossen (ASYNC)
-    if (cfg_debug && (cfg_debug_filter & 2))
-      uartLogAdd("ROAM: RSSI "+String(rssi)+" dBm low -> scanning");
+
+    // Referenzwerte JETZT einfrieren, nicht erst nach dem Scan. Hier ist die
+    // Verbindung ruhig und der RSSI wurde oben bereits als plausibel (!= 0)
+    // geprueft. Nach dem Scan liefern SSID()/RSSI()/BSSID() unter Umstaenden
+    // ""/0/NULL, und damit waere die gesamte Auswertung wertlos.
+    roamRefSsid = WiFi.SSID();
+    roamRefRssi = rssi;
+    roamRefBssidValid = false;
+    {
+      uint8_t *cb = WiFi.BSSID();
+      if (cb) { memcpy(roamRefBssid, cb, 6); roamRefBssidValid = true; }
+    }
+    if (roamRefSsid.isEmpty()) {
+      // Ohne SSID laesst sich kein Scan-Eintrag zuordnen -> Scan waere sinnlos.
+      // Spaeter erneut versuchen, statt eine leere Auswertung zu fahren.
+      uartLogAdd("ROAM: current SSID unavailable -> retry later");
+      weakSince = 0;
+      return;
+    }
+
+    uartLogAdd("ROAM: RSSI "+String(rssi)+" dBm low -> scanning");
     Serial.printf("ROAM: weak signal %d dBm, scanning for better AP\n", rssi);
-    WiFi.scanNetworks(true, false);           // async, sichtbare Netze
+    // max_ms_per_chan = 120 statt des Defaults. Der Default liess den Scan
+    // rund 9 Sekunden dauern (im Log an den Zeitstempeln ablesbar) — neun
+    // Sekunden, in denen der SoftAP nicht erreichbar ist. 120 ms pro Kanal
+    // reichen, um einen AP zu sehen, der ohnehin staerker sein soll, und
+    // druecken den Scan auf etwa zwei Sekunden. Gleicher Wert wie im
+    // Netzwerk-Scan der Weboberflaeche, der sich dort bewaehrt hat.
+    int16_t started = WiFi.scanNetworks(true, false, false, 120);
+    if (started != WIFI_SCAN_RUNNING) {
+      // Scan nicht angelaufen (z.B. Treiber gerade beschaeftigt). Frueher wurde
+      // der Rueckgabewert ignoriert und roamScanRunning trotzdem gesetzt —
+      // Phase B bekam dann WIFI_SCAN_FAILED und meldete stur "kein besserer AP".
+      uartLogAdd("ROAM: scan did not start ("+String((int)started)+") -> retry later");
+      WiFi.scanDelete();
+      roamScanRunning = false;
+      weakSince = now - 15000UL + 5000UL;   // in ~5s erneut versuchen
+      return;
+    }
     roamScanRunning = true;
     roamScanStart   = now;
     return;
@@ -1045,16 +1257,27 @@ void handleRoaming() {
     return;
   }
 
-  // Scan fertig
-  String   curSsid  = WiFi.SSID();
-  int      curRssi  = WiFi.RSSI();
-  uint8_t *curBssid = WiFi.BSSID();           // MAC des aktuell verbundenen AP
+  // Scan fertig.
+  // BEWUSST die in Phase A eingefrorenen Referenzwerte verwenden und NICHT
+  // erneut WiFi.SSID()/RSSI()/BSSID() abfragen: siehe Begruendung bei den
+  // roamRef*-Variablen in globals.h.
+  const String  &curSsid  = roamRefSsid;
+  int            curRssi  = roamRefRssi;
+  const uint8_t *curBssid = roamRefBssidValid ? roamRefBssid : nullptr;
+
+  // Ist der aktuelle Pegel inzwischen wieder abfragbar und plausibel, den
+  // frischeren Wert nehmen — er beschreibt die Lage nach dem Scan genauer.
+  // Eine 0 wird verworfen, denn ein echter Pegel ist immer negativ.
+  int freshRssi = WiFi.RSSI();
+  if (freshRssi != 0) curRssi = freshRssi;
 
   int     bestIdx   = -1;
   int     bestRssi  = -127;
+  int     sameSsidSeen = 0;
   if (res > 0) {
     for (int i = 0; i < res; i++) {
       if (WiFi.SSID(i) != curSsid) continue;  // nur gleiche SSID
+      sameSsidSeen++;
       uint8_t *b = WiFi.BSSID(i);
       bool sameAsCurrent = (curBssid && b &&
         memcmp(b, curBssid, 6) == 0);
@@ -1063,6 +1286,43 @@ void handleRoaming() {
         bestRssi = WiFi.RSSI(i);
         bestIdx  = i;
       }
+    }
+  }
+
+  // Vollstaendige Scan-Tabelle ins Log. Ohne sie bleibt jede Roaming-Analyse
+  // Raterei: man sieht sonst nicht, ob die anderen APs ueberhaupt gefunden
+  // wurden, mit welchem Pegel, und wie der Vergleich ausgegangen ist.
+  {
+    char m[20] = "--:--:--";
+    if (curBssid) snprintf(m, sizeof(m), "%02X:%02X:%02X:%02X:%02X:%02X",
+                           curBssid[0],curBssid[1],curBssid[2],
+                           curBssid[3],curBssid[4],curBssid[5]);
+    // "best_alt" ist bewusst der beste ANDERE AP, nicht der beste ueberhaupt:
+    // der aktuelle wird oben per sameAsCurrent uebersprungen. Ohne diese
+    // Beschriftung liest man sonst "best=-91 dBm" neben "cur=-87 dBm" und
+    // haelt die Auswahl fuer kaputt, obwohl sie stimmt.
+    String head = "ROAM: scan res=" + String((int)res) + " ssid='" + curSsid +
+                  "' cur=" + m + " " + String(curRssi) + " dBm, same-ssid=" +
+                  String(sameSsidSeen);
+    if (bestIdx >= 0) {
+      head += ", best_alt=" + String(bestRssi) + " dBm (delta " +
+              String(bestRssi - curRssi) + ", need >=+" +
+              String(cfg_roam_hysteresis) + ")";
+    } else {
+      head += ", best_alt=none (kein anderer AP dieser SSID gefunden)";
+    }
+    uartLogAdd(head);
+
+    for (int i = 0; i < res && i < 12; i++) {
+      if (WiFi.SSID(i) != curSsid) continue;
+      uint8_t *b = WiFi.BSSID(i);
+      char bm[20] = "--:--:--";
+      if (b) snprintf(bm, sizeof(bm), "%02X:%02X:%02X:%02X:%02X:%02X",
+                      b[0],b[1],b[2],b[3],b[4],b[5]);
+      bool isCur = (curBssid && b && memcmp(b, curBssid, 6) == 0);
+      String tag = isCur ? "  (current)" : (i == bestIdx ? "  <= best alternative" : "");
+      uartLogAdd("ROAM:   "+String(bm)+" "+String((int)WiFi.RSSI(i))+" dBm ch "+
+                 String((int)WiFi.channel(i))+tag);
     }
   }
 
@@ -1080,7 +1340,7 @@ void handleRoaming() {
   if (doSwitch) {
     Serial.printf("ROAM: switching AP  cur=%d dBm -> new=%d dBm  (ch %d)\n",
                   curRssi, bestRssi, targetChannel);
-    if (cfg_debug && (cfg_debug_filter & 2)) {
+    {
       char m[32];
       snprintf(m, sizeof(m), "%02X:%02X:%02X:%02X:%02X:%02X",
                targetBssid[0],targetBssid[1],targetBssid[2],
@@ -1122,19 +1382,25 @@ void handleRoaming() {
       wifiMulti.run(8000);                    // Notfall: irgendeinen AP nehmen
     }
     lastRoamSwitch = millis();
+    roamRetryStage = 0;                       // Wechsel geglueckt -> Backoff zurueck
+    roamNextTry    = 0;
     ensureAP(false);                          // AP nach dem Wechsel absichern
     if (cfg_ble_mode == 1 || (cfg_ble_mode == 2 && bleIsAdvertising)) {
       NimBLEDevice::startAdvertising();
     }
   } else {
-    // Kein lohnender Wechsel gefunden.
-    if (cfg_debug && (cfg_debug_filter & 2))
-      uartLogAdd("ROAM: no better AP found");
+    // Kein lohnender Wechsel gefunden. Gestaffelt zurueckziehen statt in 8s
+    // erneut zu scannen: bei dauerhaft schwachem Empfang (und ohne besseren
+    // AP in Reichweite) war das eine Endlosschleife, die den Funk zur Haelfte
+    // mit Scannen belegt und das Geraet immer wieder unerreichbar gemacht hat.
+    // 30s -> 60s -> 120s -> 300s, danach bleibt es bei 300s.
     WiFi.scanDelete();
     roamScanRunning = false;
-    // weakSince NICHT zuruecksetzen: bei weiterhin schwachem Signal soll in
-    // 15s erneut gesucht werden (vielleicht ist man dann naeher am 2. AP).
-    weakSince = millis() - 15000 + 8000;      // naechster Versuch in ~8s
+    unsigned long wait = ROAM_RETRY_MS[roamRetryStage];
+    uartLogAdd("ROAM: no better AP found -> next scan in "+String(wait/1000)+"s");
+    if (roamRetryStage < ROAM_RETRY_LAST) roamRetryStage++;
+    roamNextTry = millis() + wait;
+    weakSince   = 0;    // Schwaeche-Timer beginnt nach Ablauf der Sperre neu
   }
 }
 
@@ -1165,6 +1431,7 @@ void handleWiFiReconnect() {
           break;
         }
       }
+      staFastRetryFails = 0;   // Verbindung steht -> Sofortversuche wieder frei
       dlog("WiFi connected: %s | IP: %s\n",
                     WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
       if (cfg_ble_mode == 1 || (cfg_ble_mode == 2 && bleIsAdvertising)) {
@@ -1221,6 +1488,38 @@ void handleWiFiReconnect() {
   // Verbindungs-Timeouts.
   staDownSince = 0;
 
+  // ── Sofortversuch: gezielt zurueck auf den zuletzt funktionierenden AP ────
+  // Steht VOR der Scan-Phase und vor dem Backoff. Kein Scan noetig, die BSSID
+  // ist bekannt — das spart die 20s Wartezeit plus 5s Scan und stoert den AP
+  // nicht, weil der Funk nicht durch alle Kanaele wandert.
+  // Begrenzt auf STA_FAST_RETRY_MAX Versuche: klappt es zweimal nicht, ist der
+  // AP vermutlich wirklich weg und der normale Weg mit Scan ist der richtige.
+  if (staFastRetry && !staConnecting && !scanInProgress) {
+    staFastRetry = false;
+    if (staLastValid && staFastRetryFails < STA_FAST_RETRY_MAX) {
+      String pass = "";
+      bool known = false;
+      for (auto &w : cfg_wifi) {
+        if (w.ssid == staLastSsid) { pass = w.pass; known = true; break; }
+      }
+      if (known) {
+        staFastRetryFails++;
+        char m[20];
+        snprintf(m, sizeof(m), "%02X:%02X:%02X:%02X:%02X:%02X",
+                 staLastBssid[0], staLastBssid[1], staLastBssid[2],
+                 staLastBssid[3], staLastBssid[4], staLastBssid[5]);
+        dlog("WiFi: fast retry %u/%u to last AP %s (ch %d), no scan\n",
+             (unsigned)staFastRetryFails, (unsigned)STA_FAST_RETRY_MAX,
+             m, (int)staLastChannel);
+        if (WiFi.getMode() != WIFI_AP_STA) WiFi.mode(WIFI_AP_STA);
+        staBegin(staLastSsid, pass, staLastBssid, staLastChannel);
+        staConnecting   = true;
+        staConnectStart = now;
+        return;
+      }
+    }
+  }
+
   // ── Phase VERBINDET: non-blocking Verbindungsaufbau laeuft -> Status pollen ─
   // Kein blockierendes Warten! Der AP wird waehrenddessen normal weiter bedient.
   if (staConnecting) {
@@ -1271,7 +1570,9 @@ void handleWiFiReconnect() {
     return;
   }
 
-  // Scan fertig: das STAERKSTE bekannte Netz aus den Ergebnissen suchen.
+  // Scan fertig: den STAERKSTEN bekannten AP aus den Ergebnissen suchen.
+  // Verglichen wird ueber ALLE Eintraege, also auch mehrere APs derselben
+  // SSID (Mesh/Repeater) — gewonnen hat schlicht der beste RSSI.
   int bestIdx = -1;
   int32_t bestRssi = -1000;
   if (res > 0) {
@@ -1285,7 +1586,18 @@ void handleWiFiReconnect() {
       }
     }
   }
-  String bestSsid = (bestIdx >= 0) ? WiFi.SSID(bestIdx) : String("");
+  String  bestSsid = (bestIdx >= 0) ? WiFi.SSID(bestIdx) : String("");
+  // BSSID und Kanal JETZT kopieren — WiFi.BSSID(i) zeigt direkt in den
+  // Scan-Record, den scanDelete() gleich freigibt. Ohne die Kopie waere der
+  // Zeiger danach ungueltig.
+  uint8_t bestBssid[6];
+  int32_t bestChannel  = 0;
+  bool    haveBestBssid = false;
+  if (bestIdx >= 0) {
+    uint8_t *b = WiFi.BSSID(bestIdx);
+    if (b) { memcpy(bestBssid, b, 6); haveBestBssid = true; }
+    bestChannel = WiFi.channel(bestIdx);
+  }
   WiFi.scanDelete();
   scanInProgress = false;
 
@@ -1308,9 +1620,25 @@ void handleWiFiReconnect() {
     if (w.ssid == bestSsid) { pass = w.pass; break; }
   }
   if (WiFi.getMode() != WIFI_AP_STA) WiFi.mode(WIFI_AP_STA);
-  dlog("WiFi: known network '%s' (RSSI %d) -> connecting (nonblocking)\n",
-                bestSsid.c_str(), (int)bestRssi);
-  staBegin(bestSsid, pass);   // IP-Config (static/DHCP) VOR begin, dann verbinden
+  dlog("WiFi: known network '%s' (RSSI %d, ch %d) -> connecting (nonblocking)\n",
+                bestSsid.c_str(), (int)bestRssi, (int)bestChannel);
+  // MIT BSSID verbinden. Frueher stand hier staBegin(bestSsid, pass) — der
+  // gerade ermittelte beste AP wurde damit weggeworfen und der Treiber suchte
+  // sich per FAST_SCAN selbst einen aus, gern den erstbesten mit -91 dBm.
+  // Genau das liess das Roaming wirkungslos aussehen: der Roam-Wechsel griff,
+  // aber der naechste Reconnect landete wieder auf dem schwachen AP.
+  // Nach einem fehlgeschlagenen Versuch das Pinning fallen lassen. Sonst
+  // klopft der ESP endlos an denselben AP, obwohl die Assoziation dort gerade
+  // nicht zustande kommt (Handshake-Timeouts bei schwachem Empfang). Ohne
+  // BSSID darf der Treiber selbst waehlen — dank ALL_CHANNEL_SCAN +
+  // BY_SIGNAL nimmt er dann den staerksten, nicht den erstbesten.
+  bool pin = haveBestBssid && (staConnectFails == 0);
+  if (haveBestBssid && !pin) {
+    dlog("WiFi: %d failed attempt(s) -> retrying without BSSID pin\n", staConnectFails);
+  }
+  staBegin(bestSsid, pass,
+           pin ? bestBssid : nullptr,
+           pin ? bestChannel : 0);
   staConnecting   = true;
   staConnectStart = now;
 }
@@ -1413,6 +1741,22 @@ void wifiBleSetup() {
   // Auto-Reconnect der IDF ausschalten — wir steuern Reconnect selbst und
   // kontrolliert, damit der AP dabei nie unbeabsichtigt fällt.
   WiFi.setAutoReconnect(false);
+
+  // ── Assoziation nach Signalstaerke statt "erstbester" ──────────────────────
+  // Der Arduino-Core startet mit _scanMethod(WIFI_FAST_SCAN). Dabei bricht der
+  // IDF-Scan beim ERSTEN passenden AP ab; sort_method (WIFI_CONNECT_AP_BY_SIGNAL)
+  // wird gar nicht ausgewertet, denn sortiert wird nur bei einem vollstaendigen
+  // Scan. Zusammen mit threshold.rssi = -127 (kein Mindestpegel) fuehrt das
+  // dazu, dass sich der ESP mit einem AP bei -91 dBm verbindet, obwohl drei
+  // deutlich naehere derselben SSID in Reichweite sind.
+  //
+  // ALL_CHANNEL_SCAN laesst den Treiber alle Kanaele durchsehen und BY_SIGNAL
+  // den staerksten davon nehmen. Das kostet beim Verbinden ein paar hundert
+  // Millisekunden mehr und ist das Sicherheitsnetz fuer alle Pfade, die ohne
+  // explizite BSSID verbinden. Die Pfade, die die BSSID aus einem eigenen Scan
+  // kennen (Reconnect, Roaming, wifiMulti), pinnen ohnehin zusaetzlich.
+  WiFi.setScanMethod(WIFI_ALL_CHANNEL_SCAN);
+  WiFi.setSortMethod(WIFI_CONNECT_AP_BY_SIGNAL);
   // AP-Konfiguration setzen, BEVOR der WiFi-Treiber das erste Beacon sendet.
   // Ein direktes WiFi.mode(WIFI_AP_STA) wuerde zuerst die Default-SSID
   // ESP_XXXX starten und WiFi.softAP() wuerde sie erst danach ersetzen.
@@ -1528,6 +1872,14 @@ void wifiBleLoop() {
       }
     }
 
+    // Ein aktiver Nutzer haelt den AP EBENFALLS wach — genau wie es
+    // handleBleMode() fuer BLE laengst macht. Fehlte hier: Wer per BLE oder
+    // VESC-Tool am Geraet arbeitet, bekam den AP nach 202 Sekunden unter den
+    // Fuessen weggezogen, obwohl er offensichtlich anwesend ist.
+    if (deviceConnected || (wifiClient && wifiClient.connected()) || webUiActive()) {
+      apLastClientGone = millis();
+    }
+
     // Referenzzeit fuer den Timeout:
     //  - wenn nie ein Client da war: ab AP-Start
     //  - wenn ein Client weg ist:    ab Trennung
@@ -1551,10 +1903,40 @@ void wifiBleLoop() {
   // AP-Rueckkehr bei Bewegung — 1:1 wie BT-Auto beim Aufwecken. Ist der AP per
   // Idle-Timeout aus und der Scooter faehrt wieder an (|ERPM| > Schwelle), wird
   // der AP wieder hochgezogen. WLAN/STA bleibt dabei unberuehrt.
-  if (apOffByTimeout && cfg_ap_mode == 2 && !apActive) {
+  // Bewusst NICHT an apOffByTimeout geknuepft: der AP soll zurueckkommen,
+  // egal WARUM er gerade aus ist — Idle-Timeout, fehlgeschlagener Start beim
+  // Boot, Eingriff des Watchdogs. Einzige Bedingungen: Auto-Modus und AP
+  // laeuft nicht. Sonst gaebe es weiterhin Zustaende, in denen eine bestehende
+  // BLE-Verbindung den AP nicht zurueckholt.
+  if (cfg_ap_mode == 2 && !apActive) {
     int32_t absErpm = vescStatus.erpm < 0 ? -vescStatus.erpm : vescStatus.erpm;
-    if (vescStatus.connected && absErpm > cfg_ble_auto_erpm_on) {
-      dlog("AP wake: movement (erpm=%d) -> AP back on\n", (int)vescStatus.erpm);
+
+    // ── Die Bewegungserkennung allein reicht als Rueckweg NICHT ─────────────
+    // pollVesc() steigt sofort aus, sobald ein BLE- oder TCP-Client verbunden
+    // ist (die Bruecke besitzt dann die UART). Dann wird vescStatus nicht mehr
+    // aufgefrischt, ERPM friert ein — und der AP kann per Bewegung NIE wieder
+    // zurueckkommen. Wer in dieser Lage kein Heimnetz hat, ist vollstaendig
+    // ausgesperrt, obwohl BLE einwandfrei laeuft. Am Rad drehen half nicht,
+    // weil die Drehung gar nicht mehr gemessen wurde.
+    //
+    // Zwei Rueckwege statt einem:
+    //   - Bewegung, aber nur mit NACHWEISLICH frischen VESC-Daten. Ein alter
+    //     ERPM-Wert aus der Zeit vor der BLE-Verbindung darf nicht zaehlen.
+    //   - Ein aktiver Client. Wer per BLE oder VESC-Tool dran ist, ist da —
+    //     und braucht den AP mit hoher Wahrscheinlichkeit gleich mit.
+    bool vescFresh = vescStatus.connected &&
+                     (millis() - vescStatus.lastUpdate < 10000UL);
+    bool moving    = vescFresh && (absErpm > cfg_ble_auto_erpm_on);
+    bool clientHere = deviceConnected ||
+                      (wifiClient && wifiClient.connected()) ||
+                      webUiActive();
+
+    if (moving || clientHere) {
+      if (moving) dlog("AP wake: movement (erpm=%d) -> AP back on\n", (int)vescStatus.erpm);
+      else        dlog("AP wake: client active (ble=%d tcp=%d web=%d) -> AP back on\n",
+                       deviceConnected ? 1 : 0,
+                       (wifiClient && wifiClient.connected()) ? 1 : 0,
+                       webUiActive() ? 1 : 0);
       // apWanted MUSS gesetzt werden, sobald ERPM ueber der Schwelle liegt —
       // damit halten auch Watchdog/Safety den AP ab jetzt am Leben.
       apWanted = true;
@@ -1623,7 +2005,51 @@ void wifiBleLoop() {
              apStartedByEvent ? 1 : 0,
              runningSsid.c_str(),
              apWatchdogFails);
+
+        // ── Laufenden Scan abbrechen ─────────────────────────────────────────
+        // Ein STA-Scan belegt den Funk und laesst softAP() scheitern. Solange
+        // der AP fehlt, hat er Vorrang: ohne AP gibt es keinen Notzugang, und
+        // ein besseres Heimnetz zu suchen nuetzt nichts, wenn man nicht mehr
+        // ans Geraet kommt. Ohne diesen Abbruch koennen sich Scan und
+        // AP-Start gegenseitig blockieren, und der Watchdog laeuft leer.
+        if (scanInProgress || roamScanRunning) {
+          WiFi.scanDelete();
+          scanInProgress  = false;
+          roamScanRunning = false;
+          dlog("AP reconcile: aborted running scan to free the radio\n");
+        }
+
         ensureAP(true);
+
+        // ── Eskalation ───────────────────────────────────────────────────────
+        // Der Watchdog laeuft alle 5s. Bisher versuchte er es unbegrenzt mit
+        // demselben Mittel weiter — haengt der WLAN-Treiber, hilft das nie.
+        // Deshalb zwei Stufen, beide erst NACH einem gescheiterten ensureAP().
+        if (apWatchdogFails == 6) {
+          // Nach rund 30s: kompletten WLAN-Stack neu aufsetzen. Gleiche
+          // Eskalation wie in setupAccessPoint(), nur zur Laufzeit.
+          dlog("AP reconcile: %d failures -> hard reset of WiFi stack\n", apWatchdogFails);
+          WiFi.disconnect(true, true);
+          WiFi.softAPdisconnect(true);
+          WiFi.mode(WIFI_OFF);
+          delay(500);
+          startApStaCleanFromOff(1);
+          delay(300);
+          ensureAP(true);
+          // wifiMulti hat seine Netze noch; handleWiFiReconnect verbindet neu.
+        } else if (apWatchdogFails >= 24 && WiFi.status() != WL_CONNECTED) {
+          // Nach rund 2 Minuten und OHNE Heimnetz ist das Geraet ueber gar
+          // keinen Weg mehr erreichbar. Ein Neustart ist dann besser als ein
+          // laufendes, aber unerreichbares Geraet — beim Boot kommt der AP
+          // erfahrungsgemaess hoch. Bewusst NUR ohne STA-Verbindung: besteht
+          // sie, ist man nicht ausgesperrt und ein Neustart waere unnoetig
+          // stoerend (er wuerde z.B. ein laufendes OTA abbrechen).
+          dlog("AP reconcile: AP unrecoverable for ~2min and no STA -> restarting\n");
+          bootDiagMarkPlannedRestart("AP unrecoverable, no STA - watchdog restart");
+          ledsOff();
+          delay(500);
+          ESP.restart();
+        }
       } else {
         apActive = true;
         isAPMode = true;
@@ -1667,6 +2093,9 @@ void wifiBleLoop() {
 
   // Advertising-Intervall an WLAN-Bedarf anpassen (Airtime sparen bei Idle)
   manageAdvInterval();
+
+  // Periodischer Zustands-Schnappschuss fuer den Log-Server
+  logShipHeartbeat();
 
   // Auto reboot
   if (cfg_autoreboot && cfg_autoreboot_time > 0) {

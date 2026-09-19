@@ -63,6 +63,11 @@ void loadConfig() {
   cfg_ble_auto_off_sec   = prefs.getInt ("ble_off_sec",      120);
   cfg_ble_full_power     = prefs.getBool("ble_fullpwr",      false);
   cfg_leds_enabled       = prefs.getBool("leds_en",          false);
+  // Log-Versand: bewusst unabhaengig von cfg_debug gespeichert und geladen.
+  cfg_logship_enabled    = prefs.getBool  ("lship_en",  false);
+  cfg_logship_url        = prefs.getString("lship_url", "");
+  cfg_logship_token      = prefs.getString("lship_tok", "");
+  cfg_logship_url.replace("\\/", "/");   // gleiche Escaping-Reparatur wie oben
   int count = prefs.getInt("wifi_count", 0);
   cfg_wifi.clear();
   for (int i = 0; i < count && i < MAX_WIFI_NETWORKS; i++) {
@@ -83,6 +88,17 @@ void loadConfig() {
   prefs.end();
   if (cfg_ble_name.isEmpty()) cfg_ble_name = DEFAULT_BLE_NAME;
   if (cfg_ap_ssid.isEmpty())  cfg_ap_ssid  = DEFAULT_AP_SSID;
+  // ── Unbrauchbares AP-Passwort entschaerfen ─────────────────────────────────
+  // WPA2 verlangt 8 bis 63 Zeichen. Steht etwas anderes im NVS — durch eine
+  // aeltere App, einen abgebrochenen Speichervorgang oder einen Tippfehler —
+  // schlaegt softAP() bei JEDEM Versuch fehl, und zwar dauerhaft. Der AP ist
+  // aber der Notzugang: lieber offen als gar nicht da. Ohne diese Korrektur
+  // waere das Geraet ohne Heimnetz nur noch per USB erreichbar.
+  if (cfg_ap_pass.length() > 0 && (cfg_ap_pass.length() < 8 || cfg_ap_pass.length() > 63)) {
+    Serial.printf("[CFG] AP password length %u invalid (WPA2 needs 8..63) -> AP set to open\n",
+                  (unsigned)cfg_ap_pass.length());
+    cfg_ap_pass = "";
+  }
   if (cfg_hostname.isEmpty()) cfg_hostname = DEFAULT_HOSTNAME;
   if (cfg_port <= 0 || cfg_port > 65535) cfg_port = VESC_TCP_PORT;
   if (cfg_rx_pin < 0 || cfg_rx_pin > 48) cfg_rx_pin = VESC_RX_PIN;
@@ -102,6 +118,8 @@ void loadConfig() {
   if (cfg_ble_auto_erpm_on > 50000) cfg_ble_auto_erpm_on = 50000;
   if (cfg_ble_auto_off_sec < 5)     cfg_ble_auto_off_sec = 5;
   if (cfg_ble_auto_off_sec > 3600)  cfg_ble_auto_off_sec = 3600;
+  // Ohne Ziel-URL kann nichts gesendet werden -> Haken hat dann keine Wirkung.
+  if (cfg_logship_url.isEmpty()) cfg_logship_enabled = false;
 }
 
 void saveConfig() {
@@ -138,6 +156,9 @@ void saveConfig() {
   prefs.putInt   ("ble_off_sec", cfg_ble_auto_off_sec);
   prefs.putBool  ("ble_fullpwr", cfg_ble_full_power);
   prefs.putBool  ("leds_en",     cfg_leds_enabled);
+  prefs.putBool  ("lship_en",    cfg_logship_enabled);
+  prefs.putString("lship_url",   cfg_logship_url);
+  prefs.putString("lship_tok",   cfg_logship_token);
   prefs.putInt   ("wifi_count",  cfg_wifi.size());
   for (int i = 0; i < (int)cfg_wifi.size(); i++) {
     prefs.putString(("wssid"  +String(i)).c_str(), cfg_wifi[i].ssid);

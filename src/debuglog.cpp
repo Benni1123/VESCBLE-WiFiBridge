@@ -6,6 +6,12 @@
 #include "globals.h"
 #include "debuglog.h"
 #include "time-service.h"
+#include "logship.h"
+
+// Fuer den Mutex um den uartLog-Vector. globals.h bringt nur FreeRTOS.h und
+// task.h mit; semphr.h zieht logship.cpp zwar ebenfalls herein, steht im
+// Unity-Build aber NACH dieser Datei — hier also selbst einbinden.
+#include <freertos/semphr.h>
 
 
 #ifndef RTC_NOINIT_ATTR
@@ -14,6 +20,29 @@
 
 // ── UART-Log ──────────────────────────────────────────────────────────────────
 static std::vector<String> uartLog;
+
+// Dieser Vector wird aus MEHREREN Tasks auf BEIDEN Kernen angefasst:
+// dem WiFi-Event-Task (wifiEventLog / dlog aus onWiFiEvent), dem LED-Task auf
+// Kern 1, dem Haupt-Loop und den Webserver-Handlern (uartLogJson liest ihn,
+// uartLogClear leert ihn).
+//
+// Ohne Sperre ist das Heap-Korruption mit Ansage: push_back kann den Speicher
+// neu allokieren und erase(begin()) verschiebt saemtliche Elemente, waehrend
+// ein anderer Kern gerade darueber iteriert. Das Ergebnis ist ein
+// PANIC_EXCEPTION bei voellig unauffaelligem Heap und normaler Loop-Zeit —
+// also ohne jeden Hinweis auf die eigentliche Ursache.
+//
+// Greift nur bei aktivem Debug-Modus, weil uartLogAddRaw() sonst sofort
+// zurueckkehrt. Das erklaert, warum der Fehler lange schlummern kann.
+static SemaphoreHandle_t uartLogMutex = nullptr;
+
+static inline void uartLogLock() {
+  if (!uartLogMutex) uartLogMutex = xSemaphoreCreateMutex();
+  if (uartLogMutex) xSemaphoreTake(uartLogMutex, portMAX_DELAY);
+}
+static inline void uartLogUnlock() {
+  if (uartLogMutex) xSemaphoreGive(uartLogMutex);
+}
 
 static String logSanitize(String line) {
   // uartLog wird 1:1 in ein JSON-Array eingebettet. Zeichen entschaerfen,
@@ -25,12 +54,28 @@ static String logSanitize(String line) {
   return line;
 }
 
-void uartLogAdd(const String &line) {
+// Schreibt NUR in den UI-Ringpuffer. Fuer Byte-Dumps der Bruecke gedacht, die
+// nicht an den Log-Server gehen sollen (Menge).
+void uartLogAddRaw(const String &line) {
   if (!cfg_debug) return;
   String clean = logSanitize(line);
   if (clean.isEmpty()) return;
-  uartLog.push_back(timeServiceLogStamp() + " " + clean);
+  // Zeitstempel VOR der Sperre bilden: timeServiceLogStamp() macht Datums-
+  // und Stringarbeit, die nicht in den kritischen Abschnitt gehoert.
+  String entry = timeServiceLogStamp() + " " + clean;
+
+  uartLogLock();
+  uartLog.push_back(entry);
   while ((int)uartLog.size() > cfg_log_size) uartLog.erase(uartLog.begin());
+  uartLogUnlock();
+}
+
+// Ereigniszeile: UI-Ringpuffer (nur bei Debug) UND Versandpuffer (immer).
+// Der Versand muss unabhaengig von cfg_debug laufen — ein WLAN-Aussetzer
+// kuendigt sich nicht an, und Debug erst hinterher einzuschalten hilft nicht.
+void uartLogAdd(const String &line) {
+  logShipAdd(line);
+  uartLogAddRaw(line);
 }
 
 // ── Geplanter Neustart: Grund ueber den Reset hinweg behalten ─────────────────
@@ -168,6 +213,9 @@ static void bootDiagAdd(const String &message) {
   String line = "[BOOT] " + message;
   bootDiagnosticLines.push_back(line);
   Serial.println(line);
+  // Bootdiagnose geht IMMER an den Log-Server: Resetgrund, Brownout, Panic und
+  // Watchdog sind genau die Information, die nach einem Aussetzer zaehlt.
+  logShipAdd(line);
 }
 
 void captureBootDiagnostics() {
@@ -281,15 +329,22 @@ String uartLogJson() {
     // Boot-/Resetdiagnose ist absichtlich nicht Teil des begrenzten Ringpuffers.
     // 0s wird nach einer Zeitsynchronisierung auf die ungefaehre Bootzeit
     // zurueckgerechnet; ohne gueltige Uhr bleibt weiterhin "0s" sichtbar.
+    // bootDiagnosticLines wird nur beim Start geschrieben und braucht keine
+    // Sperre; uartLog dagegen schon — waehrend dieser Schleife darf kein
+    // anderer Task den Vector umbauen.
     for (const String &line : bootDiagnosticLines) appendLine("0s " + line);
+    uartLogLock();
     for (const String &line : uartLog) appendLine(line);
+    uartLogUnlock();
   }
   json += "]";
   return json;
 }
 
 void uartLogClear() {
+  uartLogLock();
   uartLog.clear();
+  uartLogUnlock();
 }
 
 String bootStatusJson() {
@@ -308,9 +363,10 @@ String bootStatusJson() {
   return json;
 }
 
-// dlog(): BT/WLAN-Statusmeldungen. Gibt IMMER auf Serial aus (wie bisher) und
-// schreibt zusaetzlich ins UART-Log auf dem API-Tab, wenn der Debug-Modus an
-// ist und der "Status"-Filter (Bit 8) gesetzt ist.
+// dlog(): BT/WLAN-Statusmeldungen. Gibt IMMER auf Serial aus (wie bisher),
+// geht IMMER in den Log-Versandpuffer und schreibt zusaetzlich ins UART-Log
+// auf dem API-Tab, wenn der Debug-Modus an ist und der "Status"-Filter
+// (Bit 8) gesetzt ist.
 void dlog(const char *fmt, ...) {
   char buf[200];
   va_list args;
@@ -318,11 +374,12 @@ void dlog(const char *fmt, ...) {
   vsnprintf(buf, sizeof(buf), fmt, args);
   va_end(args);
   Serial.print(buf);                                   // Serial IMMER
-  if (!cfg_debug || !(cfg_debug_filter & 8)) return;   // UI nur bei Debug+Status
   size_t len = strlen(buf);
   while (len && (buf[len-1] == '\n' || buf[len-1] == '\r')) buf[--len] = 0;
   if (!len) return;
-  uartLogAdd(String(buf));
+  logShipAdd(String(buf));                             // Versand IMMER
+  if (!cfg_debug || !(cfg_debug_filter & 8)) return;   // UI nur bei Debug+Status
+  uartLogAddRaw(String(buf));
 }
 
 #endif // VESC_BRIDGE_UNITY_BUILD

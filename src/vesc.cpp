@@ -77,6 +77,10 @@ static bool          vescPollWaiting  = false;   // warten wir gerade auf Antwor
 static unsigned long vescPollSentAt   = 0;       // wann wurde die Anfrage gesendet?
 static const unsigned long VESC_POLL_RESP_TIMEOUT_MS = 100;
 
+// VESC-Verbindungsabrisse sind ein ECHTES Ereignis und gehoeren in den
+// Log-Versand — anders als die Byte-Dumps, die nur im UI-Log landen.
+static bool vescWasConnected = false;
+
 bool webUiActive() {
   return (millis() - lastBrowserPing < 5000);
 }
@@ -102,17 +106,24 @@ void pollVesc() {
     // Auswertung (identisch zur frueheren blockierenden Version).
     if (vescPollBuffer.size() > 5 && vescPollBuffer[0] == 0x02 && vescPollBuffer.back() == 0x03) {
       uint8_t plen = vescPollBuffer[1];
-      if (cfg_debug && (cfg_debug_filter & 4)) { String h="POLL<=VESC: ";for(size_t i=0;i<min(vescPollBuffer.size(),(size_t)40);i++){char x[4];snprintf(x,4,"%02X ",(uint8_t)vescPollBuffer[i]);h+=x;} uartLogAdd(h); }
+      if (cfg_debug && (cfg_debug_filter & 4)) { String h="POLL<=VESC: ";for(size_t i=0;i<min(vescPollBuffer.size(),(size_t)40);i++){char x[4];snprintf(x,4,"%02X ",(uint8_t)vescPollBuffer[i]);h+=x;} uartLogAddRaw(h); }
       if (vescPollBuffer.size() >= (size_t)(plen + 4)) {
         parseGetValues((const uint8_t*)vescPollBuffer.data() + 2, plen);
       }
     } else {
-      if (cfg_debug && (cfg_debug_filter & 4)) uartLogAdd("POLL<=VESC: no response ("+String(vescPollBuffer.size())+" bytes)");
+      if (cfg_debug && (cfg_debug_filter & 4)) uartLogAddRaw("POLL<=VESC: no response ("+String(vescPollBuffer.size())+" bytes)");
       if (now - vescStatus.lastUpdate > 6000) {
         vescStatus.connected = false;
       }
     }
     vescPollWaiting = false;   // Zyklus abgeschlossen
+
+    // Flanke melden: verbunden <-> weg. Genau einmal pro Wechsel, damit der
+    // Log-Server den Zeitpunkt sieht, ohne mit Poll-Zeilen geflutet zu werden.
+    if (vescStatus.connected != vescWasConnected) {
+      vescWasConnected = vescStatus.connected;
+      dlog("VESC %s\n", vescStatus.connected ? "connected" : "lost (no valid response)");
+    }
     return;
   }
 
@@ -134,7 +145,7 @@ void pollVesc() {
 
   // Anfrage senden und in die Antwort-Phase wechseln (KEIN blockierendes Warten).
   Serial1.write(VESC_GET_VALUES_PKT, sizeof(VESC_GET_VALUES_PKT));
-  if (cfg_debug && (cfg_debug_filter & 4)) uartLogAdd("POLL=>VESC: 02 01 04 40 84 03");
+  if (cfg_debug && (cfg_debug_filter & 4)) uartLogAddRaw("POLL=>VESC: 02 01 04 40 84 03");
   vescPollBuffer.clear();
   vescPollSentAt  = now;
   vescPollWaiting = true;
@@ -183,7 +194,7 @@ void vescLoop() {
     if (avail > 0) {
       size_t len = wifiClient.readBytes(buf, min(avail, MAX_BUF));
       if (len > 0) {
-        if (cfg_debug && (cfg_debug_filter & 2)) { String h="WiFi=>VESC: ";for(size_t i=0;i<len;i++){char x[4];snprintf(x,4,"%02X ",buf[i]);h+=x;} uartLogAdd(h); }
+        if (cfg_debug && (cfg_debug_filter & 2)) { String h="WiFi=>VESC: ";for(size_t i=0;i<len;i++){char x[4];snprintf(x,4,"%02X ",buf[i]);h+=x;} uartLogAddRaw(h); }
         dlog("WiFi => VESC: %d bytes\n", len);
         Serial1.write(buf, len);
       }
@@ -200,7 +211,7 @@ void vescLoop() {
       }
     }
     if (vescBuffer.length() > 0) {
-      if (cfg_debug && (cfg_debug_filter & 2)) { String h="VESC=>: ";for(size_t i=0;i<min(vescBuffer.length(),(size_t)40);i++){char x[4];snprintf(x,4,"%02X ",(uint8_t)vescBuffer[i]);h+=x;} uartLogAdd(h); }
+      if (cfg_debug && (cfg_debug_filter & 2)) { String h="VESC=>: ";for(size_t i=0;i<min(vescBuffer.length(),(size_t)40);i++){char x[4];snprintf(x,4,"%02X ",(uint8_t)vescBuffer[i]);h+=x;} uartLogAddRaw(h); }
       if (deviceConnected) {
         std::string tmp = vescBuffer;
         while (tmp.length() > 0) {

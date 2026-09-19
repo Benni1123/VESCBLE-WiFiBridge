@@ -3,6 +3,7 @@
 #include "config.h"
 #include "debuglog.h"
 #include "time-service.h"
+#include "logship.h"
 #include "wifi-ble.h"
 #include "vesc.h"
 #include "webui.h"
@@ -13,6 +14,7 @@
 #include "config.cpp"
 #include "debuglog.cpp"
 #include "time-service.cpp"
+#include "logship.cpp"
 #include "wifi-ble.cpp"
 #include "vesc.cpp"
 #include "webui.cpp"
@@ -32,6 +34,12 @@ void setup() {
   Serial.println("\n=== VESC BLE/WiFi Bridge ===");
 
   loadConfig();
+
+  // Log-Sendepuffer VOR der Bootdiagnose anlegen: Resetgrund, Brownout, Panic
+  // und Watchdog sind genau die Zeilen, die nach einem Aussetzer zaehlen. Wird
+  // der Puffer erst spaeter angelegt, gehen sie verloren.
+  logShipSetup();
+
   captureBootDiagnostics();
   dlog("BLE Name: %s | WiFi networks: %d\n", cfg_ble_name.c_str(), cfg_wifi.size());
   Serial.printf("Free heap: %d bytes\n", ESP.getFreeHeap());
@@ -41,6 +49,10 @@ void setup() {
   timeServiceSetup();
   webUiSetup();
   vescTcpSetup();
+
+  // Sende-Task erst starten, wenn WiFi steht — vorher gibt es ohnehin nichts
+  // zu senden, und der Puffer haelt alles bis dahin fest.
+  logShipStartTask();
 
   // Advertising nur (re-)starten wenn der Modus es zulaesst
   if (cfg_ble_mode != 0) NimBLEDevice::startAdvertising();

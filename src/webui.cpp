@@ -10,6 +10,7 @@
 #include "wifi-ble.h"
 #include "vesc.h"
 #include "webui.h"
+#include "logship.h"
 
 
 // ── Static assets (Font + CSS, ausgelagert fuer Mehrfachnutzung) ──────────────
@@ -484,9 +485,13 @@ static const char PAGE_HTML[] PROGMEM = R"rawliteral(
       <div class="ep"><span class="method get">GET</span><a class="path" href="/api/boot/status" target="_blank">/api/boot/status</a><div class="desc">Last boot/reset reason, watchdog, panic and brownout status</div></div>
       <div class="ep"><span class="method get">GET</span><a class="path" href="/api/time" target="_blank">/api/time</a><div class="desc">Current clock, sync source and NTP status</div></div>
       <div class="ep"><span class="method get">GET</span><a class="path" href="/api/ping" target="_blank">/api/ping</a><div class="desc">Keepalive — activates VESC polling</div></div>
+      <div class="ep"><span class="method get">GET</span><a class="path" href="/api/logship" target="_blank">/api/logship</a><div class="desc">Log upload state: buffered lines, dropped, sent, last HTTP code</div></div>
       <div class="api-h2">POST</div>
       <div class="ep"><span class="method post">POST</span><span class="path">/api/config</span><div class="desc">Save config and restart (JSON body)</div></div>
       <div class="ep"><span class="method post">POST</span><span class="path">/api/uart/clear</span><div class="desc">Clear UART debug log</div></div>
+      <div class="ep"><span class="method post">POST</span><span class="path">/api/logship</span><div class="desc">Save log upload settings (enabled, url, token) &mdash; takes effect immediately, no restart</div></div>
+      <div class="ep"><span class="method post">POST</span><span class="path">/api/logship/test</span><div class="desc">Queue a test line and force an immediate send</div></div>
+      <div class="ep"><span class="method post">POST</span><span class="path">/api/logship/clear</span><div class="desc">Discard all buffered log lines</div></div>
       <div class="ep"><span class="method post">POST</span><span class="path">/api/update/install</span><div class="desc">Download and flash from update_url</div></div>
       <div class="ep"><span class="method post">POST</span><span class="path">/api/ap/start</span><div class="desc">Manually start or repair the access point (debug test)</div></div>
       <div class="ep"><span class="method post">POST</span><span class="path">/api/time?epoch=...&amp;source=app</span><div class="desc">Set Unix time; source may be supplied as query parameter or JSON field</div></div>
@@ -522,6 +527,28 @@ static const char PAGE_HTML[] PROGMEM = R"rawliteral(
           </div>
           <div id="uartLog" style="background:var(--bg3);border:1px solid var(--border2);border-radius:4px;padding:8px;font-size:11px;max-height:300px;overflow-y:auto;color:var(--text2)">-</div>
         </div>
+      </div>
+
+      <div class="api-h2" style="margin-top:16px" id="lbl-lship-title">Log Upload</div>
+      <div class="section" style="padding:12px">
+        <div id="lbl-lship-note" style="margin-bottom:10px;font-size:11px;color:var(--text3)">Buffers all event logs (boot/reset diagnostics, WiFi and AP events with disconnect reasons, BLE, roaming, VESC link, periodic state snapshot) and pushes them to an HTTP server as soon as the home network is reachable. Byte dumps of the bridge traffic are deliberately excluded &mdash; they would flood the buffer. While WiFi is down the buffer keeps filling and everything is delivered after the reconnect. Runs independently of the debug mode above and survives a restart.</div>
+        <label class="checkbox-row" style="margin-top:0">
+          <input type="checkbox" id="lship_enabled">
+          <span id="lbl-lship-enabled">Send logs to server</span>
+        </label>
+        <div style="margin-top:10px">
+          <label id="lbl-lship-url">Server URL (HTTP POST, one JSON object per line)</label>
+          <input type="text" id="lship_url" placeholder="http://192.168.1.50:9080/vesclog" autocomplete="off" spellcheck="false">
+          <label id="lbl-lship-token">Token (optional, sent as Authorization: Bearer)</label>
+          <input type="text" id="lship_token" placeholder="" autocomplete="off" spellcheck="false">
+        </div>
+        <div style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap">
+          <button class="btn sm" id="lbl-lship-save" onclick="saveLogship()">Save</button>
+          <button class="btn sm" id="lbl-lship-test" onclick="testLogship()">Send test line</button>
+          <button class="btn sm" id="lbl-lship-refresh" onclick="loadLogship()">&#x21BB; Refresh</button>
+          <button class="btn red sm" id="lbl-lship-clear" onclick="clearLogship()">Clear buffer</button>
+        </div>
+        <div id="lshipStatus" style="margin-top:12px;background:var(--bg3);border:1px solid var(--border2);border-radius:4px;padding:8px;font-size:11px;color:var(--text2)">-</div>
       </div>
     </div>
   </div>
@@ -593,6 +620,15 @@ function applyTranslations(){
   sh('lbl-drop',            'Drop firmware.bin here<br>or click to select', 'firmware.bin ablegen<br>oder klicken');
   s('uploadBtn',            'Flash',                                        'Flashen');
   s('lbl-debug-mode',       'Debug Mode (UART log)',                        'Debug Modus (UART Log)');
+  s('lbl-lship-title',      'Log Upload',                                   'Log-Upload');
+  s('lbl-lship-enabled',    'Send logs to server',                          'Logs an Server senden');
+  s('lbl-lship-url',        'Server URL (HTTP POST, one JSON object per line)', 'Server-URL (HTTP POST, ein JSON-Objekt pro Zeile)');
+  s('lbl-lship-token',      'Token (optional, sent as Authorization: Bearer)', 'Token (optional, wird als Authorization: Bearer gesendet)');
+  s('lbl-lship-save',       'Save',                                         'Speichern');
+  s('lbl-lship-test',       'Send test line',                               'Testzeile senden');
+  sh('lbl-lship-refresh',   '&#x21BB; Refresh',                             '&#x21BB; Aktualisieren');
+  s('lbl-lship-clear',      'Clear buffer',                                 'Puffer leeren');
+  sh('lbl-lship-note', 'Buffers all event logs (boot/reset diagnostics, WiFi and AP events with disconnect reasons, BLE, roaming, VESC link, periodic state snapshot) and pushes them to an HTTP server as soon as the home network is reachable. Byte dumps of the bridge traffic are deliberately excluded &mdash; they would flood the buffer. While WiFi is down the buffer keeps filling and everything is delivered after the reconnect. Runs independently of the debug mode above and survives a restart.', 'Puffert alle Ereignis-Logs (Boot-/Resetdiagnose, WLAN- und AP-Ereignisse samt Trennungsgrund, BLE, Roaming, VESC-Verbindung, periodischer Zustands-Schnappschuss) und schiebt sie an einen HTTP-Server, sobald das Heimnetz erreichbar ist. Die Byte-Dumps des Brueckenverkehrs sind bewusst ausgenommen &mdash; sie wuerden den Puffer fluten. Waehrend das WLAN weg ist laeuft der Puffer weiter voll, nach dem Reconnect wird alles nachgeliefert. Laeuft unabhaengig vom Debug-Modus darueber und uebersteht einen Neustart.');
   s('lbl-debug-boot-note',  'Boot/reset diagnostics are always logged: power-on, software restart, panic/exception, watchdog and brownout.', 'Boot-/Resetdiagnose wird immer protokolliert: Power-On, Software-Neustart, Panic/Exception, Watchdog und Brownout.');
 }
 
@@ -1037,6 +1073,83 @@ function loadUartLog(){
   });
 }
 function clearUartLog(){fetch('/api/uart/clear',{method:'POST'}).then(function(){loadUartLog();});}
+
+// ── Log-Upload ───────────────────────────────────────────────────────────────
+// Bewusst NICHT Teil von saveConfig(): das grosse Speichern startet den ESP neu.
+// Der Log-Upload wirkt sofort (der Sende-Task liest die Werte laufend), deshalb
+// ein eigener Endpunkt ohne Neustart.
+var lshipTimer=null;
+function lshipFmtAge(sec){
+  if(!sec)return de()?'noch nie':'never';
+  return sec+'s '+(de()?'Uptime':'uptime');
+}
+function renderLogship(d){
+  var el=document.getElementById('lshipStatus');
+  if(!el)return;
+  var rows=[];
+  var state;
+  if(!d.enabled)                 state=de()?'aus':'off';
+  else if(!d.url)                state=de()?'keine URL gesetzt':'no URL set';
+  else if(!d.wifi)               state=de()?'wartet auf WLAN (puffert)':'waiting for WiFi (buffering)';
+  else if(d.last_error)          state=de()?'Fehler: '+d.last_error:'error: '+d.last_error;
+  else if(d.batches_ok>0)        state=de()?'sendet':'sending';
+  else                           state=de()?'bereit':'ready';
+  var col=(!d.enabled||!d.url)?'var(--text3)':(d.last_error?'#e57373':'#81c784');
+  rows.push('<div style="color:'+col+';font-weight:600;margin-bottom:6px">'+esc(state)+'</div>');
+  rows.push((de()?'Puffer':'Buffer')+': '+d.buffered+' / '+d.slots+' '+(de()?'Zeilen':'lines')+
+            ' ('+(d.psram?'PSRAM':(de()?'interner Heap':'internal heap'))+')');
+  rows.push((de()?'Gesendet':'Sent')+': '+d.sent+' '+(de()?'Zeilen':'lines')+
+            ', '+d.batches_ok+' '+(de()?'Pakete ok':'batches ok')+
+            ', '+d.batches_err+' '+(de()?'fehlgeschlagen':'failed'));
+  rows.push((de()?'Verworfen (Puffer voll)':'Dropped (buffer full)')+': '+d.dropped);
+  rows.push((de()?'Letzter HTTP-Code':'Last HTTP code')+': '+(d.last_code||'-'));
+  rows.push((de()?'Letzte erfolgreiche Uebertragung':'Last successful send')+': '+lshipFmtAge(d.last_ok_uptime));
+  rows.push('Boot-ID: '+d.boot_id+(d.token_set?(de()?' · Token gesetzt':' · token set'):''));
+  el.innerHTML=rows.map(function(r,i){
+    return i===0?r:'<div style="border-top:1px solid var(--border);padding:2px 0">'+r+'</div>';
+  }).join('');
+}
+function loadLogship(){
+  fetch('/api/logship').then(function(r){return r.json();}).then(function(d){
+    var u=document.getElementById('lship_url'), t=document.getElementById('lship_token');
+    var c=document.getElementById('lship_enabled');
+    // Eingabefelder nur befuellen, solange der Nutzer nicht gerade darin tippt.
+    if(document.activeElement!==u) u.value=d.url||'';
+    if(document.activeElement!==c) c.checked=!!d.enabled;
+    if(document.activeElement!==t && !t.value && d.token_set) t.placeholder=de()?'(gesetzt — leer lassen zum Behalten)':'(set — leave empty to keep)';
+    renderLogship(d);
+  }).catch(function(){});
+}
+function saveLogship(){
+  var url=document.getElementById('lship_url').value.trim();
+  var en=document.getElementById('lship_enabled').checked;
+  if(en && !url){
+    showToast(de()?'Bitte zuerst eine Server-URL eintragen':'Please enter a server URL first',false,4000);
+    return;
+  }
+  if(url && !/^https?:\/\//i.test(url)){
+    showToast(de()?'URL muss mit http:// oder https:// beginnen':'URL must start with http:// or https://',false,4000);
+    return;
+  }
+  var body={enabled:en, url:url, token:document.getElementById('lship_token').value};
+  fetch('/api/logship',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
+    .then(function(r){return r.json();}).then(function(d){
+      renderLogship(d);
+      showToast(de()?'Log-Upload gespeichert — kein Neustart nötig':'Log upload saved — no restart needed',true,4000);
+    }).catch(function(){showToast('Connection error',false,4000);});
+}
+function testLogship(){
+  fetch('/api/logship/test',{method:'POST'}).then(function(r){return r.json();}).then(function(d){
+    renderLogship(d);
+    showToast(de()?'Testzeile eingereiht':'Test line queued',true,3000);
+    setTimeout(loadLogship,1500);
+  }).catch(function(){showToast('Connection error',false,4000);});
+}
+function clearLogship(){
+  if(!confirm(de()?'Alle gepufferten Logzeilen verwerfen?':'Discard all buffered log lines?'))return;
+  fetch('/api/logship/clear',{method:'POST'}).then(function(r){return r.json();}).then(renderLogship)
+    .catch(function(){showToast('Connection error',false,4000);});
+}
 function initDebugTab(){
   fetch('/api/debug/status').then(function(r){return r.json();}).then(function(d){
     document.getElementById('debug_toggle').checked=d.enabled;
@@ -1047,6 +1160,13 @@ function initDebugTab(){
     document.getElementById('debugLogWrap').style.display=d.enabled?'':'none';
     if(d.enabled)loadUartLog();
   }).catch(function(){});
+  // Log-Upload gehoert NICHT zum Debug-Haken: Zustand immer laden und, solange
+  // der API-Tab offen ist, alle 5s auffrischen (Pufferstand bewegt sich).
+  loadLogship();
+  if(lshipTimer)clearInterval(lshipTimer);
+  lshipTimer=setInterval(function(){
+    if(document.getElementById('tab-api').classList.contains('active'))loadLogship();
+  },5000);
 }
 
 // OTA
@@ -1221,6 +1341,10 @@ void handleApiConfigGet() {
   json += "\"ble_full_power\":"+String(cfg_ble_full_power?"true":"false")+",";
   json += "\"ble_auto_off_sec\":"+String(cfg_ble_auto_off_sec)+",";
   json += "\"leds_enabled\":"+String(cfg_leds_enabled?"true":"false")+",";
+  json += "\"logship_enabled\":"+String(cfg_logship_enabled?"true":"false")+",";
+  json += "\"logship_url\":\""+jsonEscapeDebug(cfg_logship_url)+"\",";
+  // Das Token selbst wird NICHT ausgeliefert, nur ob eines gesetzt ist.
+  json += "\"logship_token_set\":"+String(cfg_logship_token.length()>0?"true":"false")+",";
   json += "\"update_url\":\""+cfg_update_url+"\",";
   json += "\"version_url\":\""+cfg_version_url+"\",";
   json += "\"wifi\":[";
@@ -1328,6 +1452,21 @@ void handleApiConfigPost() {
   cfg_ble_auto_off_sec  = parseInt2("ble_auto_off_sec", 120);
   bool ledsWasEnabled   = cfg_leds_enabled;   // alten Zustand merken
   cfg_leds_enabled      = (body.indexOf("\"leds_enabled\":true") >= 0);
+  // Log-Upload: wie bei den PIN-Feldern nur uebernehmen, wenn im Body vorhanden.
+  // Eine aeltere Companion-App, die die Felder nicht kennt, wuerde den Upload
+  // sonst beim Speichern stillschweigend abschalten. Ein LEERES Token bedeutet
+  // "unveraendert lassen" — sonst wuerde die Web-UI (die das Token nie
+  // ausliefert) es bei jedem Speichern loeschen.
+  if (body.indexOf("\"logship_enabled\":") >= 0)
+    cfg_logship_enabled = (body.indexOf("\"logship_enabled\":true") >= 0);
+  if (body.indexOf("\"logship_url\":") >= 0)
+    cfg_logship_url     = extract("logship_url");
+  if (body.indexOf("\"logship_token\":") >= 0) {
+    String tok = extract("logship_token");
+    if (tok.length() > 0) cfg_logship_token = tok;
+  }
+  if (cfg_logship_url.isEmpty()) cfg_logship_enabled = false;   // ohne Ziel kein Versand
+  logShipApplyConfig();   // Sende-Task auf die neuen Werte umstellen
   // Wenn die WS28XX-Steuerung gerade DEAKTIVIERT wurde -> LEDs sofort ausschalten.
   // (Greift auch ohne Reboot; beim Reboot waeren sie ohnehin aus.)
   if (ledsWasEnabled && !cfg_leds_enabled) ledsOff();
@@ -1745,6 +1884,73 @@ void setupWebServer() {
     otaServer.send(200,"application/json","{\"unlocked\":"+String(debugUnlocked?"true":"false")+"}");
   });
   otaServer.on("/api/boot/status",  HTTP_GET, [](){ otaServer.send(200,"application/json",bootStatusJson()); });
+  // ── Log-Upload ──────────────────────────────────────────────────────────────
+  // Eigene Endpunkte statt /api/config, weil das grosse Speichern den ESP
+  // neustartet. Der Sende-Task liest cfg_logship_* laufend -> die Aenderung
+  // wirkt sofort, ein Neustart waere hier nur stoerend (und wuerde ausgerechnet
+  // den gefuellten Puffer verwerfen).
+  otaServer.on("/api/logship", HTTP_GET, [](){
+    otaServer.send(200, "application/json", logShipStatusJson());
+  });
+  otaServer.on("/api/logship", HTTP_POST, [](){
+    String body = otaServer.arg("plain");
+    auto ex = [&](const String &key) -> String {
+      String s = "\""+key+"\":\"";
+      int st = body.indexOf(s); if (st < 0) return "";
+      st += s.length();
+      int en = st;
+      while (en < (int)body.length()) {
+        char c = body.charAt(en);
+        if (c == '"') break;
+        if (c == '\\' && en + 1 < (int)body.length()) en++;
+        en++;
+      }
+      if (en >= (int)body.length()) return "";
+      String v = body.substring(st, en);
+      v.replace("\\/", "/");
+      v.replace("\\\"", "\"");
+      v.replace("\\\\", "\\");
+      return v;
+    };
+
+    if (body.indexOf("\"url\":") >= 0) cfg_logship_url = ex("url");
+    // Leeres Token = unveraendert lassen. Die Oberflaeche liefert das
+    // gespeicherte Token nie aus, wuerde es also sonst bei jedem Speichern
+    // loeschen. Zum Entfernen gibt es "token_clear".
+    if (body.indexOf("\"token\":") >= 0) {
+      String tok = ex("token");
+      if (tok.length() > 0) cfg_logship_token = tok;
+    }
+    if (body.indexOf("\"token_clear\":true") >= 0) cfg_logship_token = "";
+    if (body.indexOf("\"enabled\":") >= 0)
+      cfg_logship_enabled = (body.indexOf("\"enabled\":true") >= 0);
+    if (cfg_logship_url.isEmpty()) cfg_logship_enabled = false;
+
+    // Nur die drei Schluessel schreiben (wie /api/debug), nicht saveConfig():
+    // das wuerde den gesamten Konfigurationsblock neu schreiben.
+    prefs.begin("vesccfg", false);
+    prefs.putBool  ("lship_en",  cfg_logship_enabled);
+    prefs.putString("lship_url", cfg_logship_url);
+    prefs.putString("lship_tok", cfg_logship_token);
+    prefs.end();
+    logShipApplyConfig();   // Sende-Task auf die neuen Werte umstellen
+
+    dlog("Logship: %s, url='%s', token=%s\n",
+         cfg_logship_enabled ? "enabled" : "disabled",
+         cfg_logship_url.c_str(),
+         cfg_logship_token.length() > 0 ? "set" : "none");
+
+    if (cfg_logship_enabled) logShipRequestFlush();
+    otaServer.send(200, "application/json", logShipStatusJson());
+  });
+  otaServer.on("/api/logship/test",  HTTP_POST, [](){
+    logShipSendTestLine();
+    otaServer.send(200, "application/json", logShipStatusJson());
+  });
+  otaServer.on("/api/logship/clear", HTTP_POST, [](){
+    logShipClear();
+    otaServer.send(200, "application/json", logShipStatusJson());
+  });
   otaServer.on("/api/time", HTTP_GET, [](){
     otaServer.send(200, "application/json", timeServiceJson());
   });
