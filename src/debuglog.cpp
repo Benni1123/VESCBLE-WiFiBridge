@@ -316,8 +316,35 @@ static String uartLogResolveUptimeStamp(const String &line) {
 }
 
 String uartLogJson() {
-  String json = "[";
+  // ── Groesse begrenzen ───────────────────────────────────────────────────────
+  // Bei cfg_log_size = 500 und langen Zeilen entstuende hier ein String von
+  // deutlich ueber 100 KB — und zwar am Stueck. Der groesste zusammenhaengende
+  // Heap-Block liegt im Betrieb bei rund 30 bis 60 KB. Die Anforderung wuerde
+  // also fehlschlagen oder den Heap so fragmentieren, dass danach kein
+  // TLS-Handshake mehr geht. Deshalb ein festes Byte-Budget, gefuellt mit den
+  // NEUESTEN Zeilen — die aelteren interessieren beim Draufschauen ohnehin am
+  // wenigsten. Zusaetzlich wird EINMAL vorab reserviert, statt den String
+  // beim Anhaengen immer wieder umkopieren zu lassen.
+  const size_t JSON_BUDGET = 20000;
+
+  String json;
   bool first = true;
+  int  firstIdx = 0;
+  size_t need = 0;
+
+  uartLogLock();
+  firstIdx = (int)uartLog.size();
+  for (int i = (int)uartLog.size() - 1; i >= 0; i--) {
+    size_t add = uartLog[i].length() + 8;     // + Anfuehrungszeichen, Komma, Reserve
+    if (need + add > JSON_BUDGET) break;
+    need += add;
+    firstIdx = i;
+  }
+  uartLogUnlock();
+
+  for (const String &line : bootDiagnosticLines) need += line.length() + 12;
+  json.reserve(need + 256);
+  json += "[";
   auto appendLine = [&](String line) {
     if (!first) json += ",";
     first = false;
@@ -334,7 +361,13 @@ String uartLogJson() {
     // anderer Task den Vector umbauen.
     for (const String &line : bootDiagnosticLines) appendLine("0s " + line);
     uartLogLock();
-    for (const String &line : uartLog) appendLine(line);
+    // firstIdx kann inzwischen zu gross sein, falls zwischenzeitlich Zeilen
+    // weggefallen sind — deshalb gegen die aktuelle Groesse absichern.
+    if (firstIdx > (int)uartLog.size()) firstIdx = (int)uartLog.size();
+    if (firstIdx > 0) {
+      appendLine("... " + String(firstIdx) + " aeltere Zeilen ausgelassen (Groessenlimit) ...");
+    }
+    for (int i = firstIdx; i < (int)uartLog.size(); i++) appendLine(uartLog[i]);
     uartLogUnlock();
   }
   json += "]";

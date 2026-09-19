@@ -11,6 +11,7 @@
 #include "vesc.h"
 #include "webui.h"
 #include "logship.h"
+#include "backup.h"
 
 
 // ── Static assets (Font + CSS, ausgelagert fuer Mehrfachnutzung) ──────────────
@@ -486,12 +487,14 @@ static const char PAGE_HTML[] PROGMEM = R"rawliteral(
       <div class="ep"><span class="method get">GET</span><a class="path" href="/api/time" target="_blank">/api/time</a><div class="desc">Current clock, sync source and NTP status</div></div>
       <div class="ep"><span class="method get">GET</span><a class="path" href="/api/ping" target="_blank">/api/ping</a><div class="desc">Keepalive — activates VESC polling</div></div>
       <div class="ep"><span class="method get">GET</span><a class="path" href="/api/logship" target="_blank">/api/logship</a><div class="desc">Log upload state: buffered lines, dropped, sent, last HTTP code</div></div>
+      <div class="ep"><span class="method get">GET</span><a class="path" href="/api/backup" target="_blank">/api/backup</a><div class="desc">Full configuration backup as NDJSON (all NVS namespaces, incl. LED patterns)</div></div>
       <div class="api-h2">POST</div>
       <div class="ep"><span class="method post">POST</span><span class="path">/api/config</span><div class="desc">Save config and restart (JSON body)</div></div>
       <div class="ep"><span class="method post">POST</span><span class="path">/api/uart/clear</span><div class="desc">Clear UART debug log</div></div>
       <div class="ep"><span class="method post">POST</span><span class="path">/api/logship</span><div class="desc">Save log upload settings (enabled, url, token) &mdash; takes effect immediately, no restart</div></div>
       <div class="ep"><span class="method post">POST</span><span class="path">/api/logship/test</span><div class="desc">Queue a test line and force an immediate send</div></div>
       <div class="ep"><span class="method post">POST</span><span class="path">/api/logship/clear</span><div class="desc">Discard all buffered log lines</div></div>
+      <div class="ep"><span class="method post">POST</span><span class="path">/api/restore</span><div class="desc">Restore a backup (multipart/form-data, field: backup) and restart</div></div>
       <div class="ep"><span class="method post">POST</span><span class="path">/api/update/install</span><div class="desc">Download and flash from update_url</div></div>
       <div class="ep"><span class="method post">POST</span><span class="path">/api/ap/start</span><div class="desc">Manually start or repair the access point (debug test)</div></div>
       <div class="ep"><span class="method post">POST</span><span class="path">/api/time?epoch=...&amp;source=app</span><div class="desc">Set Unix time; source may be supplied as query parameter or JSON field</div></div>
@@ -527,6 +530,17 @@ static const char PAGE_HTML[] PROGMEM = R"rawliteral(
           </div>
           <div id="uartLog" style="background:var(--bg3);border:1px solid var(--border2);border-radius:4px;padding:8px;font-size:11px;max-height:300px;overflow-y:auto;color:var(--text2)">-</div>
         </div>
+      </div>
+
+      <div class="api-h2" style="margin-top:16px" id="lbl-bk-title">Backup</div>
+      <div class="section" style="padding:12px">
+        <div id="lbl-bk-note" style="margin-bottom:10px;font-size:11px;color:var(--text3)">Saves the complete configuration: device settings, WiFi networks, BLE, access point, VESC, log upload, all LED channels and all 12 stored patterns including their pixel data. Read directly out of the NVS, so nothing can be forgotten &mdash; future settings are included automatically. Restoring overwrites the stored values and restarts the device.</div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+          <button class="btn sm" id="lbl-bk-save" onclick="downloadBackup()">&#x2193; Download backup</button>
+          <input type="file" id="bk_file" accept=".ndjson,.json,.txt" style="display:none" onchange="restoreBackup(this)">
+          <button class="btn sm" id="lbl-bk-load" onclick="document.getElementById('bk_file').click()">&#x2191; Restore backup</button>
+        </div>
+        <div id="bkStatus" style="margin-top:10px;font-size:11px;color:var(--text2)"></div>
       </div>
 
       <div class="api-h2" style="margin-top:16px" id="lbl-lship-title">Log Upload</div>
@@ -620,6 +634,10 @@ function applyTranslations(){
   sh('lbl-drop',            'Drop firmware.bin here<br>or click to select', 'firmware.bin ablegen<br>oder klicken');
   s('uploadBtn',            'Flash',                                        'Flashen');
   s('lbl-debug-mode',       'Debug Mode (UART log)',                        'Debug Modus (UART Log)');
+  s('lbl-bk-title',         'Backup',                                       'Sicherung');
+  sh('lbl-bk-save',         '&#x2193; Download backup',                     '&#x2193; Sicherung herunterladen');
+  sh('lbl-bk-load',         '&#x2191; Restore backup',                      '&#x2191; Sicherung einspielen');
+  sh('lbl-bk-note', 'Saves the complete configuration: device settings, WiFi networks, BLE, access point, VESC, log upload, all LED channels and all 12 stored patterns including their pixel data. Read directly out of the NVS, so nothing can be forgotten &mdash; future settings are included automatically. Restoring overwrites the stored values and restarts the device.', 'Sichert die komplette Konfiguration: Geräteeinstellungen, WLAN-Netze, BLE, Access Point, VESC, Log-Upload, alle LED-Kanäle und alle 12 gespeicherten Muster samt Pixeldaten. Direkt aus dem NVS gelesen, es kann also nichts vergessen werden &mdash; künftige Einstellungen sind automatisch dabei. Das Einspielen überschreibt die gespeicherten Werte und startet das Gerät neu.');
   s('lbl-lship-title',      'Log Upload',                                   'Log-Upload');
   s('lbl-lship-enabled',    'Send logs to server',                          'Logs an Server senden');
   s('lbl-lship-url',        'Server URL (HTTP POST, one JSON object per line)', 'Server-URL (HTTP POST, ein JSON-Objekt pro Zeile)');
@@ -1073,6 +1091,52 @@ function loadUartLog(){
   });
 }
 function clearUartLog(){fetch('/api/uart/clear',{method:'POST'}).then(function(){loadUartLog();});}
+
+// ── Sicherung / Wiederherstellung ────────────────────────────────────────────
+function bkMsg(t, ok) {
+  var el = document.getElementById('bkStatus');
+  if (el) { el.textContent = t; el.style.color = ok === false ? '#e57373' : (ok ? '#81c784' : 'var(--text2)'); }
+}
+function downloadBackup() {
+  // Bewusst ueber den normalen Download des Browsers: die Antwort kommt
+  // gestreamt (chunked), sie soll nicht erst komplett in den Speicher.
+  bkMsg(de() ? 'Sicherung wird erstellt...' : 'Creating backup...');
+  window.location = '/api/backup';
+  setTimeout(function () {
+    bkMsg(de() ? 'Sicherung heruntergeladen.' : 'Backup downloaded.', true);
+  }, 1500);
+}
+function restoreBackup(input) {
+  var f = input.files && input.files[0];
+  input.value = '';               // damit dieselbe Datei erneut waehlbar bleibt
+  if (!f) return;
+  if (!confirm(de()
+        ? 'Sicherung "' + f.name + '" einspielen?\n\nAlle gespeicherten Einstellungen werden überschrieben und das Gerät startet neu.'
+        : 'Restore backup "' + f.name + '"?\n\nAll stored settings will be overwritten and the device restarts.')) return;
+
+  bkMsg(de() ? 'Wird eingespielt...' : 'Restoring...');
+  var fd = new FormData();
+  fd.append('backup', f, f.name);
+  var xhr = new XMLHttpRequest();
+  xhr.open('POST', '/api/restore', true);
+  xhr.onload = function () {
+    var d = {};
+    try { d = JSON.parse(xhr.responseText); } catch (e) {}
+    if (xhr.status === 200) {
+      bkMsg((de() ? 'Eingespielt: ' : 'Restored: ') + (d.applied || 0) +
+            (de() ? ' Einträge. ESP startet neu...' : ' entries. ESP restarting...'), true);
+      setTimeout(function () { location.reload(); }, 6000);
+    } else {
+      var why = !d.header_ok
+        ? (de() ? 'keine gültige Sicherungsdatei' : 'not a valid backup file')
+        : (de() ? 'nichts übernommen' : 'nothing applied');
+      bkMsg((de() ? 'Fehlgeschlagen: ' : 'Failed: ') + why +
+            ' (' + (d.failed || 0) + (de() ? ' Fehler)' : ' errors)'), false);
+    }
+  };
+  xhr.onerror = function () { bkMsg(de() ? 'Verbindungsfehler' : 'Connection error', false); };
+  xhr.send(fd);
+}
 
 // ── Log-Upload ───────────────────────────────────────────────────────────────
 // Bewusst NICHT Teil von saveConfig(): das grosse Speichern startet den ESP neu.
@@ -1884,6 +1948,10 @@ void setupWebServer() {
     otaServer.send(200,"application/json","{\"unlocked\":"+String(debugUnlocked?"true":"false")+"}");
   });
   otaServer.on("/api/boot/status",  HTTP_GET, [](){ otaServer.send(200,"application/json",bootStatusJson()); });
+
+  // Sicherung/Wiederherstellung der gesamten Konfiguration (eigenes Modul,
+  // siehe backup.cpp — der NVS wird dort generisch ausgelesen).
+  backupRegisterRoutes(otaServer);
   // ── Log-Upload ──────────────────────────────────────────────────────────────
   // Eigene Endpunkte statt /api/config, weil das grosse Speichern den ESP
   // neustartet. Der Sende-Task liest cfg_logship_* laufend -> die Aenderung

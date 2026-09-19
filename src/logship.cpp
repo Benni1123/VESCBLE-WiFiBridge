@@ -428,6 +428,14 @@ static void logShipTaskFn(void *) {
 
     if (!shipEnabled)                    { shipFlushNow = false; continue; }
     if (!shipBuf || shipSlots == 0)      { shipFlushNow = false; continue; }
+
+    // ── Waehrend eines Firmware-Updates NICHT senden ─────────────────────────
+    // Ein OTA schreibt seitenweise in den Flash und braucht dabei selbst Heap.
+    // Parallel einen HTTP-POST aufzubauen (Body rund 15 KB am Stueck, dazu der
+    // HTTPClient) kann dem Update den Speicher unter den Fuessen wegziehen.
+    // Ein abgebrochenes OTA ist der teuerste denkbare Fehler hier — die paar
+    // Logzeilen warten so lange im Puffer, der ueberlebt das ohne Verlust.
+    if (Update.isRunning())              { continue; }
     if (WiFi.status() != WL_CONNECTED)   { continue; }   // Puffer laeuft weiter voll
     if (shipCount == 0)                  { shipFlushNow = false; continue; }
 
