@@ -799,6 +799,7 @@ function loadInfo(){
       (d.mode!=='ap'?'<div class="info-row"><span>RSSI</span><span class="info-val">'+d.rssi+' dBm</span></div>':'')+
       '<div class="info-row"><span>'+(de()?'Freier RAM':'Free RAM')+'</span><span class="info-val">'+(d.heap>=1024?(d.heap/1024).toFixed(1)+' KB':d.heap+' B')+'</span></div>'+
       (d.psram_total>0?'<div class="info-row"><span>'+(de()?'PSRAM frei':'Free PSRAM')+'</span><span class="info-val">'+(d.psram_free/1048576).toFixed(2)+' / '+(d.psram_total/1048576).toFixed(1)+' MB</span></div>':'')+
+      (d.cpu_temp!==null&&d.cpu_temp!==undefined?'<div class="info-row"><span>'+(de()?'CPU-Temperatur':'CPU temperature')+'</span><span class="info-val" style="color:'+(d.cpu_temp>=85?'#e57373':(d.cpu_temp>=70?'#e0a030':'var(--text2)'))+'">'+d.cpu_temp.toFixed(1)+' °C</span></div>':'')+
       '<div class="info-row"><span>AP</span><span class="info-val" style="color:'+(d.ap_active?'var(--ok)':'var(--text3)')+'">'+( d.ap_active?(de()?'Aktiv':'Active'):(de()?'Aus':'Off'))+(d.ap_active?' ('+d.ap_ip+')':'')+'</span></div>'+
       (d.ap_client_ip?'<div class="info-row"><span>'+(de()?'AP-Client IP':'AP client IP')+'</span><span class="info-val">'+d.ap_client_ip+'</span></div>':'')+
       (d.ap_active&&d.ap_timeout_remaining>=0?'<div class="info-row"><span>'+(de()?'AP aus in':'AP off in')+'</span><span class="info-val">'+d.ap_timeout_remaining+'s</span></div>':'')+
@@ -1279,6 +1280,11 @@ bool isCaptivePortalRequest() {
 
 void handlePage() {
   if (isCaptivePortalRequest()) { handleCaptivePortal(); return; }
+  // Nicht zwischenspeichern lassen. Die Seite steckt in der Firmware: nach
+  // einem Update liefert der ESP sofort die neue Oberflaeche, der Browser
+  // zeigte aber weiter seine alte Kopie — inklusive fehlender neuer Knoepfe.
+  // Das sieht wie ein nicht eingespieltes Update aus und kostet nur Sucherei.
+  otaServer.sendHeader("Cache-Control", "no-store, must-revalidate");
   otaServer.send(200, "text/html", PAGE_HTML);
 }
 
@@ -1329,6 +1335,19 @@ void handleApiInfo() {
   json += "\"heap\":"+String(ESP.getFreeHeap())+",";
   json += "\"psram_free\":"+String(ESP.getFreePsram())+",";
   json += "\"psram_total\":"+String(ESP.getPsramSize())+",";
+  // Interner Die-Temperatursensor des ESP32-S3. Misst die Chiptemperatur,
+  // nicht die Umgebung — im Gehaeuse am VESC liegt sie deutlich ueber der
+  // Aussentemperatur, das ist normal.
+  //
+  // Der Sensor meldet einen Fehlwert, wenn er nicht bereitsteht. Der landet
+  // als NaN im float, und String(NaN,1) schreibt "nan" — damit waere das
+  // ganze JSON kaputt und die Startseite bliebe leer. Deshalb hier null,
+  // und das Frontend blendet die Zeile dann aus.
+  {
+    float cpuT = temperatureRead();
+    if (isnan(cpuT) || cpuT < -50.0f || cpuT > 200.0f) json += "\"cpu_temp\":null,";
+    else                                               json += "\"cpu_temp\":"+String(cpuT,1)+",";
+  }
   json += "\"uptime\":\""+uptime+"\",";
   json += "\"build\":\""+String(FIRMWARE_VERSION)+" ("+String(__DATE__)+" "+String(__TIME__)+")\",";
   json += "\"port\":"+String(cfg_port)+",";

@@ -14,16 +14,19 @@
 #include <freertos/semphr.h>
 
 // ── Puffergroesse ────────────────────────────────────────────────────────────
-// 2000 Slots a 256 Byte Text + 12 Byte Kopf = 536.000 Byte (rund 523 KiB).
+// 2000 Slots a 288 Byte Text + 12 Byte Kopf = 600.000 Byte (rund 586 KiB).
 // Liegt im PSRAM (2 MB vorhanden), damit der interne Heap fuer WiFi/BLE/TLS
 // frei bleibt. Ohne PSRAM wird auf einen kleinen internen Puffer
 // zurueckgefallen, damit die Firmware auch auf einem Board ohne PSRAM startet.
 //
-// 256 statt eines kleineren Werts, weil die laengste Zeile der Firmware der
-// periodische [STAT]-Schnappschuss aus wifi-ble.cpp ist: mit 32-Zeichen-SSID
-// und unguenstig grossen Diagnosezaehlern misst der 239 Zeichen. Bei 160 oder
-// 224 waere ausgerechnet dessen Ende (die Zaehler) abgeschnitten worden.
-#define LOGSHIP_LINE_MAX     256
+// Die laengste Zeile der Firmware ist der periodische [STAT]-Schnappschuss aus
+// wifi-ble.cpp. Mit gekappter 24-Zeichen-SSID, allen Diagnosezaehlern am
+// oberen Anschlag und der Chiptemperatur misst der 295 Zeichen. Nachgemessen
+// mit genau dem Formatstring, nicht ueberschlagen — beim Schaetzen lag der
+// Wert schon zweimal zu niedrig, und abgeschnitten wurde dann ausgerechnet
+// das Ende der Zeile: die Zaehler, wegen denen man hinsieht.
+// 320 laesst 24 Zeichen Reserve. Wer ein weiteres Feld anhaengt, misst neu.
+#define LOGSHIP_LINE_MAX     320
 #define LOGSHIP_SLOTS_PSRAM  2000
 #define LOGSHIP_SLOTS_HEAP   150
 #define LOGSHIP_BATCH_MAX    50
@@ -73,6 +76,22 @@ static const uint8_t SHIP_BACKOFF_LAST =
     (uint8_t)(sizeof(SHIP_BACKOFF_MS) / sizeof(SHIP_BACKOFF_MS[0]) - 1);
 static uint8_t       shipBackoffStage = 0;
 static unsigned long shipNextTry      = 0;
+
+// ── Mindestabstand zwischen zwei Sendevorgaengen ────────────────────────────
+// Jeder Batch oeffnet eine EIGENE TCP-Verbindung (setReuse(false), weil eine
+// dauerhaft offene Verbindung ueber Stunden mehr Probleme macht als sie loest).
+// Geschlossene Verbindungen bleiben in lwIP aber noch als TIME_WAIT liegen,
+// und die Zahl gleichzeitiger TCP-Kontrollbloecke ist knapp bemessen. Wurde
+// bei Rueckstand alle 150 ms gesendet, stapelten sich diese Reste so weit,
+// dass der Webserver zeitweise keine eingehende Verbindung mehr annehmen
+// konnte: Die Oberflaeche haengt mehrere Sekunden, obwohl WLAN steht und der
+// Loop normal laeuft.
+//
+// 2 Sekunden Abstand reichen bei 50 Zeilen pro Batch fuer 25 Zeilen/s — weit
+// mehr als im Betrieb anfaellt (rund eine Zeile alle 30 s). Selbst ein voller
+// Puffer von 2000 Zeilen ist damit in gut einer Minute abgearbeitet.
+#define LOGSHIP_MIN_GAP_MS 2000
+static unsigned long shipLastPost = 0;
 
 static inline void shipLock()   { if (shipMutex) xSemaphoreTake(shipMutex, portMAX_DELAY); }
 static inline void shipUnlock() { if (shipMutex) xSemaphoreGive(shipMutex); }
@@ -292,7 +311,6 @@ static uint32_t shipResolveEpoch(const LogShipSlot &s) {
 // Laeuft unter dem Mutex, macht aber KEIN I/O -> nur Millisekunden.
 static String shipBuildBatch(uint32_t &lastSeqOut, uint16_t &linesOut) {
   String body;
-  body.reserve(LOGSHIP_BATCH_MAX * 300);
   lastSeqOut = 0;
   linesOut   = 0;
 
@@ -300,6 +318,24 @@ static String shipBuildBatch(uint32_t &lastSeqOut, uint16_t &linesOut) {
   uint16_t idx = shipTail;
   uint16_t n   = shipCount < LOGSHIP_BATCH_MAX ? shipCount : LOGSHIP_BATCH_MAX;
   uint32_t dropped = shipDropped;
+
+  // ── Genau so viel reservieren, wie gebraucht wird ──────────────────────────
+  // Vorher stand hier pauschal LOGSHIP_BATCH_MAX * 300, also rund 15 KB — auch
+  // dann, wenn nur EINE Zeile ansteht. Genau das ist der Normalfall: alle 30
+  // Sekunden kommt der [STAT]-Schnappschuss und sonst nichts. Eine 15-KB-
+  // Anforderung am Stueck, alle 30 Sekunden, bei einem groessten freien Block
+  // von rund 34 KB — waehrenddessen bekommt der Webserver fuer eine neue
+  // Verbindung unter Umstaenden nichts mehr und die Oberflaeche haengt ein
+  // bis zwei Sekunden. Jetzt wird die tatsaechliche Laenge vorab bestimmt.
+  size_t need = 0;
+  {
+    uint16_t probe = idx;
+    for (uint16_t i = 0; i < n; i++) {
+      need += strlen(shipBuf[probe].text) + 130;   // + fester JSON-Rahmen
+      probe = (uint16_t)((probe + 1) % shipSlots);
+    }
+  }
+  body.reserve(need + 64);
   for (uint16_t i = 0; i < n; i++) {
     const LogShipSlot &s = shipBuf[idx];
     body += "{\"seq\":"      + String(s.seq);
@@ -441,14 +477,16 @@ static void logShipTaskFn(void *) {
 
     unsigned long now = millis();
     if (!shipFlushNow && shipNextTry != 0 && (long)(now - shipNextTry) < 0) continue;
+
+    // Mindestabstand einhalten, auch bei Rueckstand (siehe oben). Nur der
+    // Knopf "Testzeile senden" darf sich vordraengeln — dort will man sofort
+    // ein Ergebnis sehen, und es ist genau eine Verbindung.
+    if (!shipFlushNow && (now - shipLastPost) < LOGSHIP_MIN_GAP_MS) continue;
+
     shipFlushNow = false;
+    shipLastPost = now;
 
     shipFlushOnce();
-
-    // Grosser Rueckstand nach einem Ausfall: zuegig weitersenden, aber dem
-    // WLAN zwischen den Batches Luft lassen.
-    if (shipCount > 0 && shipLastError.isEmpty()) vTaskDelay(pdMS_TO_TICKS(150));
-    else                                          vTaskDelay(pdMS_TO_TICKS(750));
   }
 }
 

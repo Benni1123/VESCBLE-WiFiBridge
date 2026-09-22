@@ -237,7 +237,14 @@ static uint32_t      diagApClientConn    = 0;   // AP-Client-Verbindungen (Handy
 static uint32_t      diagApClientDisc    = 0;   // AP-Client-Trennungen
 static uint32_t      diagApWatchdogFires = 0;   // AP-Watchdog-Eingriffe (SSID weg)
 static uint8_t       diagLastDiscReason  = 0;   // letzter STA-Disconnect-Grund
-static unsigned long diagMaxLoopUs       = 0;   // laengster Loop-Durchlauf (us)
+static unsigned long diagMaxLoopUs       = 0;   // laengster Loop-Durchlauf (us), pro Sekunde
+// Laengster Loop-Durchlauf seit der LETZTEN [STAT]-Zeile, plus der Zeitpunkt.
+// diagMaxLoopUs wird jede Sekunde genullt und taugt nur fuer die Live-Anzeige
+// im Info-Tab — ein Haenger, der zwischen zwei [STAT]-Zeilen auftrat, war darin
+// nicht mehr zu sehen. Genau der interessiert aber. Dieser Wert ueberlebt bis
+// zum naechsten Bericht und wird erst dort zurueckgesetzt.
+static unsigned long diagMaxLoopUsStat   = 0;
+static unsigned long diagMaxLoopAtSec    = 0;   // Uptime, als dieses Maximum auftrat
 static unsigned long diagLoopWindowStart = 0;   // Fenster-Start fuer Loop-Freq
 static uint32_t      diagLoopWindowCount = 0;   // Loops im aktuellen Fenster
 static uint32_t      diagLoopsPerSec     = 0;   // zuletzt gemessene Loop-Frequenz
@@ -278,7 +285,15 @@ static unsigned long lastRoamSwitch    = 0;
 // und nimmt den SoftAP dabei von seinem Kanal: waehrenddessen ist das Geraet
 // weder ueber den AP noch zuverlaessig ueber das Heimnetz erreichbar. Findet
 // sich nichts Besseres, wird der Abstand deshalb stufenweise groesser.
-static const unsigned long ROAM_RETRY_MS[] = { 30000UL, 60000UL, 120000UL, 300000UL };
+//
+// Die letzte Stufe ist bewusst 30 Minuten und nicht 5: Ein Scan dauert trotz
+// gekuerzter Verweildauer rund 5 Sekunden — bei aktivem SoftAP kehrt der
+// Treiber zwischendurch auf den AP-Kanal zurueck, das verlaengert ihn. Fuenf
+// Sekunden Funkpause alle fuenf Minuten sind an einem Standort, an dem seit
+// Tagen KEIN besserer AP gefunden wurde, reine Kosten ohne Gegenwert. Sobald
+// sich die Lage aendert (Pegel wieder ueber der Schwelle oder ein geglueckter
+// Wechsel), faellt das Backoff sofort auf 30 Sekunden zurueck.
+static const unsigned long ROAM_RETRY_MS[] = { 30000UL, 60000UL, 300000UL, 1800000UL };
 static const uint8_t ROAM_RETRY_LAST =
     (uint8_t)(sizeof(ROAM_RETRY_MS) / sizeof(ROAM_RETRY_MS[0]) - 1);
 static uint8_t       roamRetryStage   = 0;

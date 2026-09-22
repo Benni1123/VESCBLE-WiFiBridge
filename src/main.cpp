@@ -4,6 +4,7 @@
 #include "debuglog.h"
 #include "time-service.h"
 #include "logship.h"
+#include "blackbox.h"
 #include "backup.h"
 #include "wifi-ble.h"
 #include "vesc.h"
@@ -20,6 +21,10 @@
 #include "wifi-ble.cpp"
 #include "vesc.cpp"
 #include "webui.cpp"
+// blackbox.cpp ZULETZT: der Stall-Waechter liest den RTC-Ringpuffer aus
+// logship.cpp direkt aus. Im Unity-Build ist das dieselbe
+// Uebersetzungseinheit, also muss logship.cpp vorher stehen.
+#include "blackbox.cpp"
 
 // ── Setup ─────────────────────────────────────────────────────────────────────
 void setup() {
@@ -42,6 +47,12 @@ void setup() {
   // der Puffer erst spaeter angelegt, gehen sie verloren.
   logShipSetup();
 
+  // Blackbox des vorherigen Laufs aus dem Flash holen. Muss NACH
+  // logShipSetup() laufen (sonst gibt es keinen Puffer, in den die Zeilen
+  // koennten) und VOR captureBootDiagnostics(), damit im Serverlog die
+  // Vorgeschichte vor dem Bootgrund steht.
+  blackboxSetup();
+
   captureBootDiagnostics();
   dlog("BLE Name: %s | WiFi networks: %d\n", cfg_ble_name.c_str(), cfg_wifi.size());
   Serial.printf("Free heap: %d bytes\n", ESP.getFreeHeap());
@@ -60,10 +71,20 @@ void setup() {
   if (cfg_ble_mode != 0) NimBLEDevice::startAdvertising();
   Serial.printf("Free heap after init: %d bytes\n", ESP.getFreeHeap());
   Serial.println("=== Ready ===\n");
+
+  // Stall-Waechter ZULETZT scharf machen. Waehrend setup() laeuft, gibt es
+  // noch kein Lebenszeichen aus dem Loop — ein frueher gestarteter Waechter
+  // wuerde ein langes setup() (WLAN-Verbindungsaufbau) als Stillstand werten.
+  blackboxStartTask();
 }
 
 // ── Loop ──────────────────────────────────────────────────────────────────────
 void loop() {
+  // Lebenszeichen fuer den Stall-Waechter (blackbox.cpp). Bleibt dieser Wert
+  // stehen, haengt der Loop in einem der Abschnitte weiter unten — und der
+  // Waechter schreibt die Blackbox und startet neu.
+  blackboxHeartbeat = millis();
+
   // ── Diagnose: Loop-Zeit + Frequenz + Heap-Tiefstand messen ──────────────────
   unsigned long diagLoopT0 = micros();
   {
@@ -80,15 +101,29 @@ void loop() {
     }
   }
 
+  // Die Phasenmarker kosten je einen Speicherzugriff und sind der einzige
+  // Weg, nach einem Stillstand zu sagen, WELCHER Abschnitt nicht
+  // zurueckgekehrt ist. Ohne sie weiss man nur, dass der Loop steht.
+  blackboxPhase = BB_PHASE_WEBUI;
   webUiLoop();
+  blackboxPhase = BB_PHASE_WIFI;
   wifiBleLoop();
+  blackboxPhase = BB_PHASE_TIME;
   timeServiceLoop();
+  blackboxPhase = BB_PHASE_VESC;
   vescLoop();
+  blackboxPhase = BB_PHASE_IDLE;
 
   // Diagnose: Dauer dieses Loop-Durchlaufs; Maximum im aktuellen Sekundenfenster
   // festhalten. Ein hoher Wert = irgendwas blockiert den Loop (Blockade-Indikator).
   unsigned long diagLoopDt = micros() - diagLoopT0;
   if (diagLoopDt > diagMaxLoopUs) diagMaxLoopUs = diagLoopDt;
+  // Zweites Maximum, das NICHT jede Sekunde verfaellt: nur so taucht ein
+  // Haenger in der naechsten [STAT]-Zeile ueberhaupt auf.
+  if (diagLoopDt > diagMaxLoopUsStat) {
+    diagMaxLoopUsStat = diagLoopDt;
+    diagMaxLoopAtSec  = millis() / 1000UL;
+  }
 
   yield();
 }

@@ -281,8 +281,19 @@ static void logShipHeartbeat() {
   if (millis() - lastBeat < 30000UL) return;
   lastBeat = millis();
 
-  char line[272];   // groesser als LOGSHIP_LINE_MAX (256) in logship.cpp
+  char line[336];   // groesser als LOGSHIP_LINE_MAX (320) in logship.cpp
   bool staUp = (WiFi.status() == WL_CONNECTED);
+
+  // Chiptemperatur. Interessant ist nicht der Momentanwert — den sieht man im
+  // Info-Tab — sondern der Verlauf im Serverlog: laeuft sie vor einem Ausfall
+  // weg, ist das eine ganz andere Spur als ein stehender Loop bei 50 Grad.
+  // Als Text, weil der Sensor bei Nichtbereitschaft NaN liefert und "nan"
+  // mitten in der Zeile nur verwirrt.
+  char tstr[10] = "-";
+  {
+    float t = temperatureRead();
+    if (!isnan(t) && t > -50.0f && t < 200.0f) snprintf(tstr, sizeof(tstr), "%.1f", t);
+  }
 
   // Letzte drei Oktette der BSSID: im Mesh haengen alle APs an derselben SSID,
   // erst die BSSID zeigt, auf WELCHEM man gerade sitzt. Nur drei Oktette, damit
@@ -296,7 +307,7 @@ static void logShipHeartbeat() {
 
   snprintf(line, sizeof(line),
            "[STAT] sta=%d ssid=%.24s bssid=%s rssi=%d ch=%d ap=%d apcl=%u ble=%d adv=%d "
-           "heap=%u minheap=%u maxblk=%u loopmax=%lums loops=%u "
+           "heap=%u minheap=%u maxblk=%u loopmax=%lums@%lus loops=%u temp=%s "
            "scans=%u staconn=%u stadisc=%u(%u) apwd=%u",
            staUp ? 1 : 0,
            staUp ? WiFi.SSID().c_str() : "-",
@@ -310,14 +321,20 @@ static void logShipHeartbeat() {
            (unsigned)ESP.getFreeHeap(),
            (unsigned)(diagMinHeap == 0xFFFFFFFF ? 0 : diagMinHeap),
            (unsigned)ESP.getMaxAllocHeap(),
-           (unsigned long)(diagMaxLoopUs / 1000UL),
+           (unsigned long)(diagMaxLoopUsStat / 1000UL),
+           (unsigned long)diagMaxLoopAtSec,
            (unsigned)diagLoopsPerSec,
+           tstr,
            (unsigned)diagScanCount,
            (unsigned)diagStaConnects,
            (unsigned)diagStaDisconnects,
            (unsigned)diagLastDiscReason,
            (unsigned)diagApWatchdogFires);
   logShipAdd(String(line));
+
+  // Erst NACH dem Bericht zuruecksetzen. Die naechste Zeile zeigt dann das
+  // Maximum der kommenden 30 Sekunden, nicht das der letzten Sekunde.
+  diagMaxLoopUsStat = 0;
 }
 
 // Fängt alle relevanten WiFi-Events ab. Der entscheidende Punkt für deinen Bug:
@@ -1545,7 +1562,13 @@ void handleWiFiReconnect() {
   if (!scanInProgress) {
     if (now - lastReconnectTry < staScanInterval) return;
     lastReconnectTry = now;
-    int16_t started = WiFi.scanNetworks(true, true);   // async, inkl. hidden
+    // max_ms_per_chan = 120 statt Default. Beim Roaming war das schon
+    // gekuerzt, hier nicht — und das ist der Scan, der im Betrieb uebrig
+    // bleibt. Mit dem Default dauert er 5 bis 9 Sekunden, und solange ist
+    // der Funk auf fremden Kanaelen unterwegs: die STA-Verbindung ruht, der
+    // AP sendet nicht, die Weboberflaeche haengt. Genau die Aussetzer.
+    // 120 ms pro Kanal druecken das auf rund zwei Sekunden.
+    int16_t started = WiFi.scanNetworks(true, true, false, 120);   // async, inkl. hidden
     if (started == WIFI_SCAN_RUNNING) {
       diagScanCount++;                 // Diagnose: gestarteten Scan zaehlen
       scanInProgress = true;
