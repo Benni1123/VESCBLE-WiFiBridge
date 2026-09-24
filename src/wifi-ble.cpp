@@ -250,8 +250,21 @@ static void wifiEvtQueueInit() {
 
 // NUR aus dem Event-Task. Keine Allokation, kein Mutex, kein Warten.
 static void wifiEvtSend(WifiEvtMsg &m) {
-  if (!wifiEvtQueue) { wifiEvtDropped++; return; }
-  if (xQueueSend(wifiEvtQueue, &m, 0) != pdTRUE) wifiEvtDropped++;
+  // Geschrieben wird der Zaehler ausschliesslich hier, also nur vom
+  // WLAN-Event-Task; der Loop liest ihn bloss. Lesen-Aendern-Schreiben ist
+  // damit unkritisch.
+  //
+  // Ausgeschrieben statt "++", weil C++20 den Inkrementoperator auf
+  // volatile-Werten fuer veraltet erklaert hat: er liest und schreibt in
+  // einem Ausdruck, und bei fluechtigen Werten ist die Reihenfolge dabei
+  // nicht eindeutig festgelegt.
+  if (!wifiEvtQueue) {
+    wifiEvtDropped = wifiEvtDropped + 1;
+    return;
+  }
+  if (xQueueSend(wifiEvtQueue, &m, 0) != pdTRUE) {
+    wifiEvtDropped = wifiEvtDropped + 1;
+  }
 }
 
 // Bequemer Weg fuer Nachrichten, die nur eine Logzeile sind.

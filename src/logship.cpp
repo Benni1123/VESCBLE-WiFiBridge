@@ -300,8 +300,11 @@ uint32_t logShipAddSeq(const String &line) {
     shipDropped++;
   }
   LogShipSlot &s = shipBuf[shipHead];
+  // Ausgeschrieben statt "shipSeq++": C++20 erklaert den Inkrementoperator auf
+  // volatile-Werten fuer veraltet. Die Vergabe laeuft ohnehin unter shipLock.
   uint32_t assigned = shipSeq;
-  s.seq       = shipSeq++;
+  shipSeq     = assigned + 1;
+  s.seq       = assigned;
   s.uptimeSec = up;
   s.epoch     = (now > 0) ? (uint32_t)now : 0;
   strncpy(s.text, clean.c_str(), LOGSHIP_LINE_MAX);
@@ -508,7 +511,7 @@ static void shipFlushOnce() {
     shipConfirm(lastSeq);
     shipAckedSeq = lastSeq;        // bis hierhin nachweislich zugestellt
     shipSentLines += lines;
-    shipBatchesOk++;
+    shipBatchesOk = shipBatchesOk + 1;   // kein "++" auf volatile (C++20)
     shipLastError = "";
     shipLastOkUptime = (uint32_t)(millis() / 1000UL);
     shipBackoffStage = 0;
