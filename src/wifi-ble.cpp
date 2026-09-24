@@ -1170,11 +1170,106 @@ void handleBleMode() {
 // die Schwelle, wird ASYNC gescannt; ist ein bekannter AP mit GLEICHER SSID
 // deutlich (Hysterese) staerker, wird gezielt auf dessen BSSID umverbunden.
 // Komplett non-blocking — friert den Loop nicht ein, AP bleibt aktiv.
+// ── Keine STA-Suche waehrend der Fahrt ──────────────────────────────────────
+//
+// Ein STA-Scan laesst die Funkeinheit durch alle Kanaele springen und kostet
+// je nach Lage mehrere Sekunden, in denen der Hauptloop nicht weiterkommt —
+// nachgemessen waren es bis zu sieben. Beim Reconnect-Pfad ist er zudem eine
+// Dauerbeschaeftigung: ausserhalb des Heimnetzes findet er nie etwas und
+// versucht es im Backoff immer wieder.
+//
+// Waehrend der Fahrt ist dieser Aufwand vollstaendig vergebens. Das Heimnetz
+// ist nicht in Reichweite, und selbst wenn kurz eines vorbeikaeme, waere die
+// Verbindung Sekunden spaeter wieder weg. Gleichzeitig ist das der Moment, in
+// dem ein blockierter Loop am meisten schadet: der AP faellt aus und die
+// VESC-Bruecke setzt aus, waehrend man faehrt.
+//
+// Der AP ist davon NICHT betroffen — der bleibt, und Ereignisse wie das
+// Aufwecken per Bewegung laufen unveraendert weiter. Gesperrt ist nur die
+// Suche nach dem Heimnetz.
+//
+// Schwelle ist bewusst dieselbe wie fuers Aufwecken (cfg_ble_auto_erpm_on),
+// damit es nur EINEN Begriff von "faehrt gerade" in der Firmware gibt.
+#define RIDE_SCAN_BLOCK_MS 15000UL
+
+// Laengerer Nachlauf, wenn die VESC-Verbindung weg ist.
+//
+// Der Grenzfall: waehrend der Fahrt reisst die UART-Verbindung ab (Wackler,
+// Stecker). Ab dann kommen keine ERPM mehr, die Firmware haelt das Fahrzeug
+// fuer stehend — und wuerde nach 15 Sekunden wieder scannen, obwohl weiter
+// gefahren wird. Genau dann schadet ein blockierter Loop am meisten.
+//
+// Deshalb in diesem Zustand 60 statt 15 Sekunden Ruhe. Bewusst NICHT
+// unbegrenzt: bei dauerhaft totem UART wuerde sonst nie wieder gescannt, also
+// nie wieder Heimnetz und nie wieder Logs — ausgerechnet in der Lage, in der
+// man sie braucht. Nach einer Minute ohne Fahrt gibt die Sperre also auf.
+#define RIDE_SCAN_BLOCK_LOST_MS 60000UL
+
+static unsigned long rideLastSeen    = 0;
+static bool          rideBlockLogged = false;
+
+static bool ridingNow() {
+  if (!vescStatus.connected) return false;
+  int32_t a = vescStatus.erpm < 0 ? -vescStatus.erpm : vescStatus.erpm;
+  return a > cfg_ble_auto_erpm_on;
+}
+
+// Einmal pro Loop-Durchlauf aufrufen, damit der Zeitstempel unabhaengig davon
+// mitlaeuft, ob die Scan-Funktionen an diesem Durchlauf ueberhaupt drankommen.
+static void rideTick() {
+  if (ridingNow()) rideLastSeen = millis();
+}
+
+// Nachlauf: nach dem Anhalten noch RIDE_SCAN_BLOCK_MS warten. Ohne den wuerde
+// beim ersten Ampelstopp sofort ein Scan starten und beim Anfahren mitten im
+// Kanaldurchlauf stehen — genau die Blockade, die vermieden werden soll.
+static bool staScanBlockedByRide() {
+  if (rideLastSeen == 0) return false;
+
+  // Ohne VESC-Daten laesst sich nicht feststellen, ob die Fahrt weitergeht.
+  // Solange der letzte bekannte Zustand "faehrt" war, wird im Zweifel
+  // laenger gesperrt.
+  bool lostLink = !vescStatus.connected;
+  unsigned long window = lostLink ? RIDE_SCAN_BLOCK_LOST_MS : RIDE_SCAN_BLOCK_MS;
+
+  bool blocked = (millis() - rideLastSeen) < window;
+  if (blocked != rideBlockLogged) {
+    // Zwei getrennte Aufrufe statt eines mit ausgewaehltem Formatstring: die
+    // beiden Texte haben unterschiedliche Platzhalter, und ein zur Laufzeit
+    // gewaehltes Format mit nur einem Argument passt zwangslaeufig zu einem
+    // der beiden nicht.
+    if (blocked) {
+      if (lostLink) {
+        dlog("WiFi: VESC link lost while riding -> STA scan suspended for %ds\n",
+             (int)(RIDE_SCAN_BLOCK_LOST_MS / 1000UL));
+      } else {
+        dlog("WiFi: riding (|erpm|>%d) -> STA scan suspended\n", cfg_ble_auto_erpm_on);
+      }
+    } else {
+      dlog("WiFi: stopped for %ds -> STA scan allowed again\n",
+           (int)(window / 1000UL));
+    }
+    rideBlockLogged = blocked;
+  }
+  return blocked;
+}
+
 void handleRoaming() {
   if (!cfg_roam_enabled) return;
   if (WiFi.status() != WL_CONNECTED) return;
   // Waehrend der normale Reconnect-Scan laeuft, nicht dazwischenfunken.
   if (scanInProgress) return;
+
+  // Waehrend der Fahrt kein Roam-Scan. Ein laufender wird noch eingesammelt,
+  // damit kein Ergebnis im Treiber liegenbleibt.
+  if (staScanBlockedByRide()) {
+    if (roamScanRunning && WiFi.scanComplete() != WIFI_SCAN_RUNNING) {
+      WiFi.scanDelete();
+      roamScanRunning = false;
+    }
+    weakSince = 0;
+    return;
+  }
   // Nach einem Wechsel 20s Ruhe, damit sich die Verbindung stabilisiert.
   if (lastRoamSwitch != 0 && millis() - lastRoamSwitch < 20000) return;
 
@@ -1461,6 +1556,23 @@ void handleWiFiReconnect() {
       int16_t r = WiFi.scanComplete();
       if (r != WIFI_SCAN_RUNNING) { WiFi.scanDelete(); scanInProgress = false; }
     }
+    return;
+  }
+
+  // ── Faehrt gerade? -> STA-Suche aussetzen ─────────────────────────────────
+  // Genau dieselbe Begruendung wie beim AP-Client weiter unten, nur der Anlass
+  // ist ein anderer: der Scan blockiert den Loop und findet unterwegs ohnehin
+  // nichts. staDownSince wird zurueckgesetzt, damit der Notnagel-Neustart die
+  // Fahrt nicht als haengende Verbindung missversteht und mitten im Fahren
+  // rebootet.
+  if (staScanBlockedByRide()) {
+    if (scanInProgress) { WiFi.scanDelete(); scanInProgress = false; }
+    if (staConnecting) {
+      staConnecting = false;
+      WiFi.disconnect(false, false);   // STA-Versuch stoppen, AP + Funk behalten
+    }
+    staDownSince     = 0;
+    lastReconnectTry = now;
     return;
   }
 
@@ -1841,6 +1953,11 @@ void wifiBleLoop() {
   // laeuft erst ab 60s Laufzeit, damit der Start nicht faelschlich als Ausfall
   // gilt (lastUpdate ist bis zur ersten Antwort 0).
   BB_STEP("vesclink");
+  // Fahrterkennung auffrischen. Muss hier stehen und nicht in den
+  // Scan-Funktionen: die kehren an vielen Stellen frueh zurueck, und dann
+  // liefe der Zeitstempel nicht mit.
+  rideTick();
+
   bool vescLinkLost = (millis() > 60000UL) &&
                       (!vescStatus.connected ||
                        (millis() - vescStatus.lastUpdate > 60000UL));

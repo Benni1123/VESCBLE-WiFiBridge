@@ -84,7 +84,9 @@ static bool         bbArmed        = false;   // Waechter scharf (Anlaufzeit vor
 static uint32_t     bbLastAgeMs    = 0;       // fuer die Statusanzeige
 static bool         bbHadPrevious  = false;   // beim Boot eine Blackbox gefunden
 static bool         bbWriteFailed  = false;
-static bool         bbPendingClear = false;   // gelesen, aber noch nicht zugestellt
+static bool         bbPendingClear = false;   // liegt im Flash, noch nicht zugestellt
+static bool         bbFed          = false;   // schon in den Sendepuffer gelegt
+static uint32_t     bbBatchesAtFeed = 0;      // Batch-Zaehler beim Einspeisen
 
 // ── Letzte Logzeilen aus dem RTC-Ring ────────────────────────────────────────
 //
@@ -256,32 +258,65 @@ void blackboxSetup() {
   p.end();
 
   bbHadPrevious  = true;
-  // NICHT sofort loeschen. Nach einem Stillstand ist die Wahrscheinlichkeit
-  // hoch, dass auch der naechste Lauf kein WLAN bekommt — dann laege die
-  // einzige Spur nur noch im fluechtigen Sendepuffer und waere beim naechsten
-  // Stromausfall weg. Der Eintrag bleibt deshalb im Flash stehen, bis
-  // mindestens ein Batch nachweislich beim Server angekommen ist. Ein neuer
-  // Stillstand ueberschreibt ihn ohnehin, der neueste Fall gewinnt also.
   bbPendingClear = true;
+  bbFed          = false;
 
   Serial.println("\n[BLACKBOX] Eintrag aus dem Flash gefunden:");
   Serial.println(stored);
 
-  // uartLogAdd() statt logShipAdd(): die Zeilen gehoeren in BEIDE Puffer.
-  // logShipAdd() allein hiesse, dass die Blackbox nur auf dem Server
-  // auftaucht — ausgerechnet dann unsichtbar, wenn nach dem Neustart wieder
-  // kein WLAN da ist und man per AP oder USB nachsieht.
-  uartLogAdd("[BLACKBOX] --- Zustand vor dem letzten Stillstand (aus dem Flash) ---");
+  // Hier NUR in den Anzeigepuffer der Weboberflaeche, NICHT in den
+  // Sendepuffer. Das Einspeisen zum Verschicken passiert spaeter im
+  // Waechter-Task, sobald nachweislich eine Verbindung zum Server steht —
+  // siehe bbFeedFromFlash().
+  uartLogAddRaw("[BLACKBOX] --- Zustand vor dem letzten Stillstand (aus dem Flash) ---");
   int start = 0;
   while (start < (int)stored.length()) {
     int nl = stored.indexOf('\n', start);
     if (nl < 0) nl = stored.length();
     String line = stored.substring(start, nl);
     line.trim();
-    if (line.length() > 0) uartLogAdd("[BLACKBOX] " + line);
+    if (line.length() > 0) uartLogAddRaw("[BLACKBOX] " + line);
     start = nl + 1;
   }
-  uartLogAdd("[BLACKBOX] --- Ende ---");
+  uartLogAddRaw("[BLACKBOX] --- Ende ---");
+}
+
+// ── Blackbox in den Sendepuffer legen ───────────────────────────────────────
+//
+// Bewusst NICHT beim Boot, sondern erst wenn ein Batch nachweislich beim
+// Server angekommen ist.
+//
+// Der Grund ist eine Rechnung: der Sendepuffer fasst 2000 Zeilen, und allein
+// der [STAT]-Schnappschuss schreibt 120 Zeilen pro Stunde. Nach gut 16 Stunden
+// ohne Netz ist der Ring einmal umgelaufen. Beim Boot eingespeist, waeren die
+// Blackbox-Zeilen dann laengst als aelteste verdraengt — und der erste Batch,
+// der danach durchgeht, wuerde den Eintrag im Flash als "zugestellt" loeschen,
+// obwohl die Blackbox nie angekommen ist. Genau der Fall, fuer den das alles
+// gebaut wurde, waere der einzige, in dem es nicht funktioniert.
+//
+// Umgekehrt ist es sicher: steht die Verbindung, sind die frisch eingelegten
+// Zeilen die naechsten, die rausgehen.
+static void bbFeedFromFlash() {
+  Preferences p;
+  if (!p.begin(BLACKBOX_NS, true)) return;     // nur lesen
+  String stored = p.getString(BLACKBOX_KEY, "");
+  p.end();
+  if (stored.length() == 0) {
+    bbPendingClear = false;                    // nichts mehr da
+    return;
+  }
+
+  logShipAdd("[BLACKBOX] --- Zustand vor dem letzten Stillstand (aus dem Flash) ---");
+  int start = 0;
+  while (start < (int)stored.length()) {
+    int nl = stored.indexOf('\n', start);
+    if (nl < 0) nl = stored.length();
+    String line = stored.substring(start, nl);
+    line.trim();
+    if (line.length() > 0) logShipAdd("[BLACKBOX] " + line);
+    start = nl + 1;
+  }
+  logShipAdd("[BLACKBOX] --- Ende ---");
 }
 
 // ── Waechter ─────────────────────────────────────────────────────────────────
@@ -307,17 +342,34 @@ static void blackboxTaskFn(void *) {
 
     uint32_t now = millis();
 
-    // Zugestellt? Dann darf die Spur im Flash weg. shipBatchesOk ist der
-    // Zaehler erfolgreicher Uebertragungen aus logship.cpp — im Unity-Build
-    // hier sichtbar. Erst ein bestaetigter Batch heisst, dass die Zeilen
-    // wirklich auf dem Server liegen.
-    if (bbPendingClear && shipBatchesOk > 0) {
-      Preferences pc;
-      if (pc.begin(BLACKBOX_NS, false)) {
-        pc.remove(BLACKBOX_KEY);
-        pc.end();
+    // ── Blackbox zustellen, in zwei Schritten ───────────────────────────
+    //
+    // shipBatchesOk ist der Zaehler erfolgreicher Uebertragungen aus
+    // logship.cpp (im Unity-Build hier sichtbar). Er steigt nur, wenn der
+    // Server einen Batch mit 2xx bestaetigt hat — das ist der einzige
+    // verlaessliche Beleg, dass die Verbindung wirklich traegt.
+    //
+    //   1. Erst wenn einer durch ist, legen wir die Blackbox in den Puffer.
+    //   2. Erst wenn danach NOCH einer durch ist, war sie dabei und der
+    //      Eintrag im Flash darf weg.
+    //
+    // Bis dahin ueberlebt er alles: Neustarts, tagelang kein Netz, Strom weg.
+    if (bbPendingClear) {
+      if (!bbFed) {
+        if (shipBatchesOk > 0) {
+          bbFeedFromFlash();
+          bbBatchesAtFeed = shipBatchesOk;
+          bbFed = true;
+        }
+      } else if (shipBatchesOk > bbBatchesAtFeed) {
+        Preferences pc;
+        if (pc.begin(BLACKBOX_NS, false)) {
+          pc.remove(BLACKBOX_KEY);
+          pc.end();
+        }
+        bbPendingClear = false;
+        Serial.println("[BLACKBOX] zugestellt -> Flash-Eintrag geloescht");
       }
-      bbPendingClear = false;
     }
 
     // Waehrend eines OTA-Updates ist der Loop legitim ueber lange Strecken
@@ -387,6 +439,8 @@ String blackboxStatusJson() {
   j += ",\"rtc_wdt\":"     + String(bbRtcWdtOn ? "true" : "false");
   j += ",\"rtc_wdt_ms\":"  + String((unsigned long)BLACKBOX_RTCWDT_MS);
   j += ",\"had_previous\":" + String(bbHadPrevious ? "true" : "false");
+  j += ",\"pending\":"      + String(bbPendingClear ? "true" : "false");
+  j += ",\"fed\":"          + String(bbFed ? "true" : "false");
   j += ",\"write_failed\":" + String(bbWriteFailed ? "true" : "false");
   j += "}";
   return j;
