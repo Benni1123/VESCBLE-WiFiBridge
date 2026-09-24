@@ -8,6 +8,7 @@
 #include "debuglog.h"
 #include "time-service.h"
 #include "logship.h"
+#include "blackbox.h"
 #include "wifi-ble.h"
 #include <NimBLEBondMigration.h>   // einmalige Bond-Konvertierung 1.x -> 2.x (vor init!)
 
@@ -1839,6 +1840,7 @@ void wifiBleLoop() {
   // kurze Unterbrechung soll den AP nicht sofort hochreissen. Der Zeitvergleich
   // laeuft erst ab 60s Laufzeit, damit der Start nicht faelschlich als Ausfall
   // gilt (lastUpdate ist bis zur ersten Antwort 0).
+  BB_STEP("vesclink");
   bool vescLinkLost = (millis() > 60000UL) &&
                       (!vescStatus.connected ||
                        (millis() - vescStatus.lastUpdate > 60000UL));
@@ -1862,6 +1864,7 @@ void wifiBleLoop() {
 
   // Abschalten im Auto-Modus ist nur erlaubt, wenn der Rueckweg auch traegt:
   // Geraet eingerichtet, Auto gewaehlt UND der VESC liefert Daten.
+  BB_STEP("factory-ap");
   bool apMayShutOff = cfg_configured && (cfg_ap_mode == 2) && !vescLinkLost;
   if (!cfg_configured) {
     apWanted       = true;
@@ -1880,6 +1883,7 @@ void wifiBleLoop() {
   //              Bewegung holt ihn zurueck. KEIN "Aus" (AP ist der Fallback-Zugang).
   //
   // Modus-Wechsel zur Laufzeit sauber behandeln (ohne Reboot, wie BLE):
+  BB_STEP("apmode-switch");
   static int lastApMode = -1;
   if (cfg_ap_mode != lastApMode) {
     if (lastApMode != -1) {
@@ -1909,6 +1913,7 @@ void wifiBleLoop() {
   // Rueckweg: naechste Bewegung holt den AP zurueck (siehe Wake-Block unten).
   // Steht der Scooter dauerhaft ohne STA-Netz, ist der ESP bis zur naechsten
   // Bewegung/Reboot nicht per WLAN erreichbar — im Auto-Modus so gewollt.
+  BB_STEP("ap-idle-timeout");
   if (apActive && apMayShutOff && cfg_ap_timeout > 0) {
     int stations = WiFi.softAPgetStationNum();
     // Flanke erkennen: ist gerade das letzte Geraet abgefallen?
@@ -1998,6 +2003,7 @@ void wifiBleLoop() {
       // damit halten auch Watchdog/Safety den AP ab jetzt am Leben.
       apWanted = true;
       apLastClientGone = millis();   // Timer frisch starten, damit er nicht sofort wieder ablaeuft
+      BB_STEP("ap-wake");
       if (WiFi.getMode() != WIFI_AP_STA) WiFi.mode(WIFI_AP_STA);
       // force=true: echten softAP()-Start erzwingen (Zombie-AP-Schutz, s. ensureAP).
       // apOffByTimeout erst bei ERFOLG loeschen — schlaegt der Start fehl (z.B.
@@ -2018,6 +2024,7 @@ void wifiBleLoop() {
   // apWanted ist die einzige Wahrheit fuer den Soll-Zustand: true ausser der AP
   // wurde im Auto-Modus per Idle-Timeout abgeschaltet. Im Werkszustand
   // (unkonfiguriert) ist apWanted oben bereits hart auf true gezwungen.
+  BB_STEP("ap-watchdog");
   static int apWatchdogFails = 0;
   if (millis() - lastApEnsure > 5000) {
     lastApEnsure = millis();
@@ -2140,23 +2147,29 @@ void wifiBleLoop() {
   }
 
   // Non-blocking WiFi-Reconnect (async Scan, friert den Loop nicht ein)
+  BB_STEP("reconnect");
   handleWiFiReconnect();
 
   // RSSI-basiertes Roaming: zu staerkerem AP gleicher SSID wechseln
+  BB_STEP("roaming");
   handleRoaming();
 
   // BLE-Modus (Aus / An / Auto)
+  BB_STEP("blemode");
   handleBleMode();
 
   // Advertising-Intervall an WLAN-Bedarf anpassen (Airtime sparen bei Idle)
+  BB_STEP("adv-interval");
   manageAdvInterval();
 
   // Periodischer Zustands-Schnappschuss fuer den Log-Server
+  BB_STEP("heartbeat");
   logShipHeartbeat();
 
   // ── Auto reboot ─────────────────────────────────────────────────────────────
   // Die Wartezeit laeuft ab der LETZTEN Aktivitaet, nicht ab dem Boot. Jede
   // Form von Nutzung frischt sie auf; erst danach beginnt die Uhr von vorn.
+  BB_STEP("autoreboot");
   if (cfg_autoreboot && cfg_autoreboot_time > 0) {
     static unsigned long lastConnected = millis();
 

@@ -60,6 +60,19 @@ enum BlackboxPhase : uint8_t {
 };
 extern volatile uint8_t blackboxPhase;
 
+// Feinere Ortsangabe INNERHALB einer Phase.
+//
+// Die Phase allein sagt "steht in wifiBleLoop" — das sind rund 370 Zeilen mit
+// AP-Watchdog, Reconnect, Roaming, BLE-Modus und Heartbeat darin, und jeder
+// dieser Abschnitte ruft WLAN-Funktionen auf, die blockieren koennen. Ohne
+// eine feinere Angabe faengt die Suche bei neun Verdaechtigen an.
+//
+// Zeiger auf ein String-Literal: die Zuweisung ist auf dem S3 ein einzelner
+// 32-Bit-Schreibzugriff, also unteilbar. Kein Kopieren, keine Allokation,
+// nichts, was im Loop messbar waere.
+extern volatile const char *blackboxStep;
+#define BB_STEP(s) do { blackboxStep = (s); } while (0)
+
 // Schreibt sofort eine Blackbox mit dem angegebenen Grund. Kann aus jedem
 // Task gerufen werden; schlaegt der Schreibvorgang fehl, passiert nichts
 // weiter (die Blackbox darf niemals selbst zum Problem werden).

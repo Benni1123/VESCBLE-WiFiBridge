@@ -113,8 +113,17 @@ static inline void shipUnlock() { if (shipMutex) xSemaphoreGive(shipMutex); }
 #define RTC_NOINIT_ATTR
 #endif
 
-#define LOGSHIP_RTC_SLOTS 24
-#define LOGSHIP_RTC_LINE  160
+// 208 statt 160: die [STAT]-Zeile misst im Betrieb rund 200 Zeichen, und bei
+// 160 wurde sie ausgerechnet hinter temp= abgeschnitten — es fehlten scans,
+// staconn, stadisc und apwd, also genau die WLAN-Zaehler, wegen denen man die
+// Blackbox ueberhaupt aufschlaegt.
+//
+// Damit der RTC-Speicher dabei nicht waechst, dafuer weniger Plaetze:
+// 16 x 212 = 3392 Byte statt vorher 24 x 164 = 3936. Der RTC-Bereich des S3
+// ist knapp, und mehr als ein Dutzend Zeilen passen ohnehin nicht in die
+// Blackbox.
+#define LOGSHIP_RTC_SLOTS 16
+#define LOGSHIP_RTC_LINE  208
 #define LOGSHIP_RTC_MAGIC 0x4C534232UL   // "LSB2"
 
 struct LogShipRtcSlot {

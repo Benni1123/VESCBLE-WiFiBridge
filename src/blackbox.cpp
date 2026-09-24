@@ -66,16 +66,18 @@
 // Reset werden.
 #define BLACKBOX_RTCWDT_MS   180000UL
 
-// NVS-Groesse. 2 KB fassen die Kopfzeilen plus rund ein Dutzend Logzeilen.
-// Mehr bringt wenig: die interessante Information steht in den letzten
-// Sekunden vor dem Stillstand, nicht in den letzten Minuten.
-#define BLACKBOX_TEXT_MAX      2048
+// NVS-Groesse. Eine [STAT]-Zeile misst im Betrieb rund 200 Zeichen, dazu der
+// Kopf. Mit 2 KB brach die letzte Zeile mitten im Wort ab — 3 KB fassen die
+// Kopfzeilen plus rund vierzehn vollstaendige Logzeilen. Der NVS-Wert darf
+// knapp 4 KB gross werden, es bleibt also Reserve.
+#define BLACKBOX_TEXT_MAX      3072
 
 static const char BLACKBOX_NS[]  = "vescbb";
 static const char BLACKBOX_KEY[] = "bb";
 
-volatile uint32_t blackboxHeartbeat = 0;
-volatile uint8_t  blackboxPhase     = BB_PHASE_IDLE;
+volatile uint32_t   blackboxHeartbeat = 0;
+volatile uint8_t    blackboxPhase     = BB_PHASE_IDLE;
+volatile const char *blackboxStep     = "-";
 
 static TaskHandle_t bbTaskHandle   = nullptr;
 static bool         bbArmed        = false;   // Waechter scharf (Anlaufzeit vorbei)
@@ -183,19 +185,29 @@ void blackboxWrite(const char *reason) {
   uint32_t hb     = blackboxHeartbeat;
   uint32_t age    = (hb == 0) ? 0 : (now - hb);
   uint8_t  phase  = blackboxPhase;
+  const char *step = (const char *)blackboxStep;
+  if (!step) step = "-";
 
   size_t used = 0;
   int w = snprintf(text, BLACKBOX_TEXT_MAX,
                    "grund=%s\n"
-                   "up=%lus phase=%s hb_alter=%lums\n"
+                   "up=%lus phase=%s step=%s hb_alter=%lums\n"
                    "heap=%lu minheap=%lu maxblk=%lu loopmax=%lums@%lus loops=%lu\n",
                    (reason && reason[0]) ? reason : "unbekannt",
                    (unsigned long)(now / 1000UL),
                    phaseName(phase),
+                   step,
                    (unsigned long)age,
                    (unsigned long)ESP.getFreeHeap(),
                    (unsigned long)diagMinHeap,
-                   (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
+                   // MALLOC_CAP_INTERNAL ist hier entscheidend: ohne das misst
+                   // MALLOC_CAP_8BIT auch den PSRAM mit und meldet ueber ein
+                   // Megabyte, waehrend die [STAT]-Zeile daneben mit
+                   // ESP.getMaxAllocHeap() den internen Heap zeigt. Zwei
+                   // verschiedene Zahlen fuer dasselbe Feld sind schlimmer als
+                   // gar keine — man vergleicht sie und zieht falsche Schluesse.
+                   (unsigned long)heap_caps_get_largest_free_block(
+                       MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
                    (unsigned long)(diagMaxLoopUsStat / 1000UL),
                    (unsigned long)diagMaxLoopAtSec,
                    (unsigned long)diagLoopsPerSec);
@@ -330,8 +342,10 @@ static void blackboxTaskFn(void *) {
 
     // Stillstand.
     char reason[96];
-    snprintf(reason, sizeof(reason), "Hauptloop steht seit %lus in %s",
-             (unsigned long)(age / 1000UL), phaseName(blackboxPhase));
+    const char *st = (const char *)blackboxStep;
+    snprintf(reason, sizeof(reason), "Hauptloop steht seit %lus in %s/%s",
+             (unsigned long)(age / 1000UL), phaseName(blackboxPhase),
+             st ? st : "-");
 
     blackboxWrite(reason);
     bootDiagMarkPlannedRestart(reason);
@@ -369,6 +383,7 @@ String blackboxStatusJson() {
   j += ",\"hb_age_ms\":"   + String(bbLastAgeMs);
   j += ",\"stall_ms\":"    + String((unsigned long)BLACKBOX_STALL_MS);
   j += ",\"phase\":\""     + String(phaseName(blackboxPhase)) + "\"";
+  j += ",\"step\":\""      + String(blackboxStep ? (const char *)blackboxStep : "-") + "\"";
   j += ",\"rtc_wdt\":"     + String(bbRtcWdtOn ? "true" : "false");
   j += ",\"rtc_wdt_ms\":"  + String((unsigned long)BLACKBOX_RTCWDT_MS);
   j += ",\"had_previous\":" + String(bbHadPrevious ? "true" : "false");
