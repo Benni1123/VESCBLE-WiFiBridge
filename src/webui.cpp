@@ -1292,7 +1292,7 @@ void handlePage() {
 // oder "" wenn keiner verbunden ist / die IP noch nicht per DHCP vergeben wurde.
 // Zweistufig: Stationen holen (MAC), dann ueber esp_netif auf DHCP-IPs mappen.
 static String apClientIp() {
-  if (WiFi.softAPgetStationNum() == 0) return "";
+  if (apClientCount() == 0) return "";
   wifi_sta_list_t staList;
   if (esp_wifi_ap_get_sta_list(&staList) != ESP_OK) return "";
   // IDF 5: esp_netif_get_sta_list()/esp_netif_sta_list_t wurden entfernt.
@@ -1321,7 +1321,7 @@ void handleApiInfo() {
   json += "\"wifi_client_connected\":"+String((wifiClient&&wifiClient.connected())?"true":"false")+",";
   json += "\"ap_active\":"+String(apActive?"true":"false")+",";
   if (apActive && cfg_ap_mode == 2 && cfg_ap_timeout > 0) {
-    if (WiFi.softAPgetStationNum() > 0) {
+    if (apClientCount() > 0) {
       // Client verbunden -> Timer pausiert
       json += "\"ap_timeout_remaining\":-2,";
     } else {

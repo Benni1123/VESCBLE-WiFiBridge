@@ -137,7 +137,12 @@ NimBLEServer         *pServer               = nullptr;
 NimBLECharacteristic *pCharacteristicVescTx = nullptr;
 NimBLECharacteristic *pCharacteristicVescRx = nullptr;
 
-bool deviceConnected    = false;
+// volatile: geschrieben im NimBLE-Host-Task, gelesen im Hauptloop. Ohne das
+// darf der Compiler den Wert in ein Register legen und die Schleife nie wieder
+// nachsehen lassen — der Loop wuerde eine bestehende BLE-Verbindung dann
+// dauerhaft uebersehen. Ein bool ist ein einzelner Zugriff, also unteilbar;
+// mehr als volatile braucht es hier nicht.
+volatile bool deviceConnected    = false;
 bool oldDeviceConnected = false;
 
 // Runtime-Freischaltung des API-Tabs (8x auf die Ueberschrift tippen).
@@ -175,12 +180,15 @@ static unsigned long apStartTime = 0;
 static unsigned long apLastClientGone = 0;   // Zeitpunkt an dem das letzte Geraet sich vom AP trennte
 static int           apLastStationNum = 0;   // letzte bekannte Anzahl AP-Clients
 static bool          apOffByTimeout   = false; // AP wurde durch Timeout abgeschaltet (fuer Wake-on-Move)
-static bool       apActive   = false;
+// volatile: wird aus dem WLAN-Event-Task UND dem Hauptloop beschrieben.
+static volatile bool apActive   = false;
 
 // ── AP / WiFi resilience state ────────────────────────────────────────────────
 // apWanted = "der AP SOLL laufen". Wird einmal beim Start gesetzt und bleibt true
 // (AP soll dauerhaft aktiv sein). Der AP-Timeout kann ihn auf false setzen.
-static bool          apWanted          = false;
+// volatile: der Event-Task setzt das bei einem STA-Abbruch, der Loop und der
+// AP-Watchdog lesen es. Genau die Variable, an der der AP-Schutz haengt.
+static volatile bool apWanted          = false;
 static unsigned long lastApEnsure      = 0;
 static unsigned long lastReconnectTry  = 0;
 static bool          scanInProgress    = false;
@@ -314,6 +322,10 @@ uint8_t buf[MAX_BUF];
 // Moduluebergreifende Vorwaertsdeklarationen.
 static String vescFaultToString(int code);
 bool ensureAP(bool force);
+// Zahl der am AP haengenden Clients, zwischengespeichert (wifi-ble.cpp).
+// Ersetzt WiFi.softAPgetStationNum() ueberall dort, wo im Sekundentakt oder
+// oefter gefragt wird — der direkte Aufruf ist ein Treiberzugriff mit Sperre.
+int apClientCount();
 void handleRoaming();
 void handleBleMode();
 bool webUiActive();

@@ -70,7 +70,18 @@ extern volatile uint8_t blackboxPhase;
 // Zeiger auf ein String-Literal: die Zuweisung ist auf dem S3 ein einzelner
 // 32-Bit-Schreibzugriff, also unteilbar. Kein Kopieren, keine Allokation,
 // nichts, was im Loop messbar waere.
-extern volatile const char *blackboxStep;
+//
+// Schreibweise beachten: "const char * volatile" — der ZEIGER ist volatile,
+// nicht sein Ziel. Mit "volatile const char *" waere nur das Zeichen hinter
+// dem Zeiger fluechtig gewesen, der Zeiger selbst nicht: der Compiler haette
+// die Zuweisungen im Loop zusammenfassen, umordnen oder ganz weglassen
+// duerfen, weil sie aus seiner Sicht niemand liest. Die Marke haette dann im
+// Ernstfall auf den falschen Abschnitt gezeigt — schlimmer als gar keine.
+//
+// Ein Zeiger ist auf dem S3 vier Byte gross und ausgerichtet, die Zuweisung
+// also ein einzelner Schreibzugriff und damit unteilbar. Der Waechter-Task
+// sieht deshalb immer einen vollstaendigen Wert, nie eine halbe Adresse.
+extern const char * volatile blackboxStep;
 #define BB_STEP(s) do { blackboxStep = (s); } while (0)
 
 // Schreibt sofort eine Blackbox mit dem angegebenen Grund. Kann aus jedem

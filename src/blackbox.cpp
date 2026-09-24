@@ -77,7 +77,7 @@ static const char BLACKBOX_KEY[] = "bb";
 
 volatile uint32_t   blackboxHeartbeat = 0;
 volatile uint8_t    blackboxPhase     = BB_PHASE_IDLE;
-volatile const char *blackboxStep     = "-";
+const char * volatile blackboxStep    = "-";
 
 static TaskHandle_t bbTaskHandle   = nullptr;
 static bool         bbArmed        = false;   // Waechter scharf (Anlaufzeit vorbei)
@@ -86,7 +86,17 @@ static bool         bbHadPrevious  = false;   // beim Boot eine Blackbox gefunde
 static bool         bbWriteFailed  = false;
 static bool         bbPendingClear = false;   // liegt im Flash, noch nicht zugestellt
 static bool         bbFed          = false;   // schon in den Sendepuffer gelegt
-static uint32_t     bbBatchesAtFeed = 0;      // Batch-Zaehler beim Einspeisen
+// ERSTE und LETZTE eigene Zeile im Sendepuffer.
+//
+// Beide Nummern sind noetig, weil ein Ueberlauf die Blackbox auch nur ZUM TEIL
+// erwischen kann: fliegen von 100 bis 115 nur 100 bis 105 heraus, bleibt die
+// hoechste verworfene Nummer bei 105 und damit unter der letzten eigenen.
+// Nur die letzte zu pruefen hiesse dann: Bestaetigung erreicht 115, der
+// Flash-Eintrag wird geloescht — und auf dem Server liegt eine Blackbox, der
+// vorne die Haelfte fehlt. Verglichen wird deshalb gegen die ERSTE Nummer.
+static uint32_t     bbFeedFirstSeq  = 0;
+static uint32_t     bbFeedLastSeq   = 0;
+static uint32_t     bbBatchesAtFeed = 0;      // Batch-Stand beim letzten Einspeisen
 
 // ── Letzte Logzeilen aus dem RTC-Ring ────────────────────────────────────────
 //
@@ -142,9 +152,11 @@ static void bbRtcWdtStart() {
   rtc_wdt_set_stage(RTC_WDT_STAGE0, RTC_WDT_STAGE_ACTION_RESET_SYSTEM);
   rtc_wdt_set_time(RTC_WDT_STAGE0, BLACKBOX_RTCWDT_MS);
   rtc_wdt_enable();
-  // rtc_wdt_protect_on() wird bewusst NICHT gerufen: mit aktivem Schreibschutz
-  // laeuft jedes Fuettern ins Leere, und ein Watchdog, den niemand mehr
-  // beruhigen kann, startet das Geraet im Minutentakt neu.
+  // Schreibschutz wieder aktivieren. Ohne ihn kann jeder beliebige Code — auch
+  // ein Amoklauf im Speicher — die Watchdog-Register ueberschreiben und damit
+  // genau die letzte Sicherung abschalten, die im Fehlerfall noch greifen
+  // soll. Das Fuettern kommt trotzdem durch, siehe bbRtcWdtFeed().
+  rtc_wdt_protect_on();
   bbRtcWdtOn = true;
   Serial.printf("[BLACKBOX] RTC-Watchdog aktiv (%lus)\n",
                 (unsigned long)(BLACKBOX_RTCWDT_MS / 1000UL));
@@ -155,7 +167,15 @@ static void bbRtcWdtStart() {
 
 static inline void bbRtcWdtFeed() {
 #if BB_HAVE_RTC_WDT
-  if (bbRtcWdtOn) rtc_wdt_feed();
+  if (!bbRtcWdtOn) return;
+  // Schutz explizit auf und wieder zu. rtc_wdt_feed() macht das in den
+  // meisten IDF-Fassungen zwar selbst, aber darauf zu bauen waere hier die
+  // falsche Wette: laege man daneben, liefe jedes Fuettern ins Leere und der
+  // Watchdog startete das Geraet im Dreiminutentakt neu. Zweimal aufzuschliessen
+  // ist dagegen folgenlos.
+  rtc_wdt_protect_off();
+  rtc_wdt_feed();
+  rtc_wdt_protect_on();
 #endif
 }
 
@@ -187,7 +207,7 @@ void blackboxWrite(const char *reason) {
   uint32_t hb     = blackboxHeartbeat;
   uint32_t age    = (hb == 0) ? 0 : (now - hb);
   uint8_t  phase  = blackboxPhase;
-  const char *step = (const char *)blackboxStep;
+  const char *step = blackboxStep;
   if (!step) step = "-";
 
   size_t used = 0;
@@ -296,27 +316,46 @@ void blackboxSetup() {
 //
 // Umgekehrt ist es sicher: steht die Verbindung, sind die frisch eingelegten
 // Zeilen die naechsten, die rausgehen.
-static void bbFeedFromFlash() {
+// Liefert true, wenn wirklich Zeilen eingelegt wurden. Nur dann darf der
+// Aufrufer bbFed setzen — sonst gaelte die Blackbox als "unterwegs", obwohl
+// nie etwas in den Puffer kam, und der Flash-Eintrag verschwaende beim
+// naechsten bestaetigten Batch.
+static bool bbFeedFromFlash() {
   Preferences p;
-  if (!p.begin(BLACKBOX_NS, true)) return;     // nur lesen
+  if (!p.begin(BLACKBOX_NS, true)) return false;   // nur lesen
   String stored = p.getString(BLACKBOX_KEY, "");
   p.end();
   if (stored.length() == 0) {
-    bbPendingClear = false;                    // nichts mehr da
-    return;
+    bbPendingClear = false;                        // nichts mehr da
+    return false;
   }
 
-  logShipAdd("[BLACKBOX] --- Zustand vor dem letzten Stillstand (aus dem Flash) ---");
+  // Jede Zeile gibt ihre eigene Nummer zurueck. Sie aus shipSeq abzuleiten
+  // waere ein Rennen: zwischen dem Einlegen und dem Auslesen des Zaehlers kann
+  // der Hauptloop oder der Event-Task eine eigene Zeile dazwischenschieben.
+  uint32_t first = 0, last = 0;
+  auto put = [&](const String &l) {
+    uint32_t sq = logShipAddSeq(l);
+    if (sq == 0) return;
+    if (first == 0) first = sq;
+    last = sq;
+  };
+
+  put("[BLACKBOX] --- Zustand vor dem letzten Stillstand (aus dem Flash) ---");
   int start = 0;
   while (start < (int)stored.length()) {
     int nl = stored.indexOf('\n', start);
     if (nl < 0) nl = stored.length();
     String line = stored.substring(start, nl);
     line.trim();
-    if (line.length() > 0) logShipAdd("[BLACKBOX] " + line);
+    if (line.length() > 0) put("[BLACKBOX] " + line);
     start = nl + 1;
   }
-  logShipAdd("[BLACKBOX] --- Ende ---");
+  put("[BLACKBOX] --- Ende ---");
+
+  bbFeedFirstSeq = first;
+  bbFeedLastSeq  = last;
+  return first != 0;
 }
 
 // ── Waechter ─────────────────────────────────────────────────────────────────
@@ -349,19 +388,56 @@ static void blackboxTaskFn(void *) {
     // Server einen Batch mit 2xx bestaetigt hat — das ist der einzige
     // verlaessliche Beleg, dass die Verbindung wirklich traegt.
     //
-    //   1. Erst wenn einer durch ist, legen wir die Blackbox in den Puffer.
-    //   2. Erst wenn danach NOCH einer durch ist, war sie dabei und der
-    //      Eintrag im Flash darf weg.
+    //   1. Erst wenn einer durch ist, legen wir die Blackbox in den Puffer
+    //      und merken uns die Sequenznummer ihrer letzten Zeile.
+    //   2. Geloescht wird erst, wenn die BESTAETIGTE Sequenznummer diese
+    //      erreicht hat. Auf "noch ein Batch war erfolgreich" zu warten
+    //      reichte nicht: der Puffer ist FIFO, bei Rueckstau gehen erst die
+    //      aelteren Zeilen raus und die Blackbox waere geloescht worden,
+    //      bevor sie ueberhaupt an der Reihe war.
     //
     // Bis dahin ueberlebt er alles: Neustarts, tagelang kein Netz, Strom weg.
     if (bbPendingClear) {
+      // Sind die eingelegten Zeilen inzwischen aus dem Ringpuffer geflogen?
+      //
+      // Der Ablauf, der sonst still Daten verliert: Blackbox bekommt die
+      // Nummern 100 bis 115, danach faellt das Netz tagelang aus, der Ring
+      // laeuft mehrfach ueber und verwirft sie. Kommt das Netz zurueck, wird
+      // irgendwann Nummer 3000 bestaetigt — und "3000 >= 115" waere erfuellt,
+      // obwohl die Blackbox nie gesendet wurde. Der Flash-Eintrag verschwaende
+      // ausgerechnet in dem Fall, fuer den er gedacht ist.
+      //
+      // shipDroppedMaxSeq trennt die beiden Faelle sauber: liegt es bei oder
+      // ueber der eigenen Nummer, wurden die Zeilen verworfen und muessen
+      // erneut aus dem Flash kommen.
+      // Verglichen wird gegen die ERSTE Nummer: sobald auch nur die aelteste
+      // eigene Zeile verworfen wurde, ist die Blackbox unvollstaendig und
+      // muss komplett neu eingespeist werden.
+      if (bbFed && bbFeedFirstSeq != 0 && shipDroppedMaxSeq >= bbFeedFirstSeq) {
+        Serial.println("[BLACKBOX] Zeilen aus dem Sendepuffer verdraengt -> erneut einspeisen");
+        bbFed          = false;
+        bbFeedFirstSeq = 0;
+        bbFeedLastSeq  = 0;
+      }
+
+      // Eingespeist wird nur, wenn seit dem letzten Versuch tatsaechlich ein
+      // Batch durchgegangen ist. Ohne diese Kopplung an echten Fortschritt
+      // koennte der Puffer die Zeilen sofort wieder verdraengen und der
+      // Waechter legte im Zweisekundentakt neue nach — eine Schleife, die den
+      // Puffer zusaetzlich flutet, statt zu helfen.
       if (!bbFed) {
-        if (shipBatchesOk > 0) {
-          bbFeedFromFlash();
-          bbBatchesAtFeed = shipBatchesOk;
-          bbFed = true;
+        if (shipBatchesOk > bbBatchesAtFeed) {
+          if (bbFeedFromFlash()) {               // setzt bbFeedFirst/LastSeq
+            bbFed           = true;
+            bbBatchesAtFeed = shipBatchesOk;
+          }
         }
-      } else if (shipBatchesOk > bbBatchesAtFeed) {
+      } else if (bbFeedLastSeq != 0 && shipAckedSeq >= bbFeedLastSeq) {
+        // Geloescht wird erst, wenn die LETZTE eigene Zeile bestaetigt ist —
+        // und da oben bereits sichergestellt ist, dass keine davon verworfen
+        // wurde, ist damit die ganze Blackbox angekommen. Die Null-Pruefung
+        // faengt den Fall ab, dass nie etwas eingelegt wurde; ohne sie waere
+        // die Bedingung sofort erfuellt.
         Preferences pc;
         if (pc.begin(BLACKBOX_NS, false)) {
           pc.remove(BLACKBOX_KEY);
@@ -394,7 +470,7 @@ static void blackboxTaskFn(void *) {
 
     // Stillstand.
     char reason[96];
-    const char *st = (const char *)blackboxStep;
+    const char *st = blackboxStep;
     snprintf(reason, sizeof(reason), "Hauptloop steht seit %lus in %s/%s",
              (unsigned long)(age / 1000UL), phaseName(blackboxPhase),
              st ? st : "-");
@@ -435,12 +511,16 @@ String blackboxStatusJson() {
   j += ",\"hb_age_ms\":"   + String(bbLastAgeMs);
   j += ",\"stall_ms\":"    + String((unsigned long)BLACKBOX_STALL_MS);
   j += ",\"phase\":\""     + String(phaseName(blackboxPhase)) + "\"";
-  j += ",\"step\":\""      + String(blackboxStep ? (const char *)blackboxStep : "-") + "\"";
+  j += ",\"step\":\""      + String(blackboxStep ? blackboxStep : "-") + "\"";
   j += ",\"rtc_wdt\":"     + String(bbRtcWdtOn ? "true" : "false");
   j += ",\"rtc_wdt_ms\":"  + String((unsigned long)BLACKBOX_RTCWDT_MS);
   j += ",\"had_previous\":" + String(bbHadPrevious ? "true" : "false");
   j += ",\"pending\":"      + String(bbPendingClear ? "true" : "false");
   j += ",\"fed\":"          + String(bbFed ? "true" : "false");
+  j += ",\"feed_first\":"   + String(bbFeedFirstSeq);
+  j += ",\"feed_last\":"    + String(bbFeedLastSeq);
+  j += ",\"acked_seq\":"    + String(shipAckedSeq);
+  j += ",\"dropped_seq\":"  + String(shipDroppedMaxSeq);
   j += ",\"write_failed\":" + String(bbWriteFailed ? "true" : "false");
   j += "}";
   return j;

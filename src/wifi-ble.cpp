@@ -10,6 +10,12 @@
 #include "logship.h"
 #include "blackbox.h"
 #include "wifi-ble.h"
+
+// Die Ereignis-Queue zwischen WLAN-Event-Task und Hauptloop. FreeRTOS.h zieht
+// queue.h nicht in jeder Fassung mit, deshalb ausdruecklich.
+#include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
+
 #include <NimBLEBondMigration.h>   // einmalige Bond-Konvertierung 1.x -> 2.x (vor init!)
 
 // Interne Initialisierungsfunktion des Arduino-Cores (in 3.3.9 verifiziert:
@@ -167,18 +173,252 @@ class MyCallbacks : public NimBLECharacteristicCallbacks {
 // im UI zum WiFi-Filter (Bit 2), nicht zum allgemeinen Status-Filter. Der
 // Versand laeuft bewusst unabhaengig davon: genau diese Events braucht man nach
 // einem Aussetzer, und Debug erst hinterher einzuschalten hilft dann nicht mehr.
-static void wifiEventLog(const char *fmt, ...) {
-  char msg[192];
+// Client-Zaehler, aus den AP-Ereignissen im Hauptloop fortgeschrieben.
+// Steht bewusst hier oben: sowohl wifiEvtDrain() als auch apStaCountRefresh()
+// greifen darauf zu, und beide stehen weiter unten.
+//
+// KEIN volatile: seit die Ereignisse ueber die Queue laufen, fasst ihn
+// ausschliesslich der Hauptloop an — wifiEvtDrain(), apStaCountRefresh() und
+// apClientCount(), letzteres auch aus den Webhandlern, die ebenfalls im Loop
+// laufen. volatile wuerde hier nur verhindern, dass der Compiler den Wert
+// zwischen den rund zehn Abfragen je Durchlauf im Register behaelt.
+static int apStaEvtCount = 0;
+
+// ── Ereignisse aus dem WLAN-Event-Task herausreichen ────────────────────────
+//
+// Arduino ruft WLAN-Callbacks in einem EIGENEN FreeRTOS-Task auf, und dieser
+// Task ist es auch, der die Antworten der esp_wifi-API zustellt. Alles, was
+// den Callback anhaelt, haelt damit den gesamten WLAN-Stack an — und jeder
+// spaetere esp_wifi-Aufruf aus dem Hauptloop wartet dann auf eine Antwort,
+// die nie kommt. Der Loop steht, BLE laeuft in seinem eigenen Task munter
+// weiter. Genau dieses Bild zeigen die Blackbox-Aufzeichnungen.
+//
+// Frueher stand im Callback Serial.println(), logShipAdd() und
+// uartLogAddRaw(). Alle drei koennen warten: der USB-Puffer laeuft voll, und
+// die beiden Logpuffer nehmen ihre Mutexe mit portMAX_DELAY. Haelt der
+// Sende-Task auf Kern 0 gerade shipMutex, blockiert der Event-Task unbegrenzt.
+// Dazu kamen direkte WiFi.*-Aufrufe — Reentranz in genau den Stack, der das
+// Ereignis gerade verarbeitet.
+//
+// Jetzt legt der Callback eine Nachricht in eine FreeRTOS-Queue und kehrt
+// zurueck. Warum eine Queue und nicht ein selbstgebauter Ring mit zwei
+// volatile-Indizes: der Ring laeuft ueber zwei Kerne, und volatile ordnet nur
+// volatile Zugriffe untereinander. Der Compiler darf das Beschreiben des
+// Textpuffers hinter das Hochzaehlen des Schreibindex schieben — der Leser
+// saehe dann eine Nachricht, die noch gar nicht fertig geschrieben ist.
+// xQueueSend kopiert die Nachricht unter der richtigen Absicherung und ist
+// fuer genau diesen Zweck gebaut. Mit Wartezeit 0 blockiert es nie: ist die
+// Queue voll, wird die Nachricht verworfen und gezaehlt. Eine verlorene
+// Logzeile ist harmlos, ein blockierter WLAN-Stack nicht.
+//
+// Alle Nutzdaten stammen aus dem info-Struct des Ereignisses. Damit braucht
+// der Callback keinen einzigen Treiberaufruf mehr, und die Werte beschreiben
+// exakt dieses Ereignis statt den Zustand einige Millisekunden spaeter.
+enum : uint8_t {
+  WEVT_TEXT = 0,          // reine Logzeile, keine weitere Wirkung
+  WEVT_STA_CONNECTED,     // + ssid/bssid/channel
+  WEVT_STA_GOT_IP,
+  WEVT_STA_DISCONNECTED,  // + reason
+  WEVT_AP_START,
+  WEVT_AP_STOP,
+  WEVT_AP_STACONN,
+  WEVT_AP_STADISCONN,
+};
+
+struct WifiEvtMsg {
+  uint8_t  kind;
+  uint8_t  reason;
+  uint8_t  channel;
+  uint8_t  ssidLen;
+  uint8_t  ssid[33];
+  uint8_t  bssid[6];
+  uint32_t ip;
+  char     text[144];
+};
+
+#define WIFI_EVT_QUEUE_LEN 16
+
+static QueueHandle_t     wifiEvtQueue   = nullptr;
+static volatile uint32_t wifiEvtDropped = 0;
+
+// Muss VOR WiFi.onEvent() laufen. Ohne Queue verwirft der Callback still.
+static void wifiEvtQueueInit() {
+  if (!wifiEvtQueue) {
+    wifiEvtQueue = xQueueCreate(WIFI_EVT_QUEUE_LEN, sizeof(WifiEvtMsg));
+  }
+}
+
+// NUR aus dem Event-Task. Keine Allokation, kein Mutex, kein Warten.
+static void wifiEvtSend(WifiEvtMsg &m) {
+  if (!wifiEvtQueue) { wifiEvtDropped++; return; }
+  if (xQueueSend(wifiEvtQueue, &m, 0) != pdTRUE) wifiEvtDropped++;
+}
+
+// Bequemer Weg fuer Nachrichten, die nur eine Logzeile sind.
+static void wifiEvtText(uint8_t kind, const char *fmt, ...) {
+  WifiEvtMsg m;
+  memset(&m, 0, sizeof(m));
+  m.kind = kind;
   va_list args;
   va_start(args, fmt);
-  vsnprintf(msg, sizeof(msg), fmt, args);
+  vsnprintf(m.text, sizeof(m.text), fmt, args);
   va_end(args);
+  wifiEvtSend(m);
+}
 
-  Serial.println(msg);
-  logShipAdd(String(msg));
+// ── Verarbeitung im Hauptloop ───────────────────────────────────────────────
+//
+// Hier ist Warten erlaubt und hier duerfen Strings entstehen. Saemtliche
+// Folgewirkungen eines Ereignisses passieren erst an dieser Stelle:
+// Diagnosezaehler, Merkwerte fuer den schnellen Wiedereinstieg, die
+// AP-Clientzahl und der Modus-Schutz. Der Callback selbst aendert keinen
+// gemeinsam genutzten Zustand mehr, er schickt nur eine Nachricht — damit
+// entfaellt die ganze Klasse von Wettlaeufen zwischen den beiden Kernen.
+static void wifiEvtDrain() {
+  if (!wifiEvtQueue) return;
 
-  if (!cfg_debug || !(cfg_debug_filter & 2)) return;
-  uartLogAddRaw(String(msg));
+  WifiEvtMsg m;
+  while (xQueueReceive(wifiEvtQueue, &m, 0) == pdTRUE) {
+
+    switch (m.kind) {
+      case WEVT_STA_CONNECTED:
+        // SSID, BSSID und Kanal stammen aus dem Ereignis und beschreiben
+        // exakt diese Assoziation — verlaesslicher als ein spaeterer
+        // Treiberzugriff, der nach einem Scan auch mal leer zurueckkommt.
+        memcpy(staLastBssid, m.bssid, 6);
+        staLastSsid       = String((const char *)m.ssid);
+        staLastChannel    = m.channel;
+        staLastValid      = !staLastSsid.isEmpty();
+        staFastRetryFails = 0;
+        break;
+
+      case WEVT_STA_GOT_IP:
+        diagStaConnects++;
+        staWasConnected = true;
+        break;
+
+      case WEVT_STA_DISCONNECTED:
+        diagStaDisconnects++;
+        diagLastDiscReason = m.reason;
+        if (staLastValid) staFastRetry = true;
+        apWanted = true;                 // AP wird als Zugang wieder gebraucht
+        // Modus-Schutz: frueher stand WiFi.mode() direkt im Ereignis. Der
+        // Schutz ist zu wichtig zum Streichen, gehoert aber hierher.
+        if (WiFi.getMode() != WIFI_AP_STA) {
+          WiFi.mode(WIFI_AP_STA);
+          dlog("WiFi: mode restored to AP_STA after STA disconnect\n");
+        }
+        staWasConnected = false;
+        break;
+
+      case WEVT_AP_START:
+        apStartedByEvent = true;
+        break;
+
+      case WEVT_AP_STOP:
+        apStartedByEvent = false;
+        break;
+
+      case WEVT_AP_STACONN:
+        diagApClientConn++;
+        apStaEvtCount++;
+        break;
+
+      case WEVT_AP_STADISCONN:
+        diagApClientDisc++;
+        if (apStaEvtCount > 0) apStaEvtCount--;
+        // War das der LETZTE Client? Dann Nachlauf-Sperre starten: die
+        // naechsten STA_SUPPRESS_AFTER_AP_MS wird nicht gescannt.
+        if (apStaEvtCount == 0) apClientGoneAt = millis();
+        break;
+
+      default:
+        break;
+    }
+
+    if (m.text[0]) {
+      m.text[sizeof(m.text) - 1] = 0;
+      Serial.println(m.text);
+      logShipAdd(String(m.text));
+      if (cfg_debug && (cfg_debug_filter & 2)) uartLogAddRaw(String(m.text));
+    }
+  }
+
+  static uint32_t lastDropReport = 0;
+  uint32_t dropped = wifiEvtDropped;
+  if (dropped != lastDropReport) {
+    lastDropReport = dropped;
+    String w = String("[evt] WARN: ") + String(dropped) + String(" Ereignisse verworfen (Queue voll)");
+    Serial.println(w);
+    logShipAdd(w);
+  }
+}
+
+// ── Zahl der AP-Clients, zwischengespeichert ────────────────────────────────
+//
+// WiFi.softAPgetStationNum() ist ein synchroner Treiberzugriff und nimmt dabei
+// die WLAN-API-Sperre. Abgefragt wurde er an vier Stellen im Loop —
+// AP-Idle-Timeout, Roaming, Reconnect und Auto-Reboot — also bei knapp 1000
+// Durchlaeufen pro Sekunde rund viertausend Mal je Sekunde. Jede dieser
+// Anfragen ist eine Gelegenheit, auf einen blockierten Event-Task zu treffen,
+// und keine davon braucht wirklich einen Wert, der jede Millisekunde frisch
+// ist: es geht um "haengt gerade jemand am AP?".
+//
+// Gefragt wird der Treiber nur noch alle 5 Sekunden und nur bei LAUFENDEM AP.
+// Die Ereignisse melden jede Verbindung und Trennung ohnehin sofort — die
+// periodische Abfrage ist reine Nachkontrolle fuer den Fall, dass eines
+// ausfaellt. Alle 500 ms zu fragen waeren rund 173.000 Treiberzugriffe am Tag
+// gewesen, und bei abgeschaltetem AP haetten sie ausnahmslos null ergeben.
+#define AP_STA_REFRESH_MS 5000UL
+static int           apStaCached     = 0;
+static unsigned long apStaCachedAt   = 0;
+
+
+static void apStaCountRefresh(bool force) {
+  unsigned long now = millis();
+
+  // Kein AP -> kein Client. Das braucht keinen Treiberzugriff, und der
+  // Zaehler muss trotzdem auf null fallen: sonst hielte ein alter Wert den
+  // AP-Idle-Timeout dauerhaft angehalten.
+  if (!apActive) {
+    apStaCached   = 0;
+    apStaEvtCount = 0;
+    apStaCachedAt = now;
+    return;
+  }
+
+  if (!force && apStaCachedAt != 0 && (now - apStaCachedAt) < AP_STA_REFRESH_MS) return;
+  apStaCachedAt = now;
+  int n = (int)WiFi.softAPgetStationNum();
+  apStaCached   = n;
+  apStaEvtCount = n;                      // Ereigniszaehler nachfuehren
+}
+
+// Ueberall dort zu benutzen, wo frueher WiFi.softAPgetStationNum() stand.
+// Nimmt den hoeheren der beiden Werte: ein gerade per Ereignis gemeldeter
+// Client soll nicht dadurch verlorengehen, dass der letzte Treiberwert noch
+// aelter ist. Fuer die Frage "ist jemand da?" ist das die sichere Richtung —
+// im Zweifel bleibt der AP an, statt jemandem unter den Fuessen wegzugehen.
+int apClientCount() {
+  int e = apStaEvtCount;
+  return (e > apStaCached) ? e : apStaCached;
+}
+
+// ── Scan wirklich beenden ───────────────────────────────────────────────────
+//
+// WiFi.scanDelete() gibt nur die Ergebnisliste frei und setzt die Arduino-
+// eigenen Zustandsvariablen zurueck. Der HARDWARE-Scan laeuft danach weiter:
+// die Funkeinheit springt weiter durch die Kanaele und nimmt den SoftAP dabei
+// von seinem Kanal mit. Wer also "if (scanInProgress) { scanDelete(); }"
+// schreibt, verliert nur den Zustand und glaubt fortan, es laufe kein Scan —
+// waehrend genau das passiert, was er verhindern wollte.
+//
+// esp_wifi_scan_stop() bricht den laufenden Durchlauf im Treiber ab. Ein
+// Fehler daraus ist unkritisch (meist ESP_ERR_WIFI_NOT_STARTED oder es lief
+// ohnehin keiner), deshalb wird er bewusst nicht behandelt.
+static void stopStaScan() {
+  esp_wifi_scan_stop();
+  WiFi.scanDelete();
 }
 
 // Vollstaendige Klartext-Zuordnung fuer ESP-IDF wifi_err_reason_t.
@@ -282,6 +522,7 @@ static void logShipHeartbeat() {
   if (millis() - lastBeat < 30000UL) return;
   lastBeat = millis();
 
+  BB_STEP("stat-status");
   char line[336];   // groesser als LOGSHIP_LINE_MAX (320) in logship.cpp
   bool staUp = (WiFi.status() == WL_CONNECTED);
 
@@ -290,6 +531,7 @@ static void logShipHeartbeat() {
   // weg, ist das eine ganz andere Spur als ein stehender Loop bei 50 Grad.
   // Als Text, weil der Sensor bei Nichtbereitschaft NaN liefert und "nan"
   // mitten in der Zeile nur verwirrt.
+  BB_STEP("stat-temp");
   char tstr[10] = "-";
   {
     float t = temperatureRead();
@@ -300,12 +542,14 @@ static void logShipHeartbeat() {
   // erst die BSSID zeigt, auf WELCHEM man gerade sitzt. Nur drei Oktette, damit
   // die Zeile nicht ueber LOGSHIP_LINE_MAX waechst — die ersten drei sind bei
   // Geraeten desselben Herstellers ohnehin identisch.
+  BB_STEP("stat-bssid");
   char bss[8] = "------";
   if (staUp) {
     uint8_t *b = WiFi.BSSID();
     if (b) snprintf(bss, sizeof(bss), "%02X%02X%02X", b[3], b[4], b[5]);
   }
 
+  BB_STEP("stat-build");
   snprintf(line, sizeof(line),
            "[STAT] sta=%d ssid=%.24s bssid=%s rssi=%d ch=%d ap=%d apcl=%u ble=%d adv=%d "
            "heap=%u minheap=%u maxblk=%u loopmax=%lums@%lus loops=%u temp=%s "
@@ -316,7 +560,7 @@ static void logShipHeartbeat() {
            staUp ? (int)WiFi.RSSI() : 0,
            (int)WiFi.channel(),
            apActive ? 1 : 0,
-           (unsigned)WiFi.softAPgetStationNum(),
+           (unsigned)apClientCount(),
            deviceConnected ? 1 : 0,
            bleIsAdvertising ? 1 : 0,
            (unsigned)ESP.getFreeHeap(),
@@ -331,6 +575,7 @@ static void logShipHeartbeat() {
            (unsigned)diagStaDisconnects,
            (unsigned)diagLastDiscReason,
            (unsigned)diagApWatchdogFires);
+  BB_STEP("stat-queue");
   logShipAdd(String(line));
 
   // Erst NACH dem Bericht zuruecksetzen. Die naechste Zeile zeigt dann das
@@ -342,96 +587,77 @@ static void logShipHeartbeat() {
 // bei STA_DISCONNECTED darf der AP NICHT mitsterben. Wir setzen den Mode hart
 // zurück und ziehen den AP sofort wieder hoch, falls er gefallen ist.
 void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
+  // AB HIER GILT: kein WiFi.*, kein Serial, kein String, kein Mutex, keine
+  // Allokation und keine Aenderung an gemeinsam genutztem Zustand. Alles, was
+  // hier laenger braucht, haelt den gesamten WLAN-Stack an.
+  WifiEvtMsg m;
+  memset(&m, 0, sizeof(m));
+
   switch (event) {
-    case ARDUINO_EVENT_WIFI_STA_CONNECTED:
-      wifiEventLog("[evt] STA connected");
+    case ARDUINO_EVENT_WIFI_STA_CONNECTED: {
+      m.kind = WEVT_STA_CONNECTED;
+      uint8_t l = info.wifi_sta_connected.ssid_len;
+      if (l > 32) l = 32;
+      memcpy(m.ssid, info.wifi_sta_connected.ssid, l);
+      m.ssid[l]  = 0;
+      m.ssidLen  = l;
+      memcpy(m.bssid, info.wifi_sta_connected.bssid, 6);
+      m.channel  = info.wifi_sta_connected.channel;
+      snprintf(m.text, sizeof(m.text), "[evt] STA connected");
+      wifiEvtSend(m);
       break;
+    }
 
-    case ARDUINO_EVENT_WIFI_STA_GOT_IP:
-      wifiEventLog("[evt] STA got IP: %s (rssi %d dBm, ch %d)",
-                   WiFi.localIP().toString().c_str(), (int)WiFi.RSSI(), (int)WiFi.channel());
-      diagStaConnects++;                    // Diagnose: erfolgreiche STA-Verbindung
-      staWasConnected = true;
-      // Diese Assoziation hat funktioniert -> als Ziel fuer den schnellen
-      // Wiedereinstieg merken. Hier sind die Werte verlaesslich: die
-      // Verbindung steht gerade, esp_wifi_sta_get_ap_info() liefert also
-      // gueltige Daten (anders als direkt nach einem Scan).
-      {
-        uint8_t *b = WiFi.BSSID();
-        if (b) {
-          memcpy(staLastBssid, b, 6);
-          staLastSsid       = WiFi.SSID();
-          staLastChannel    = WiFi.channel();
-          staLastValid      = !staLastSsid.isEmpty();
-          staFastRetryFails = 0;
-        }
-      }
-      // Kein ensureAP() hier (Reentranz vermeiden). Falls der STA-Connect den
-      // AP-Channel verschoben hat, korrigiert der Watchdog im loop() das
-      // zeitversetzt und ohne Event-Schleife.
+    case ARDUINO_EVENT_WIFI_STA_GOT_IP: {
+      m.kind = WEVT_STA_GOT_IP;
+      uint32_t ip = info.got_ip.ip_info.ip.addr;
+      m.ip = ip;
+      // Die IP steht im Ereignis. RSSI und Kanal bewusst nicht: die waeren
+      // nur ueber den Treiber zu haben, und dafuer ist hier nicht der Ort.
+      snprintf(m.text, sizeof(m.text), "[evt] STA got IP: %u.%u.%u.%u",
+               (unsigned)(ip & 0xFF), (unsigned)((ip >> 8) & 0xFF),
+               (unsigned)((ip >> 16) & 0xFF), (unsigned)((ip >> 24) & 0xFF));
+      wifiEvtSend(m);
       break;
+    }
 
-    case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
-      // *** Das ist der kritische Pfad deines Bugs. ***
-      // STA hat die Verbindung verloren. Die IDF räumt intern auf — dabei darf
-      // der AP NICHT verschwinden. Mode hart auf AP_STA halten und AP prüfen.
-      {
-        uint8_t reason = info.wifi_sta_disconnected.reason;
-        wifiEventLog("[evt] STA disconnected - protecting AP (reason=%u %s)",
-                     (unsigned)reason, wifiDisconnectReasonName(reason));
-      }
-      diagStaDisconnects++;                                 // Diagnose: Abbruch zaehlen
-      diagLastDiscReason = info.wifi_sta_disconnected.reason;// Diagnose: Grund merken
-      // Sofortversuch anfordern. Nur ein Flag setzen — der eigentliche
-      // Verbindungsaufbau gehoert NICHT in den Event-Handler (Reentranz in
-      // den WLAN-Stack, genau wie beim AP weiter unten kommentiert).
-      if (staLastValid) staFastRetry = true;
-      // WLAN ist weg -> der AP wird als Zugang wieder gebraucht, auch wenn ein
-      // vorheriger AP-Timeout ihn abgeschaltet hatte. apWanted reaktivieren.
-      // WICHTIG: hier KEIN ensureAP() aufrufen (Reentranz -> Event-Schleife).
-      // Nur Mode sicherstellen + Flag setzen; der Watchdog im loop() holt den
-      // AP zeitversetzt zurueck.
-      apWanted = true;
-      if (WiFi.getMode() != WIFI_AP_STA) {
-        WiFi.mode(WIFI_AP_STA);
-      }
-      staWasConnected = false;
+    case ARDUINO_EVENT_WIFI_STA_DISCONNECTED: {
+      // Der kritische Pfad: die IDF raeumt intern auf, dabei darf der AP nicht
+      // verschwinden. Das Gegenmittel (apWanted setzen, Modus zurueckholen)
+      // laeuft jetzt im Loop — siehe wifiEvtDrain.
+      m.kind   = WEVT_STA_DISCONNECTED;
+      m.reason = info.wifi_sta_disconnected.reason;
+      snprintf(m.text, sizeof(m.text), "[evt] STA disconnected - protecting AP (reason=%u %s)",
+               (unsigned)m.reason, wifiDisconnectReasonName(m.reason));
+      wifiEvtSend(m);
       break;
+    }
 
     case ARDUINO_EVENT_WIFI_AP_START:
-      apStartedByEvent = true;
-      wifiEventLog("[evt] AP started");
+      wifiEvtText(WEVT_AP_START, "[evt] AP started");
       break;
 
     case ARDUINO_EVENT_WIFI_AP_STOP:
-      apStartedByEvent = false;
-      // AP wurde gestoppt. NICHT hier ensureAP() aufrufen!
-      // Grund: softAP() macht intern Stop+Start. Ein Aufruf von ensureAP() aus
-      // diesem Event heraus loest erneut ein STOP-Event aus -> Endlosschleife
-      // (genau der Bug: AP stopped -> restart -> AP started -> AP stopped ...).
-      // Der AP-Watchdog im loop() (zeitversetzt, alle 5s) holt den AP zurueck,
-      // ohne diese Reentranz. Hier nur protokollieren.
-      wifiEventLog("[evt] AP stopped");
+      // KEIN ensureAP() von hier aus: softAP() macht intern Stop+Start und
+      // loeste damit erneut dieses Ereignis aus — eine Endlosschleife. Der
+      // AP-Watchdog im Loop holt den AP zeitversetzt zurueck.
+      wifiEvtText(WEVT_AP_STOP, "[evt] AP stopped");
       break;
 
     case ARDUINO_EVENT_WIFI_AP_STACONNECTED:
-      wifiEventLog("[evt] AP: station connected (clients=%u)", (unsigned)WiFi.softAPgetStationNum());
-      diagApClientConn++;                   // Diagnose: Handy hat sich am AP verbunden
+      wifiEvtText(WEVT_AP_STACONN, "[evt] AP: station connected");
       break;
 
     case ARDUINO_EVENT_WIFI_AP_STADISCONNECTED:
-      wifiEventLog("[evt] AP: station disconnected (clients=%u)", (unsigned)WiFi.softAPgetStationNum());
-      diagApClientDisc++;                   // Diagnose: Handy hat AP verlassen
-      // War das der LETZTE Client? Dann Nachlauf-Sperre starten: die naechsten
-      // STA_SUPPRESS_AFTER_AP_MS wird nicht gescannt (kein sofortiger Stoerscan).
-      if (WiFi.softAPgetStationNum() == 0) apClientGoneAt = millis();
+      wifiEvtText(WEVT_AP_STADISCONN, "[evt] AP: station disconnected");
       break;
 
     case ARDUINO_EVENT_WIFI_AP_PROBEREQRECVED:
-      // Ein Geraet funkt den AP an (Probe-Request). Zaehlen + RSSI merken.
-      // Damit laesst sich unterscheiden: Handy erreicht den AP ueberhaupt?
-      // Bewusst NICHT geloggt: kommt im Sekundentakt und wuerde jeden Puffer
-      // fluten. Die Zaehler landen ueber den [STAT]-Schnappschuss im Log.
+      // Kommt im Sekundentakt und wuerde die Queue fluten. Deshalb als
+      // einzige Ausnahme zwei direkte Zuweisungen statt einer Nachricht:
+      // beides sind reine Statistikwerte ohne Steuerwirkung, ein verpasstes
+      // Inkrement ist folgenlos. Geloggt wird hier ohnehin nichts, die Zahlen
+      // erscheinen im [STAT]-Schnappschuss.
       diagProbeReqs++;
       diagLastProbeRssi = info.wifi_ap_probereqrecved.rssi;
       break;
@@ -695,7 +921,10 @@ bool ensureAP(bool force) {
   String runningSsid = WiFi.softAPSSID();
   bool ssidOk = (runningSsid == cfg_ap_ssid) || (runningSsid.length() == 0);
 
-  if (!force && apLooksUp && ssidOk && WiFi.softAPgetStationNum() >= 0) {
+  // Die fruehere Bedingung "softAPgetStationNum() >= 0" war wirkungslos — der
+  // Rueckgabewert ist nie negativ, der Aufruf also ein reiner Treiberzugriff
+  // ohne Aussage. Ersatzlos gestrichen.
+  if (!force && apLooksUp && ssidOk) {
     int curCh = WiFi.channel();   // aktueller Betriebs-Channel
     bool channelOk = (curCh == ch) || (WiFi.status() != WL_CONNECTED);
     if (channelOk) {
@@ -768,7 +997,8 @@ bool startAccessPointManual() {
   apWanted       = true;
   apOffByTimeout = false;
   apLastClientGone = millis();
-  apLastStationNum = WiFi.softAPgetStationNum();
+  apStaCountRefresh(true);          // nach einem AP-Start den echten Wert holen
+  apLastStationNum = apClientCount();
 
   wifi_mode_t mode = WiFi.getMode();
   bool apModeEnabled = (mode == WIFI_AP || mode == WIFI_AP_STA);
@@ -819,7 +1049,7 @@ String accessPointStatusJson(bool operationOk) {
   json += ",\"ssid\":\"" + jsonEscapeDebug(ssid) + "\"";
   json += ",\"configured_ssid\":\"" + jsonEscapeDebug(cfg_ap_ssid) + "\"";
   json += ",\"ip\":\"" + ip.toString() + "\"";
-  json += ",\"clients\":" + String(WiFi.softAPgetStationNum());
+  json += ",\"clients\":" + String(apClientCount());
   json += ",\"arduino_mode\":" + String((int)arduinoMode);
   json += ",\"idf_mode\":" + String(idfModeResult == ESP_OK ? (int)idfMode : -1);
   json += "}";
@@ -1264,7 +1494,7 @@ void handleRoaming() {
   // damit kein Ergebnis im Treiber liegenbleibt.
   if (staScanBlockedByRide()) {
     if (roamScanRunning && WiFi.scanComplete() != WIFI_SCAN_RUNNING) {
-      WiFi.scanDelete();
+      stopStaScan();
       roamScanRunning = false;
     }
     weakSince = 0;
@@ -1281,10 +1511,10 @@ void handleRoaming() {
   // Kanal — wer gerade per Handy auf der Weboberflaeche ist, verliert genau
   // dann die Verbindung. Das ist der wichtigere Bedarf: ein laufender Zugriff
   // schlaegt eine mogliche Verbesserung des Heimnetz-Empfangs.
-  if (WiFi.softAPgetStationNum() > 0) {
+  if (apClientCount() > 0) {
     if (roamScanRunning) {                    // laufenden Scan einsammeln
       if (WiFi.scanComplete() != WIFI_SCAN_RUNNING) {
-        WiFi.scanDelete();
+        stopStaScan();
         roamScanRunning = false;
       }
     }
@@ -1350,7 +1580,7 @@ void handleRoaming() {
       // der Rueckgabewert ignoriert und roamScanRunning trotzdem gesetzt —
       // Phase B bekam dann WIFI_SCAN_FAILED und meldete stur "kein besserer AP".
       uartLogAdd("ROAM: scan did not start ("+String((int)started)+") -> retry later");
-      WiFi.scanDelete();
+      stopStaScan();
       roamScanRunning = false;
       weakSince = now - 15000UL + 5000UL;   // in ~5s erneut versuchen
       return;
@@ -1364,7 +1594,7 @@ void handleRoaming() {
   int16_t res = WiFi.scanComplete();
   if (res == WIFI_SCAN_RUNNING) {
     if (now - roamScanStart > 15000) {        // Timeout
-      WiFi.scanDelete();
+      stopStaScan();
       roamScanRunning = false;
     }
     return;
@@ -1460,7 +1690,7 @@ void handleRoaming() {
                targetBssid[3],targetBssid[4],targetBssid[5]);
       uartLogAdd("ROAM: -> "+String(m)+" "+String(bestRssi)+" dBm");
     }
-    WiFi.scanDelete();
+    stopStaScan();
     roamScanRunning = false;
     weakSince       = 0;
 
@@ -1507,7 +1737,7 @@ void handleRoaming() {
     // AP in Reichweite) war das eine Endlosschleife, die den Funk zur Haelfte
     // mit Scannen belegt und das Geraet immer wieder unerreichbar gemacht hat.
     // 30s -> 60s -> 120s -> 300s, danach bleibt es bei 300s.
-    WiFi.scanDelete();
+    stopStaScan();
     roamScanRunning = false;
     unsigned long wait = ROAM_RETRY_MS[roamRetryStage];
     uartLogAdd("ROAM: no better AP found -> next scan in "+String(wait/1000)+"s");
@@ -1554,7 +1784,7 @@ void handleWiFiReconnect() {
     }
     if (scanInProgress) {
       int16_t r = WiFi.scanComplete();
-      if (r != WIFI_SCAN_RUNNING) { WiFi.scanDelete(); scanInProgress = false; }
+      if (r != WIFI_SCAN_RUNNING) { stopStaScan(); scanInProgress = false; }
     }
     return;
   }
@@ -1566,7 +1796,7 @@ void handleWiFiReconnect() {
   // Fahrt nicht als haengende Verbindung missversteht und mitten im Fahren
   // rebootet.
   if (staScanBlockedByRide()) {
-    if (scanInProgress) { WiFi.scanDelete(); scanInProgress = false; }
+    if (scanInProgress) { stopStaScan(); scanInProgress = false; }
     if (staConnecting) {
       staConnecting = false;
       WiFi.disconnect(false, false);   // STA-Versuch stoppen, AP + Funk behalten
@@ -1584,8 +1814,8 @@ void handleWiFiReconnect() {
   // (Hinweis: Eine BESTEHENDE Heimnetz-Verbindung wird oben behandelt und bleibt
   //  erhalten - ein fertiger STA-Link stoert den AP nicht, nur das Suchen tut es.)
   // Sobald der letzte Client weg ist, laeuft die STA-Suche automatisch weiter.
-  if (WiFi.softAPgetStationNum() > 0) {
-    if (scanInProgress) { WiFi.scanDelete(); scanInProgress = false; }
+  if (apClientCount() > 0) {
+    if (scanInProgress) { stopStaScan(); scanInProgress = false; }
     if (staConnecting) {
       // laufenden (non-blocking) Verbindungsversuch sauber abbrechen
       staConnecting = false;
@@ -1602,7 +1832,7 @@ void handleWiFiReconnect() {
   // Geraet hat Ruhe, und es kommt kein sofortiger Stoerscan. Danach freigeben.
   if (apClientGoneAt != 0) {
     if (now - apClientGoneAt < STA_SUPPRESS_AFTER_AP_MS) {
-      if (scanInProgress) { WiFi.scanDelete(); scanInProgress = false; }
+      if (scanInProgress) { stopStaScan(); scanInProgress = false; }
       staDownSince     = 0;    // kein Haenger -> Notnagel nicht ausloesen
       lastReconnectTry = now;
       return;
@@ -1687,7 +1917,7 @@ void handleWiFiReconnect() {
       scanInProgress = true;
       scanStartTime  = now;
     } else {
-      WiFi.scanDelete();
+      stopStaScan();
       scanInProgress = false;
     }
     return;
@@ -1699,7 +1929,7 @@ void handleWiFiReconnect() {
   if (res == WIFI_SCAN_RUNNING) {
     if (now - scanStartTime > 12000) {
       dlog("WiFi: scan timeout -> reset scan state\n");
-      WiFi.scanDelete();
+      stopStaScan();
       scanInProgress = false;
       lastReconnectTry = now;
     }
@@ -1734,7 +1964,7 @@ void handleWiFiReconnect() {
     if (b) { memcpy(bestBssid, b, 6); haveBestBssid = true; }
     bestChannel = WiFi.channel(bestIdx);
   }
-  WiFi.scanDelete();
+  stopStaScan();
   scanInProgress = false;
 
   if (bestIdx < 0) {
@@ -1869,6 +2099,9 @@ void wifiBleSetup() {
   lastMovementTime = millis();
 
   // WiFi-Event-Handler registrieren BEVOR WiFi gestartet wird.
+  // Queue MUSS stehen, bevor der Callback registriert wird — sonst
+  // verwirft er die ersten Ereignisse still.
+  wifiEvtQueueInit();
   WiFi.onEvent(onWiFiEvent);
   // WiFi-Config NICHT im Flash persistieren — die IDF speichert sonst bei jedem
   // Mode-/Connect-Wechsel ins NVS, was beim Boot zu korrupten/halben Zustaenden
@@ -1952,6 +2185,16 @@ void wifiBleLoop() {
   // kurze Unterbrechung soll den AP nicht sofort hochreissen. Der Zeitvergleich
   // laeuft erst ab 60s Laufzeit, damit der Start nicht faelschlich als Ausfall
   // gilt (lastUpdate ist bis zur ersten Antwort 0).
+  // Ereignisse aus dem WLAN-Event-Task abholen, BEVOR irgendetwas anderes
+  // passiert: darunter ist der Modus-Schutz nach einem STA-Abbruch.
+  BB_STEP("evt-drain");
+  wifiEvtDrain();
+
+  // Einmal pro Loop-Durchlauf pruefen. Der Treiber wird darin hoechstens alle
+  // 5 Sekunden wirklich gefragt, und nur wenn der AP laeuft.
+  BB_STEP("apsta-refresh");
+  apStaCountRefresh(false);
+
   BB_STEP("vesclink");
   // Fahrterkennung auffrischen. Muss hier stehen und nicht in den
   // Scan-Funktionen: die kehren an vielen Stellen frueh zurueck, und dann
@@ -2015,7 +2258,7 @@ void wifiBleLoop() {
         // An -> Auto: Idle-Timer frisch starten, sonst wuerde ref=apStartTime
         // (evtl. lange her) sofort einen Timeout ausloesen.
         apLastClientGone = millis();
-        apLastStationNum = WiFi.softAPgetStationNum();
+        apLastStationNum = apClientCount();
         dlog("AP mode -> AUTO: idle timer started\n");
       }
     }
@@ -2032,7 +2275,7 @@ void wifiBleLoop() {
   // Bewegung/Reboot nicht per WLAN erreichbar — im Auto-Modus so gewollt.
   BB_STEP("ap-idle-timeout");
   if (apActive && apMayShutOff && cfg_ap_timeout > 0) {
-    int stations = WiFi.softAPgetStationNum();
+    int stations = apClientCount();
     // Flanke erkennen: ist gerade das letzte Geraet abgefallen?
     if (stations == 0 && apLastStationNum > 0) {
       apLastClientGone = millis();   // Timer ab JETZT neu starten
@@ -2151,15 +2394,18 @@ void wifiBleLoop() {
     //  2. direkter ESP-IDF-Treiberzustand
     // Eine gespeicherte SSID oder AP-IP ist KEIN Beweis, dass der AP noch sendet;
     // beide Werte koennen nach WiFi.mode(WIFI_STA) im Treiber erhalten bleiben.
+    BB_STEP("apwd-getmode");
     wifi_mode_t arduinoMode = WiFi.getMode();
     bool arduinoApEnabled = (arduinoMode == WIFI_AP || arduinoMode == WIFI_AP_STA);
 
+    BB_STEP("apwd-idfmode");
     wifi_mode_t idfMode = WIFI_MODE_NULL;
     esp_err_t idfModeResult = esp_wifi_get_mode(&idfMode);
     bool idfApEnabled = (idfModeResult == ESP_OK) &&
                         (idfMode == WIFI_MODE_AP || idfMode == WIFI_MODE_APSTA);
 
     bool apModeEnabled = arduinoApEnabled || idfApEnabled;
+    BB_STEP("apwd-ssid");
     String runningSsid = WiFi.softAPSSID();
     bool apSsidOk = (runningSsid == cfg_ap_ssid);
 
@@ -2180,6 +2426,7 @@ void wifiBleLoop() {
       if (!apReallyRunning) {
         apWatchdogFails++;
         diagApWatchdogFires++;
+        BB_STEP("apwd-ensure");
         dlog("AP reconcile: should be ON, not healthy (mode=%d/%d event=%d ssid='%s', fail #%d) -> ensureAP\n",
              (int)arduinoMode,
              (idfModeResult == ESP_OK) ? (int)idfMode : -1,
@@ -2194,7 +2441,7 @@ void wifiBleLoop() {
         // ans Geraet kommt. Ohne diesen Abbruch koennen sich Scan und
         // AP-Start gegenseitig blockieren, und der Watchdog laeuft leer.
         if (scanInProgress || roamScanRunning) {
-          WiFi.scanDelete();
+          stopStaScan();
           scanInProgress  = false;
           roamScanRunning = false;
           dlog("AP reconcile: aborted running scan to free the radio\n");
@@ -2292,7 +2539,7 @@ void wifiBleLoop() {
 
     bool anyConnected = deviceConnected || (wifiClient && wifiClient.connected());
     if (!cfg_autoreboot_no_wifi && WiFi.status() == WL_CONNECTED) anyConnected = true;
-    if (WiFi.softAPgetStationNum() > 0) anyConnected = true;
+    if (apClientCount() > 0) anyConnected = true;
     // Offene Weboberflaeche zaehlt ebenfalls als Nutzung. Fehlte bisher: wer
     // ueber das Heimnetz auf der Seite arbeitet, waehrend "auch ohne WLAN"
     // gesetzt ist, wurde nicht erkannt — der ESP startete ihm unter den

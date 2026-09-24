@@ -44,15 +44,39 @@ static uint16_t     shipHead  = 0;   // naechste Schreibposition
 static uint16_t     shipTail  = 0;   // aelteste noch nicht bestaetigte Zeile
 static uint16_t     shipCount = 0;   // belegte Slots
 
-static uint32_t shipSeq        = 1;  // naechste zu vergebende Sequenznummer
+// Die drei folgenden Zaehler schreibt der Sende-Task auf Kern 0, gelesen
+// werden sie vom Stall-Waechter (ebenfalls Kern 0) und vom Hauptloop auf
+// Kern 1. volatile, damit der Lesende den Wert wirklich nachschlaegt und nicht
+// eine Registerkopie aus einem frueheren Durchlauf weiterverwendet — sonst
+// wartet der Waechter womoeglich ewig auf eine Bestaetigung, die laengst da
+// ist. 32 Bit sind ausgerichtet und damit unteilbar zu lesen.
+static volatile uint32_t shipSeq = 1;  // naechste zu vergebende Sequenznummer
 static uint32_t shipDropped    = 0;  // wegen Pufferueberlauf verworfen
 static uint32_t shipSentLines  = 0;  // erfolgreich uebertragene Zeilen
-static uint32_t shipBatchesOk  = 0;
+static volatile uint32_t shipBatchesOk = 0;
 static uint32_t shipBatchesErr = 0;
 static uint32_t shipBootId     = 0;  // pro Boot zufaellig: trennt Neustarts
 static int      shipLastCode   = 0;  // letzter HTTP-Statuscode
 static String   shipLastError;
 static uint32_t shipLastOkUptime = 0;
+
+// Hoechste Sequenznummer, deren Zustellung der Server mit 2xx bestaetigt hat.
+// Der reine Batch-Zaehler reicht dafuer nicht: der Puffer ist FIFO, neue
+// Zeilen landen hinten. Bei Rueckstau gehen also erst etliche Batches mit
+// AELTEREN Zeilen raus, bevor die eigenen an der Reihe sind. Wer "ein Batch
+// war erfolgreich" mit "meine Zeilen sind angekommen" verwechselt, loescht
+// zu frueh — fuer die Blackbox hiesse das: geloescht, ohne je gesendet
+// worden zu sein.
+static volatile uint32_t shipAckedSeq = 0;
+
+// Hoechste Sequenznummer, die wegen Pufferueberlauf VERWORFEN wurde.
+//
+// Ohne diesen Wert laesst sich "zugestellt" nicht von "weggeworfen"
+// unterscheiden: beides fuehrt dazu, dass shipAckedSeq spaeter ueber die
+// gesuchte Nummer hinauslaeuft. Fuer die Blackbox ist der Unterschied
+// entscheidend — wurden ihre Zeilen verdraengt, muss sie erneut eingespeist
+// werden, statt den Flash-Eintrag als erledigt zu loeschen.
+static volatile uint32_t shipDroppedMaxSeq = 0;
 
 static SemaphoreHandle_t shipMutex      = nullptr;
 static TaskHandle_t      shipTaskHandle = nullptr;
@@ -237,8 +261,18 @@ void logShipApplyConfig() {
 }
 
 // ── Zeile puffern ────────────────────────────────────────────────────────────
-void logShipAdd(const String &line) {
-  if (!shipBuf || shipSlots == 0) return;
+// Liefert die Sequenznummer, die dieser Zeile zugeteilt wurde, oder 0, wenn
+// nichts eingelegt wurde.
+//
+// Warum das noetig ist: wer nach dem Einlegen einfach shipSeq liest und davon
+// eins abzieht, unterstellt, dass in der Zwischenzeit niemand sonst geloggt
+// hat. Der Sendepuffer wird aber aus dem Hauptloop, dem Event-Task und dem
+// Waechter-Task gefuettert — genau in dieser Luecke kann eine fremde Zeile
+// dazwischenrutschen, und die vermerkte Nummer gehoert dann jemand anderem.
+// Die Nummer unter derselben Sperre zurueckzugeben, unter der sie vergeben
+// wird, schliesst das aus.
+uint32_t logShipAddSeq(const String &line) {
+  if (!shipBuf || shipSlots == 0) return 0;
 
   // Zeilenumbrueche und Steuerzeichen raus: eine Logzeile ist genau eine
   // NDJSON-Zeile. Ein \n im Text wuerde das Format auf der Serverseite zerlegen.
@@ -246,7 +280,7 @@ void logShipAdd(const String &line) {
   clean.replace("\r", " ");
   clean.replace("\n", " ");
   clean.trim();
-  if (clean.isEmpty()) return;
+  if (clean.isEmpty()) return 0;
 
   uint32_t up = (uint32_t)(millis() / 1000UL);
   time_t   now = timeServiceEpoch();
@@ -256,11 +290,17 @@ void logShipAdd(const String &line) {
     // Puffer voll -> aelteste Zeile verwerfen. Bewusst so herum: bei einem
     // langen Ausfall ist der aktuelle Verlauf interessanter als der Anfang.
     // Der Zaehler wird mitgesendet, damit die Luecke auf dem Server sichtbar ist.
+    //
+    // Die Nummer der verworfenen Zeile festhalten: nur daran erkennt die
+    // Blackbox, ob ihre eigenen Zeilen betroffen waren.
+    uint32_t lostSeq = shipBuf[shipTail].seq;
+    if (lostSeq > shipDroppedMaxSeq) shipDroppedMaxSeq = lostSeq;
     shipTail = (uint16_t)((shipTail + 1) % shipSlots);
     shipCount--;
     shipDropped++;
   }
   LogShipSlot &s = shipBuf[shipHead];
+  uint32_t assigned = shipSeq;
   s.seq       = shipSeq++;
   s.uptimeSec = up;
   s.epoch     = (now > 0) ? (uint32_t)now : 0;
@@ -280,11 +320,26 @@ void logShipAdd(const String &line) {
     if (rtcRing.count < LOGSHIP_RTC_SLOTS) rtcRing.count++;
   }
   shipUnlock();
+  return assigned;
+}
+
+// Bisherige Form, fuer alle Aufrufer, die die Nummer nicht brauchen.
+void logShipAdd(const String &line) {
+  (void)logShipAddSeq(line);
 }
 
 void logShipClear() {
   if (!shipBuf) return;
   shipLock();
+  // Die hoechste entfernte Nummer festhalten — manuelles Leeren ist fuer die
+  // Blackbox nichts anderes als ein Pufferueberlauf. Ohne das haette ein Klick
+  // auf "Puffer leeren" ihre Zeilen beseitigt, und ein spaeter bestaetigter
+  // Batch haette den Flash-Eintrag geloescht, als waere sie angekommen.
+  if (shipCount > 0) {
+    uint16_t lastIdx = (uint16_t)((shipHead + shipSlots - 1) % shipSlots);
+    uint32_t lastSeq = shipBuf[lastIdx].seq;
+    if (lastSeq > shipDroppedMaxSeq) shipDroppedMaxSeq = lastSeq;
+  }
   shipHead = shipTail = shipCount = 0;
   shipDropped = 0;
   shipUnlock();
@@ -451,6 +506,7 @@ static void shipFlushOnce() {
   shipLastCode = code;
   if (code >= 200 && code < 300) {
     shipConfirm(lastSeq);
+    shipAckedSeq = lastSeq;        // bis hierhin nachweislich zugestellt
     shipSentLines += lines;
     shipBatchesOk++;
     shipLastError = "";

@@ -29,6 +29,13 @@ void logShipApplyConfig();
 // und der Bootdiagnose aufgerufen.
 void logShipAdd(const String &line);
 
+// Wie logShipAdd(), liefert aber die zugeteilte Sequenznummer zurueck (0, wenn
+// nichts eingelegt wurde). Wird von der Blackbox gebraucht: nur so laesst sich
+// spaeter feststellen, ob genau IHRE Zeilen bestaetigt oder verworfen wurden.
+// Die Nummer nachtraeglich aus dem Zaehler abzuleiten waere ein Rennen mit
+// jeder anderen Logzeile, die zwischendurch geschrieben wird.
+uint32_t logShipAddSeq(const String &line);
+
 // Verwirft alle gepufferten Zeilen (API/Debug-Tab).
 void logShipClear();
 
