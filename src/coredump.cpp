@@ -113,7 +113,7 @@ void coreDumpSetup() {
       if (shaBuf[i] != 0 && (shaBuf[i] < 32 || shaBuf[i] > 126)) { shaBuf[i] = 0; break; }
     }
     cdElfSha = String(shaBuf);
-    logShipAdd("[COREDUMP] Firmware-Kennung (SHA256, Anfang): " + sha);
+    logShipAdd("[COREDUMP] Firmware-Kennung (SHA256, Anfang): " + cdElfSha);
   } else {
     logShipAdd("[COREDUMP] Kurzfassung nicht lesbar - rohes Abbild per /api/coredump holen");
   }
