@@ -830,7 +830,18 @@ function loadInfo(){
       '<div class="info-row"><span>'+(de()?'Loop max (ms)':'Loop max (ms)')+'</span><span class="info-val" style="color:'+(d.diag_loop_max_us>50000?'#e57373':(d.diag_loop_max_us>10000?'#e0a030':'var(--ok)'))+'">'+(d.diag_loop_max_us/1000).toFixed(1)+'</span></div>'+
       '<div class="info-row"><span>'+(de()?'Loops/Sek':'Loops/sec')+'</span><span class="info-val">'+d.diag_loops_per_sec+'</span></div>'+
       '<div class="info-row"><span>'+(de()?'Heap-Tiefstand':'Min free heap')+'</span><span class="info-val">'+(d.diag_min_heap>=1024?(d.diag_min_heap/1024).toFixed(1)+' KB':d.diag_min_heap+' B')+'</span></div>'+
-      '<div class="info-row"><span>'+(de()?'Probe-Requests (RSSI)':'Probe requests (RSSI)')+'</span><span class="info-val">'+d.diag_probe_reqs+(d.diag_probe_reqs>0?' ('+d.diag_probe_rssi+' dBm)':'')+'</span></div>'
+      '<div class="info-row"><span>'+(de()?'Probe-Requests (RSSI)':'Probe requests (RSSI)')+'</span><span class="info-val">'+d.diag_probe_reqs+(d.diag_probe_reqs>0?' ('+d.diag_probe_rssi+' dBm)':'')+'</span></div>'+
+      (d.blackbox?(
+      '<div style="margin:10px 0 6px;font-size:11px;color:#666;text-transform:uppercase;letter-spacing:1px">Blackbox</div>'+
+      '<div class="info-row"><span>'+(de()?'Stall-Waechter':'Stall watchdog')+'</span><span class="info-val" style="color:'+(d.blackbox.armed?'var(--ok)':'#e0a030')+'">'+(d.blackbox.armed?(de()?'scharf, ausloest nach ':'armed, fires after ')+(d.blackbox.stall_ms/1000)+'s':(de()?'Anlaufzeit':'warming up'))+'</span></div>'+
+      '<div class="info-row"><span>'+(de()?'Loop zuletzt vor':'Loop last seen')+'</span><span class="info-val">'+d.blackbox.hb_age_ms+' ms ('+esc(d.blackbox.step||'-')+')</span></div>'+
+      '<div class="info-row"><span>'+(de()?'RTC-Watchdog':'RTC watchdog')+'</span><span class="info-val" style="color:'+(d.blackbox.rtc_wdt?'var(--ok)':'#e0a030')+'">'+(d.blackbox.rtc_wdt?(de()?'aktiv, ':'active, ')+(d.blackbox.rtc_wdt_ms/1000)+'s':(de()?'nicht verfuegbar':'not available'))+'</span></div>'+
+      (d.blackbox.pending?
+        '<div class="info-row"><span>'+(de()?'Eintrag im Flash':'Entry in flash')+'</span><span class="info-val" style="color:#e0a030">'+(de()?'wartet auf Uebertragung':'waiting to be sent')+(d.blackbox.fed?(de()?' (eingespeist, seq ':' (queued, seq ')+d.blackbox.feed_first+'..'+d.blackbox.feed_last+')':(de()?' (noch nicht eingespeist)':' (not queued yet)'))+'</span></div>'
+        :'<div class="info-row"><span>'+(de()?'Eintrag im Flash':'Entry in flash')+'</span><span class="info-val">'+(d.blackbox.had_previous?(de()?'zugestellt':'delivered'):(de()?'keiner':'none'))+'</span></div>')+
+      (d.blackbox.pending?'<div class="info-row"><span>'+(de()?'Bestaetigt bis / verworfen bis':'Acked / dropped up to')+'</span><span class="info-val">'+d.blackbox.acked_seq+' / '+d.blackbox.dropped_seq+'</span></div>':'')+
+      (d.blackbox.write_failed?'<div class="info-row"><span>'+(de()?'Schreibfehler':'Write error')+'</span><span class="info-val" style="color:#e57373">'+(de()?'ja':'yes')+'</span></div>':'')
+      ):'')
       ):'');
   }).catch(function(){document.getElementById('infoContent').innerHTML='<div style="color:#e57373;font-size:13px">'+(de()?'Fehler':'Error')+'</div>';});
 }
@@ -1388,6 +1399,9 @@ void handleApiInfo() {
   json += "\"diag_min_heap\":"+String(diagMinHeap==0xFFFFFFFF?0:diagMinHeap)+",";
   json += "\"diag_probe_reqs\":"+String(diagProbeReqs)+",";
   json += "\"diag_probe_rssi\":"+String(diagLastProbeRssi)+",";
+  // Zustand des Stall-Waechters und der Blackbox. Wichtig vor allem, um zu
+  // sehen, ob noch ein Eintrag im Flash auf seine Uebertragung wartet.
+  json += "\"blackbox\":" + blackboxStatusJson() + ",";
   if (WiFi.status() != WL_CONNECTED) {
     json += "\"mode\":\"ap\",\"ip\":\""+WiFi.softAPIP().toString()+"\"";
   } else {

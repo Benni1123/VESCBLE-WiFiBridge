@@ -268,9 +268,14 @@ static void wifiEvtSend(WifiEvtMsg &m) {
 }
 
 // Bequemer Weg fuer Nachrichten, die nur eine Logzeile sind.
-static void wifiEvtText(uint8_t kind, const char *fmt, ...) {
-  WifiEvtMsg m;
-  memset(&m, 0, sizeof(m));
+//
+// Nimmt die bereits angelegte Nachricht des Aufrufers entgegen, statt eine
+// zweite auf dem Stack anzulegen. Der WLAN-Event-Task hat nur wenige Kilobyte,
+// und zwei WifiEvtMsg (je rund 190 Byte) plus der Zwischenspeicher von
+// vsnprintf summieren sich dort schneller, als man denkt. Ein Stackueberlauf
+// in diesem Task sieht hinterher aus wie ein zufaelliger Absturz ohne Bezug
+// zur eigentlichen Ursache.
+static void wifiEvtTextInto(WifiEvtMsg &m, uint8_t kind, const char *fmt, ...) {
   m.kind = kind;
   va_list args;
   va_start(args, fmt);
@@ -647,22 +652,22 @@ void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
     }
 
     case ARDUINO_EVENT_WIFI_AP_START:
-      wifiEvtText(WEVT_AP_START, "[evt] AP started");
+      wifiEvtTextInto(m, WEVT_AP_START, "[evt] AP started");
       break;
 
     case ARDUINO_EVENT_WIFI_AP_STOP:
       // KEIN ensureAP() von hier aus: softAP() macht intern Stop+Start und
       // loeste damit erneut dieses Ereignis aus — eine Endlosschleife. Der
       // AP-Watchdog im Loop holt den AP zeitversetzt zurueck.
-      wifiEvtText(WEVT_AP_STOP, "[evt] AP stopped");
+      wifiEvtTextInto(m, WEVT_AP_STOP, "[evt] AP stopped");
       break;
 
     case ARDUINO_EVENT_WIFI_AP_STACONNECTED:
-      wifiEvtText(WEVT_AP_STACONN, "[evt] AP: station connected");
+      wifiEvtTextInto(m, WEVT_AP_STACONN, "[evt] AP: station connected");
       break;
 
     case ARDUINO_EVENT_WIFI_AP_STADISCONNECTED:
-      wifiEvtText(WEVT_AP_STADISCONN, "[evt] AP: station disconnected");
+      wifiEvtTextInto(m, WEVT_AP_STADISCONN, "[evt] AP: station disconnected");
       break;
 
     case ARDUINO_EVENT_WIFI_AP_PROBEREQRECVED:

@@ -34,6 +34,18 @@
 #  define BB_HAVE_RTC_WDT 0
 #endif
 
+// ── Notschalter fuer Stufe 2 ────────────────────────────────────────────────
+// Auf 0 setzen schaltet den RTC-Watchdog vollstaendig ab, ohne sonst etwas zu
+// aendern. Gedacht zum Eingrenzen: bleibt ein Absturz damit aus, liegt er in
+// diesem Teil; bleibt er, ist der RTC-Watchdog unschuldig. Stufe 1 (Waechter
+// mit Blackbox) laeuft in beiden Faellen weiter.
+#define BLACKBOX_USE_RTCWDT 1
+
+#if !BLACKBOX_USE_RTCWDT
+#  undef  BB_HAVE_RTC_WDT
+#  define BB_HAVE_RTC_WDT 0
+#endif
+
 // ── Kennzahlen ───────────────────────────────────────────────────────────────
 //
 // BLACKBOX_STALL_MS grosszuegig gewaehlt. Der Loop laeuft im Normalbetrieb
@@ -72,8 +84,24 @@
 // knapp 4 KB gross werden, es bleibt also Reserve.
 #define BLACKBOX_TEXT_MAX      3072
 
-static const char BLACKBOX_NS[]  = "vescbb";
-static const char BLACKBOX_KEY[] = "bb";
+static const char BLACKBOX_NS[]   = "vescbb";
+static const char BLACKBOX_KEY[]  = "bb";
+static const char BLACKBOX_TRY[]  = "bbtry";
+
+// Wie oft darf ein Start scheitern, waehrend eine Blackbox im Flash liegt,
+// bevor sie aufgegeben wird?
+//
+// Der Grund fuer diese Grenze ist eine schmerzhafte Erfahrung: ein Fehler beim
+// Einspeisen der Blackbox liess das Geraet abstuerzen, der Eintrag blieb
+// dadurch im Flash stehen, und der naechste Start lief in denselben Absturz —
+// eine Schleife, aus der das Geraet ohne USB-Kabel nicht mehr herauskam.
+//
+// Eine Diagnosefunktion darf niemals schlimmere Folgen haben als das Problem,
+// das sie finden soll. Deshalb zaehlt jeder Start, bei dem eine Blackbox
+// vorliegt, einen Versuchszaehler hoch; erst die erfolgreiche Zustellung
+// setzt ihn zurueck. Ist die Grenze erreicht, wird der Eintrag verworfen und
+// das Geraet laeuft wieder normal — lieber die Spur verlieren als das Geraet.
+#define BLACKBOX_MAX_TRIES 3
 
 volatile uint32_t   blackboxHeartbeat = 0;
 volatile uint8_t    blackboxPhase     = BB_PHASE_IDLE;
@@ -203,9 +231,15 @@ void blackboxWrite(const char *reason) {
     return;
   }
 
-  uint32_t now    = millis();
+  // Gleiche Vorsicht wie im Waechter: erst das Lebenszeichen, dann die Zeit,
+  // und vorzeichenbehaftet rechnen. Sonst steht im Bericht eine Zahl, die dem
+  // Wert daneben widerspricht — und man sucht den Fehler an der falschen
+  // Stelle, statt ihn im Messwerkzeug zu vermuten.
   uint32_t hb     = blackboxHeartbeat;
-  uint32_t age    = (hb == 0) ? 0 : (now - hb);
+  uint32_t now    = millis();
+  int32_t  ageS   = (hb == 0) ? 0 : (int32_t)(now - hb);
+  if (ageS < 0) ageS = 0;
+  uint32_t age    = (uint32_t)ageS;
   uint8_t  phase  = blackboxPhase;
   const char *step = blackboxStep;
   if (!step) step = "-";
@@ -256,6 +290,7 @@ void blackboxWrite(const char *reason) {
   Preferences p;
   if (p.begin(BLACKBOX_NS, false)) {
     if (p.putString(BLACKBOX_KEY, text) == 0) bbWriteFailed = true;
+    p.remove(BLACKBOX_TRY);            // neuer Fall -> Versuche neu zaehlen
     p.end();
   } else {
     bbWriteFailed = true;
@@ -276,6 +311,34 @@ void blackboxSetup() {
   }
 
   p.end();
+
+  // Versuchszaehler hochzaehlen, BEVOR irgendetwas mit dem Eintrag gemacht
+  // wird. Stuerzt das Geraet gleich danach ab, ist der erhoehte Stand beim
+  // naechsten Start bereits gespeichert — nur so kann die Grenze ueberhaupt
+  // greifen.
+  uint32_t tries = 0;
+  {
+    Preferences pt;
+    if (pt.begin(BLACKBOX_NS, false)) {
+      tries = pt.getUInt(BLACKBOX_TRY, 0) + 1;
+      pt.putUInt(BLACKBOX_TRY, tries);
+      pt.end();
+    }
+  }
+
+  if (tries > BLACKBOX_MAX_TRIES) {
+    Preferences pd;
+    if (pd.begin(BLACKBOX_NS, false)) {
+      pd.remove(BLACKBOX_KEY);
+      pd.remove(BLACKBOX_TRY);
+      pd.end();
+    }
+    Serial.printf("[BLACKBOX] nach %u Startversuchen nicht zugestellt -> verworfen\n",
+                  (unsigned)(tries - 1));
+    uartLogAddRaw("[BLACKBOX] nach mehreren Startversuchen verworfen (Schutz gegen Bootschleife)");
+    logShipAdd("[BLACKBOX] Eintrag nach mehreren erfolglosen Startversuchen verworfen");
+    return;
+  }
 
   bbHadPrevious  = true;
   bbPendingClear = true;
@@ -441,6 +504,7 @@ static void blackboxTaskFn(void *) {
         Preferences pc;
         if (pc.begin(BLACKBOX_NS, false)) {
           pc.remove(BLACKBOX_KEY);
+          pc.remove(BLACKBOX_TRY);     // Versuchszaehler mit zuruecksetzen
           pc.end();
         }
         bbPendingClear = false;
@@ -462,11 +526,27 @@ static void blackboxTaskFn(void *) {
       bbArmed = true;
     }
 
-    uint32_t hb = blackboxHeartbeat;
-    uint32_t age = now - hb;
-    bbLastAgeMs = age;
+    // Reihenfolge und Vorzeichen sind hier entscheidend.
+    //
+    // Frueher stand hier "now - hb" mit einem now, das ganz oben in der
+    // Schleife gelesen wurde — davor lagen aber der NVS-Block und weitere
+    // Anweisungen, die Millisekunden kosten koennen. In dieser Zeit setzt der
+    // Loop ein frischeres Lebenszeichen, hb wird also GROESSER als now, und
+    // die vorzeichenlose Subtraktion liefert statt "minus zwei Millisekunden"
+    // den groesstmoeglichen Wert: 4.294.967.295. Der liegt zuverlaessig ueber
+    // jeder Schwelle — der Waechter meldete einen Stillstand, den es nie gab,
+    // und startete ein voellig gesundes Geraet neu.
+    //
+    // Deshalb: erst das Lebenszeichen lesen, dann die Zeit (so ist now
+    // garantiert nicht aelter), und die Differenz vorzeichenbehaftet
+    // auswerten. Laeuft hb trotzdem voraus, ist age negativ statt riesig.
+    uint32_t hb    = blackboxHeartbeat;
+    uint32_t nowHb = millis();
+    int32_t  age   = (int32_t)(nowHb - hb);
+    if (age < 0) age = 0;
+    bbLastAgeMs = (uint32_t)age;
 
-    if (age < BLACKBOX_STALL_MS) continue;
+    if (age < (int32_t)BLACKBOX_STALL_MS) continue;
 
     // Stillstand.
     char reason[96];
@@ -501,7 +581,13 @@ void blackboxStartTask() {
   // Kern 0: der Hauptloop laeuft auf Kern 1. Ein Waechter, der sich denselben
   // Kern mit dem teilt, den er ueberwacht, kann von diesem verdraengt werden.
   // Prioritaet 3 liegt ueber dem Loop (1) und ueber dem Sende-Task (1).
-  xTaskCreatePinnedToCore(blackboxTaskFn, "bbwatch", 4096, nullptr, 3, &bbTaskHandle, 0);
+  // 8192 statt 4096: der Task ruft im Ernstfall Preferences/NVS auf, und
+  // bbFeedFromFlash() arbeitet mit Strings von mehreren Kilobyte. NVS-Zugriffe
+  // brauchen selbst schon einige hundert Byte Stack. Ein Ueberlauf aeussert
+  // sich als Panic ohne erkennbaren Zusammenhang — genau die Sorte Fehler, die
+  // man tagelang an der falschen Stelle sucht. Die zusaetzlichen 4 KB sind bei
+  // rund 100 KB freiem Heap nicht der Rede wert.
+  xTaskCreatePinnedToCore(blackboxTaskFn, "bbwatch", 8192, nullptr, 3, &bbTaskHandle, 0);
 }
 
 // ── Status ───────────────────────────────────────────────────────────────────
@@ -515,6 +601,7 @@ String blackboxStatusJson() {
   j += ",\"rtc_wdt\":"     + String(bbRtcWdtOn ? "true" : "false");
   j += ",\"rtc_wdt_ms\":"  + String((unsigned long)BLACKBOX_RTCWDT_MS);
   j += ",\"had_previous\":" + String(bbHadPrevious ? "true" : "false");
+  j += ",\"max_tries\":"   + String((unsigned)BLACKBOX_MAX_TRIES);
   j += ",\"pending\":"      + String(bbPendingClear ? "true" : "false");
   j += ",\"fed\":"          + String(bbFed ? "true" : "false");
   j += ",\"feed_first\":"   + String(bbFeedFirstSeq);
