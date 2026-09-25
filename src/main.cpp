@@ -5,6 +5,7 @@
 #include "time-service.h"
 #include "logship.h"
 #include "blackbox.h"
+#include "coredump.h"
 #include "backup.h"
 #include "wifi-ble.h"
 #include "vesc.h"
@@ -17,6 +18,7 @@
 #include "debuglog.cpp"
 #include "time-service.cpp"
 #include "logship.cpp"
+#include "coredump.cpp"
 #include "backup.cpp"
 #include "wifi-ble.cpp"
 #include "vesc.cpp"
@@ -52,6 +54,12 @@ void setup() {
   // koennten) und VOR captureBootDiagnostics(), damit im Serverlog die
   // Vorgeschichte vor dem Bootgrund steht.
   blackboxSetup();
+
+  // Absturzabbild aus der Flash-Partition auswerten. Muss nach logShipSetup()
+  // laufen (sonst gibt es keinen Puffer fuer die Zeilen) und vor der
+  // Bootdiagnose, damit im Serverlog erst steht WAS abgestuerzt ist und
+  // danach der Resetgrund.
+  coreDumpSetup();
 
   captureBootDiagnostics();
   dlog("BLE Name: %s | WiFi networks: %d\n", cfg_ble_name.c_str(), cfg_wifi.size());

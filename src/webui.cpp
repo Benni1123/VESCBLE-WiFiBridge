@@ -841,7 +841,19 @@ function loadInfo(){
         :'<div class="info-row"><span>'+(de()?'Eintrag im Flash':'Entry in flash')+'</span><span class="info-val">'+(d.blackbox.had_previous?(de()?'zugestellt':'delivered'):(de()?'keiner':'none'))+'</span></div>')+
       (d.blackbox.pending?'<div class="info-row"><span>'+(de()?'Bestaetigt bis / verworfen bis':'Acked / dropped up to')+'</span><span class="info-val">'+d.blackbox.acked_seq+' / '+d.blackbox.dropped_seq+'</span></div>':'')+
       (d.blackbox.write_failed?'<div class="info-row"><span>'+(de()?'Schreibfehler':'Write error')+'</span><span class="info-val" style="color:#e57373">'+(de()?'ja':'yes')+'</span></div>':'')
-      ):'')
+      ):'')+
+      (d.coredump&&d.coredump.present?(
+      '<div style="margin:10px 0 6px;font-size:11px;color:#666;text-transform:uppercase;letter-spacing:1px">'+(de()?'Absturzabbild':'Core dump')+'</div>'+
+      '<div class="info-row"><span>'+(de()?'Abgestuerzter Task':'Crashed task')+'</span><span class="info-val" style="color:#e57373">'+esc(d.coredump.task||'?')+'</span></div>'+
+      '<div class="info-row"><span>'+(de()?'Adresse':'Address')+'</span><span class="info-val">'+esc(d.coredump.pc||'?')+'</span></div>'+
+      (d.coredump.backtrace?'<div class="info-row"><span>Backtrace</span><span class="info-val" style="font-size:11px;word-break:break-all">'+esc(d.coredump.backtrace)+'</span></div>':'')+
+      '<div class="info-row"><span>'+(de()?'Groesse':'Size')+'</span><span class="info-val">'+(d.coredump.size/1024).toFixed(1)+' KB</span></div>'+
+      (d.coredump.elf_sha?'<div class="info-row"><span>'+(de()?'Firmware-Kennung':'Firmware id')+'</span><span class="info-val">'+esc(d.coredump.elf_sha)+'</span></div>':'')+
+      '<div style="margin-top:6px"><a href="/api/coredump" class="btn" style="display:inline-block;text-decoration:none;padding:6px 12px">'+(de()?'Abbild herunterladen':'Download dump')+'</a> <button type="button" onclick="clearCoreDump()" style="padding:6px 12px">'+(de()?'Loeschen':'Erase')+'</button></div>'
+      ):(d.coredump&&d.coredump.available?
+      '<div style="margin:10px 0 6px;font-size:11px;color:#666;text-transform:uppercase;letter-spacing:1px">'+(de()?'Absturzabbild':'Core dump')+'</div>'+
+      '<div class="info-row"><span>'+(de()?'Gespeichert':'Stored')+'</span><span class="info-val">'+(de()?'keines':'none')+'</span></div>'
+      :''))
       ):'');
   }).catch(function(){document.getElementById('infoContent').innerHTML='<div style="color:#e57373;font-size:13px">'+(de()?'Fehler':'Error')+'</div>';});
 }
@@ -852,6 +864,13 @@ fetch('/api/config').then(function(r){return r.json();}).then(function(d){
 }).catch(function(){});
 setInterval(function(){if(document.getElementById('tab-info').classList.contains('active'))loadInfo();},1000);
 setInterval(function(){fetch('/api/ping');},2000);
+
+function clearCoreDump(){
+  if(!confirm(de()?'Absturzabbild wirklich loeschen?\n\nDanach ist die Spur des letzten Absturzes weg.':'Really erase the core dump?\n\nThe last crash trace will be gone.')) return;
+  fetch('/api/coredump/clear',{method:'POST'}).then(function(r){return r.json();}).then(function(d){
+    if(d&&d.ok){ loadInfo(); } else { alert('Fehler: '+((d&&d.err)||'unbekannt')); }
+  }).catch(function(){ alert(de()?'Server nicht erreichbar':'Server unreachable'); });
+}
 
 function loadUpdateStatus(){
   fetch('/api/update/status').then(function(r){return r.json();}).then(function(d){
@@ -1402,6 +1421,7 @@ void handleApiInfo() {
   // Zustand des Stall-Waechters und der Blackbox. Wichtig vor allem, um zu
   // sehen, ob noch ein Eintrag im Flash auf seine Uebertragung wartet.
   json += "\"blackbox\":" + blackboxStatusJson() + ",";
+  json += "\"coredump\":" + coreDumpStatusJson() + ",";
   if (WiFi.status() != WL_CONNECTED) {
     json += "\"mode\":\"ap\",\"ip\":\""+WiFi.softAPIP().toString()+"\"";
   } else {
@@ -1985,6 +2005,7 @@ void setupWebServer() {
   // Sicherung/Wiederherstellung der gesamten Konfiguration (eigenes Modul,
   // siehe backup.cpp — der NVS wird dort generisch ausgelesen).
   backupRegisterRoutes(otaServer);
+  coreDumpRegisterRoutes(otaServer);
   // ── Log-Upload ──────────────────────────────────────────────────────────────
   // Eigene Endpunkte statt /api/config, weil das grosse Speichern den ESP
   // neustartet. Der Sende-Task liest cfg_logship_* laufend -> die Aenderung
