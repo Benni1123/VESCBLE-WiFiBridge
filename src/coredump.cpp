@@ -115,31 +115,35 @@ void coreDumpSetup() {
       // in der Logzeile.
       if (shaBuf[i] != 0 && (shaBuf[i] < 32 || shaBuf[i] > 126)) { shaBuf[i] = 0; break; }
     }
-    cdElfSha = String(shaBuf);
+    // ── Kennung des Firmware-Abbilds ────────────────────────────────────────
+    //
+    // Frueher wurde hier geraten, in welchem Format das Feld vorliegt: mal als
+    // lesbarer Text, mal als rohe Bytes. Beides kam vor, und beide Male war
+    // die Anzeige bei einem der Faelle falsch — einmal stand die Hex-Form der
+    // Schriftzeichen da, einmal blieb der Vergleichswert leer.
+    //
+    // Deshalb jetzt ohne jede Annahme: der VERGLEICH laeuft ueber die rohen
+    // Bytes und ist damit immer richtig. Fuer die ANZEIGE werden die ersten
+    // acht Bytes einheitlich in Hex gewandelt — dieselbe Darstellung, die auch
+    // das Ablege-Skript fuer die Dateinamen benutzt, sodass beide zueinander
+    // passen.
+    auto toHex8 = [](const uint8_t *raw) {
+      String out;
+      for (size_t i = 0; i < 8; i++) {
+        char b[3];
+        snprintf(b, sizeof(b), "%02x", raw[i]);
+        out += b;
+      }
+      return out;
+    };
 
-    // ── Stammt das Abbild von der laufenden Firmware? ───────────────────────
-    //
-    // Ohne diese Angabe ist ein gefundenes Abbild nur halb verwertbar: man
-    // weiss nicht, ob es den letzten Absturz DIESES Builds zeigt oder noch
-    // von einer Version davor stammt. Genau die Frage stellt sich nach jedem
-    // Update, und raten hilft dabei nicht.
-    //
-    // esp_app_get_description() liefert dieselbe Kennung fuer das laufende
-    // Abbild. Sind beide gleich, passen auch die Adressen oben zur aktuellen
-    // firmware.elf — sonst braucht man die aeltere.
+    cdElfSha = toHex8(sum->app_elf_sha256);
+
     const esp_app_desc_t *desc = esp_app_get_description();
     if (desc) {
-      char runBuf[sizeof(desc->app_elf_sha256) + 1];
-      memcpy(runBuf, desc->app_elf_sha256, sizeof(desc->app_elf_sha256));
-      runBuf[sizeof(desc->app_elf_sha256)] = 0;
-      for (size_t i = 0; i < sizeof(runBuf); i++) {
-        if (runBuf[i] != 0 && (runBuf[i] < 32 || runBuf[i] > 126)) { runBuf[i] = 0; break; }
-      }
-      cdRunSha    = String(runBuf);
-      cdSameBuild = (cdRunSha.length() > 0) && (cdRunSha == cdElfSha);
-    }
-
-    if (cdRunSha.length() > 0) {
+      cdRunSha    = toHex8(desc->app_elf_sha256);
+      cdSameBuild = (memcmp(sum->app_elf_sha256, desc->app_elf_sha256,
+                            sizeof(sum->app_elf_sha256)) == 0);
       logShipAdd("[COREDUMP] Firmware-Kennung: Abbild=" + cdElfSha +
                  " laufend=" + cdRunSha +
                  (cdSameBuild ? " -> GLEICHER Build, Adressen passen zur aktuellen firmware.elf"
