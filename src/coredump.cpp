@@ -100,34 +100,31 @@ void coreDumpSetup() {
     cdBacktrace = bt;
     if (bt.length()) logShipAdd("[COREDUMP] Backtrace: " + bt);
 
-    // Die Pruefsumme des Firmware-Abbilds: nur mit GENAU dieser firmware.elf
-    // ergeben die Adressen oben die richtigen Zeilen.
-    //
-    // Die IDF legt sie bereits als lesbare Zeichen ab, nicht als rohe Bytes.
-    // Sie noch einmal nach Hex zu wandeln machte aus "02b56d25" die Ziffernfolge
-    // "3032623536643235" — die Hex-Werte der einzelnen Schriftzeichen. Deshalb
-    // hier nur kopieren und am ersten Nullbyte abschneiden.
-    char shaBuf[sizeof(sum->app_elf_sha256) + 1];
-    memcpy(shaBuf, sum->app_elf_sha256, sizeof(sum->app_elf_sha256));
-    shaBuf[sizeof(sum->app_elf_sha256)] = 0;
-    for (size_t i = 0; i < sizeof(shaBuf); i++) {
-      // Nicht druckbare Zeichen beenden die Kennung — sonst landet Datenmuell
-      // in der Logzeile.
-      if (shaBuf[i] != 0 && (shaBuf[i] < 32 || shaBuf[i] > 126)) { shaBuf[i] = 0; break; }
-    }
     // ── Kennung des Firmware-Abbilds ────────────────────────────────────────
     //
-    // Frueher wurde hier geraten, in welchem Format das Feld vorliegt: mal als
-    // lesbarer Text, mal als rohe Bytes. Beides kam vor, und beide Male war
-    // die Anzeige bei einem der Faelle falsch — einmal stand die Hex-Form der
-    // Schriftzeichen da, einmal blieb der Vergleichswert leer.
+    // Nur mit GENAU der firmware.elf dieses Builds ergeben die Adressen oben
+    // die richtigen Zeilen. Der Vergleich sagt also, ob sich das Auswerten
+    // ueberhaupt lohnt.
     //
-    // Deshalb jetzt ohne jede Annahme: der VERGLEICH laeuft ueber die rohen
-    // Bytes und ist damit immer richtig. Fuer die ANZEIGE werden die ersten
-    // acht Bytes einheitlich in Hex gewandelt — dieselbe Darstellung, die auch
-    // das Ablege-Skript fuer die Dateinamen benutzt, sodass beide zueinander
-    // passen.
-    auto toHex8 = [](const uint8_t *raw) {
+    // Die beiden Quellen legen die Kennung UNTERSCHIEDLICH ab, und genau daran
+    // ist der Vergleich bisher gescheitert:
+    //
+    //   Absturzabbild   esp_core_dump_summary_t.app_elf_sha256
+    //                   -> 16 LESBARE Schriftzeichen + Nullbyte ("02b56d25...")
+    //   laufende FW     esp_app_desc_t.app_elf_sha256
+    //                   -> 32 ROHE Bytes
+    //
+    // Ein memcmp ueber beide konnte deshalb nie gleich sein — "same_build" war
+    // immer false, auch beim eigenen Build. Und beide Felder stur nach Hex zu
+    // wandeln machte aus dem Text "02b56d25" die Ziffernfolge
+    // "3032623536643235", die Hex-Werte der einzelnen Schriftzeichen.
+    //
+    // Deshalb wird jetzt beides auf EINE Darstellung gebracht: Kleinbuchstaben-
+    // Hex der ersten acht Bytes. Der Text aus dem Abbild wird dazu nur
+    // uebernommen und kleingeschrieben, die rohen Bytes werden gewandelt.
+    // Dasselbe Format benutzt auch archive_elf.py fuer die Dateinamen, sodass
+    // Logzeile und abgelegte Datei zueinander passen.
+    auto rawToHex8 = [](const uint8_t *raw) {
       String out;
       for (size_t i = 0; i < 8; i++) {
         char b[3];
@@ -137,13 +134,31 @@ void coreDumpSetup() {
       return out;
     };
 
-    cdElfSha = toHex8(sum->app_elf_sha256);
+    // Text aus dem Abbild einlesen: am ersten Nullbyte oder am ersten nicht
+    // druckbaren Zeichen enden, damit kein Datenmuell in die Logzeile kommt.
+    String dumpSha;
+    for (size_t i = 0; i < sizeof(sum->app_elf_sha256); i++) {
+      char c = (char)sum->app_elf_sha256[i];
+      if (c == 0 || c < 32 || c > 126) break;
+      if (c >= 'A' && c <= 'F') c = (char)(c - 'A' + 'a');
+      dumpSha += c;
+    }
+
+    // Sicherheitsnetz, falls eine kuenftige IDF hier doch rohe Bytes ablegt:
+    // dann ist der Text keine gueltige Hex-Zahl und wird stattdessen gewandelt.
+    bool looksHex = (dumpSha.length() >= 16);
+    for (size_t i = 0; looksHex && i < 16; i++) {
+      char c = dumpSha[i];
+      if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) looksHex = false;
+    }
+    if (!looksHex) dumpSha = rawToHex8(sum->app_elf_sha256);
+
+    cdElfSha = dumpSha.substring(0, 16);
 
     const esp_app_desc_t *desc = esp_app_get_description();
     if (desc) {
-      cdRunSha    = toHex8(desc->app_elf_sha256);
-      cdSameBuild = (memcmp(sum->app_elf_sha256, desc->app_elf_sha256,
-                            sizeof(sum->app_elf_sha256)) == 0);
+      cdRunSha    = rawToHex8(desc->app_elf_sha256);
+      cdSameBuild = (cdElfSha.length() == 16) && (cdElfSha == cdRunSha);
       logShipAdd("[COREDUMP] Firmware-Kennung: Abbild=" + cdElfSha +
                  " laufend=" + cdRunSha +
                  (cdSameBuild ? " -> GLEICHER Build, Adressen passen zur aktuellen firmware.elf"

@@ -16,35 +16,39 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
-// ── RTC-Watchdog (Hardware) ─────────────────────────────────────────────────
-// Der Kopfpfad hat sich zwischen den IDF-Versionen verschoben; beide Varianten
-// abdecken, statt sich auf eine festzulegen. Ist keiner vorhanden, entfaellt
-// Stufe 2 — der Rest funktioniert unveraendert, und beim Boot steht eine
-// Zeile im Log, damit man nicht faelschlich mit dem Netz darunter rechnet.
-#if defined(__has_include)
-#  if __has_include(<esp_private/rtc_wdt.h>)
-#    include <esp_private/rtc_wdt.h>
-#    define BB_HAVE_RTC_WDT 1
-#  elif __has_include(<soc/rtc_wdt.h>)
-#    include <soc/rtc_wdt.h>
-#    define BB_HAVE_RTC_WDT 1
-#  endif
-#endif
-#ifndef BB_HAVE_RTC_WDT
-#  define BB_HAVE_RTC_WDT 0
-#endif
+// ── Stufe 2: Hardware-Watchdog ──────────────────────────────────────────────
+//
+// Hier stand vorher der RTC-Watchdog (rtc_wdt_*). Der faellt auf diesem Chip
+// aus, und zwar endgueltig: der Kopf rtc_wdt.h ist zwar vorhanden, sein
+// gesamter Inhalt steht aber hinter
+//
+//     #if CONFIG_IDF_TARGET_ESP32 || CONFIG_IDF_TARGET_ESP32S2
+//
+// Auf dem ESP32-S3 ist die Datei damit leer — deshalb fand __has_include sie,
+// und der Uebersetzer kannte trotzdem keine einzige der Funktionen.
+//
+// An ihre Stelle tritt der Task-Watchdog (TWDT). Der ist kein Notbehelf,
+// sondern fuer genau diesen Zweck gemacht und hat hier sogar Vorteile:
+//
+//   - Er laeuft auf einem eigenen Hardware-Zaehler in der Timer-Gruppe,
+//     unabhaengig davon, ob der Waechter-Task noch lebt.
+//   - Er ueberwacht namentlich angemeldete Tasks. Angemeldet wird genau einer:
+//     "bbwatch". Hoert der auf zu fuettern — weil er abgestuerzt, geloescht
+//     oder dauerhaft verdraengt ist — schlaegt der Watchdog zu.
+//   - Er loest einen Panic aus. Das heisst: Neustart MIT Absturzabbild und
+//     Backtrace des schuldigen Tasks. Der RTC-Watchdog haette nur hart
+//     zurueckgesetzt, ohne jede Spur.
+//
+// Der Fall "Interrupts komplett blockiert" faellt nicht unter den Tisch: den
+// deckt der Interrupt-Watchdog ab, der im Arduino-Kern ohnehin laeuft.
+// (esp_task_wdt.h ist oben bereits eingebunden.)
 
 // ── Notschalter fuer Stufe 2 ────────────────────────────────────────────────
-// Auf 0 setzen schaltet den RTC-Watchdog vollstaendig ab, ohne sonst etwas zu
-// aendern. Gedacht zum Eingrenzen: bleibt ein Absturz damit aus, liegt er in
-// diesem Teil; bleibt er, ist der RTC-Watchdog unschuldig. Stufe 1 (Waechter
-// mit Blackbox) laeuft in beiden Faellen weiter.
-#define BLACKBOX_USE_RTCWDT 1
-
-#if !BLACKBOX_USE_RTCWDT
-#  undef  BB_HAVE_RTC_WDT
-#  define BB_HAVE_RTC_WDT 0
-#endif
+// Auf 0 setzen schaltet den Hardware-Watchdog vollstaendig ab, ohne sonst
+// etwas zu aendern. Gedacht zum Eingrenzen: bleibt ein Absturz damit aus,
+// liegt er in diesem Teil; bleibt er, ist der Watchdog unschuldig. Stufe 1
+// (Waechter mit Blackbox) laeuft in beiden Faellen weiter.
+#define BLACKBOX_USE_HWWDT 1
 
 // ── Kennzahlen ───────────────────────────────────────────────────────────────
 //
@@ -64,19 +68,19 @@
 
 // Stufe 2: Hardware-Netz unter dem Waechter.
 //
-// Der Waechter-Task selbst ist Software. Steht der Scheduler komplett, ist
-// auch er weg und niemand schreibt mehr etwas. Der RTC-Watchdog laeuft in der
-// RTC-Domaene mit eigenem Takt neben der CPU her und zieht den Reset auch
-// dann. Gefuettert wird er AUSSCHLIESSLICH vom Waechter-Task — nicht vom
-// Hauptloop. Dadurch staffeln sich die beiden sauber:
+// Der Waechter-Task selbst ist Software. Stirbt er oder kommt er nicht mehr
+// dran, schreibt niemand mehr etwas. Der Hardware-Watchdog laeuft auf einem
+// eigenen Zaehler weiter und zieht den Reset auch dann. Gefuettert wird er
+// AUSSCHLIESSLICH vom Waechter-Task — nicht vom Hauptloop. Dadurch staffeln
+// sich die beiden sauber:
 //
 //   Loop haengt, Waechter lebt   -> Stufe 1 nach 60 s, mit Blackbox
-//   Waechter ebenfalls tot       -> Stufe 2 nach 180 s, harter Reset
+//   Waechter ebenfalls tot       -> Stufe 2 nach 180 s, Panic + Neustart
 //
 // 180 s mit reichlich Abstand zu den 60 s: der Waechter hat Prioritaet 3, der
 // WLAN-Task 23 und NimBLE 21. Wird er kurzzeitig verdraengt, darf daraus kein
 // Reset werden.
-#define BLACKBOX_RTCWDT_MS   180000UL
+#define BLACKBOX_HWWDT_MS    180000UL
 
 // NVS-Groesse. Eine [STAT]-Zeile misst im Betrieb rund 200 Zeichen, dazu der
 // Kopf. Mit 2 KB brach die letzte Zeile mitten im Wort ab — 3 KB fassen die
@@ -169,41 +173,63 @@ static size_t bbCopyRtcLines(char *dst, size_t cap, uint8_t maxLines) {
   return used;
 }
 
-// ── Stufe 2: RTC-Watchdog scharf machen und fuettern ────────────────────────
-static bool bbRtcWdtOn = false;
+// ── Stufe 2: Hardware-Watchdog scharf machen und fuettern ───────────────────
+static bool bbHwWdtOn = false;
 
-static void bbRtcWdtStart() {
-#if BB_HAVE_RTC_WDT
-  rtc_wdt_protect_off();
-  rtc_wdt_disable();
-  rtc_wdt_set_length_of_reset_signal(RTC_WDT_SYS_RESET_SIG, RTC_WDT_LENGTH_3_2us);
-  rtc_wdt_set_stage(RTC_WDT_STAGE0, RTC_WDT_STAGE_ACTION_RESET_SYSTEM);
-  rtc_wdt_set_time(RTC_WDT_STAGE0, BLACKBOX_RTCWDT_MS);
-  rtc_wdt_enable();
-  // Schreibschutz wieder aktivieren. Ohne ihn kann jeder beliebige Code — auch
-  // ein Amoklauf im Speicher — die Watchdog-Register ueberschreiben und damit
-  // genau die letzte Sicherung abschalten, die im Fehlerfall noch greifen
-  // soll. Das Fuettern kommt trotzdem durch, siehe bbRtcWdtFeed().
-  rtc_wdt_protect_on();
-  bbRtcWdtOn = true;
-  Serial.printf("[BLACKBOX] RTC-Watchdog aktiv (%lus)\n",
-                (unsigned long)(BLACKBOX_RTCWDT_MS / 1000UL));
+// Muss AUS dem Waechter-Task heraus aufgerufen werden: esp_task_wdt_add(nullptr)
+// meldet den gerade laufenden Task an, und genau der soll ueberwacht werden.
+static void bbHwWdtStart() {
+#if BLACKBOX_USE_HWWDT
+  // Der Task-Watchdog ist im Arduino-Kern bereits eingerichtet, aber mit
+  // Vorgaben, die hier nicht passen: kurze Frist und — je nach Fassung — nur
+  // eine Warnung statt eines Neustarts. Eine blosse Warnung nuetzt bei einem
+  // Geraet ohne Kabel gar nichts. Deshalb wird die Einstellung hier
+  // ausdruecklich gesetzt, statt sich auf eine Vorgabe zu verlassen, die sich
+  // mit dem naechsten Kern-Update aendern kann.
+  //
+  // idle_core_mask = 0: die Leerlauf-Tasks werden bewusst NICHT ueberwacht.
+  // Mit der langen Frist waere das ohnehin sinnlos, und ein Neustart, weil
+  // irgendein fremder Task den Kern mal laenger belegt, ist das Letzte, was
+  // dieses Geraet gebrauchen kann. Ueberwacht wird nur "bbwatch" — und der
+  // laeuft auf Kern 0, faellt also ohnehin aus, wenn dort etwas klemmt.
+  esp_task_wdt_config_t cfg = {};
+  cfg.timeout_ms     = BLACKBOX_HWWDT_MS;
+  cfg.idle_core_mask = 0;
+  cfg.trigger_panic  = true;
+
+  esp_err_t e = esp_task_wdt_reconfigure(&cfg);
+  if (e != ESP_OK) {
+    // Noch nicht eingerichtet (kommt vor, wenn der Kern den Task-Watchdog
+    // beim Start nicht selbst anlegt) -> dann selbst anlegen.
+    e = esp_task_wdt_init(&cfg);
+  }
+  if (e != ESP_OK) {
+    Serial.printf("[BLACKBOX] Hardware-Watchdog nicht einstellbar (%d) - nur Stufe 1 aktiv\n",
+                  (int)e);
+    return;
+  }
+
+  // Der Waechter-Task meldet sich selbst an. Ab hier gilt: fuettert er nicht
+  // mehr, gibt es einen Panic mit Absturzabbild und danach einen Neustart.
+  esp_err_t a = esp_task_wdt_add(nullptr);
+  if (a != ESP_OK && a != ESP_ERR_INVALID_ARG) {   // INVALID_ARG = schon angemeldet
+    Serial.printf("[BLACKBOX] Waechter konnte sich nicht anmelden (%d) - nur Stufe 1 aktiv\n",
+                  (int)a);
+    return;
+  }
+
+  bbHwWdtOn = true;
+  Serial.printf("[BLACKBOX] Hardware-Watchdog aktiv (%lus, Neustart mit Absturzabbild)\n",
+                (unsigned long)(BLACKBOX_HWWDT_MS / 1000UL));
 #else
-  Serial.println("[BLACKBOX] RTC-Watchdog nicht verfuegbar - nur Stufe 1 aktiv");
+  Serial.println("[BLACKBOX] Hardware-Watchdog per Schalter aus - nur Stufe 1 aktiv");
 #endif
 }
 
-static inline void bbRtcWdtFeed() {
-#if BB_HAVE_RTC_WDT
-  if (!bbRtcWdtOn) return;
-  // Schutz explizit auf und wieder zu. rtc_wdt_feed() macht das in den
-  // meisten IDF-Fassungen zwar selbst, aber darauf zu bauen waere hier die
-  // falsche Wette: laege man daneben, liefe jedes Fuettern ins Leere und der
-  // Watchdog startete das Geraet im Dreiminutentakt neu. Zweimal aufzuschliessen
-  // ist dagegen folgenlos.
-  rtc_wdt_protect_off();
-  rtc_wdt_feed();
-  rtc_wdt_protect_on();
+static inline void bbHwWdtFeed() {
+#if BLACKBOX_USE_HWWDT
+  if (!bbHwWdtOn) return;
+  esp_task_wdt_reset();
 #endif
 }
 
@@ -428,19 +454,17 @@ static void blackboxTaskFn(void *) {
   // Task-Watchdog. Dann gibt es zwar keine Blackbox, aber immer noch einen
   // Neustart — und ein Geraet, das zurueckkommt, ist mehr wert als eine
   // Diagnose, die niemand abholt.
-  bool wdt = (esp_task_wdt_add(nullptr) == ESP_OK);
-
   // Stufe 2 erst hier scharf machen: ab jetzt gibt es auch jemanden, der
   // fuettert. Waere sie schon in setup() aktiv, liefe die Frist bereits,
-  // waehrend noch niemand sie zuruecksetzen kann.
-  bbRtcWdtStart();
+  // waehrend noch niemand sie zuruecksetzen kann. bbHwWdtStart() meldet
+  // diesen Task gleich mit an.
+  bbHwWdtStart();
 
   uint32_t startedAt = millis();
 
   for (;;) {
     vTaskDelay(pdMS_TO_TICKS(BLACKBOX_CHECK_MS));
-    if (wdt) esp_task_wdt_reset();
-    bbRtcWdtFeed();
+    bbHwWdtFeed();
 
     uint32_t now = millis();
 
@@ -565,11 +589,10 @@ static void blackboxTaskFn(void *) {
     // niemand mehr, und eine noch laufende Frist wuerde in den naechsten
     // Startvorgang hineinragen. Der Bootloader richtet sich seinen eigenen
     // RTC-Watchdog ohnehin neu ein.
-#if BB_HAVE_RTC_WDT
-    if (bbRtcWdtOn) {
-      rtc_wdt_protect_off();
-      rtc_wdt_disable();
-      bbRtcWdtOn = false;
+#if BLACKBOX_USE_HWWDT
+    if (bbHwWdtOn) {
+      esp_task_wdt_delete(nullptr);
+      bbHwWdtOn = false;
     }
 #endif
     esp_restart();
@@ -598,8 +621,8 @@ String blackboxStatusJson() {
   j += ",\"stall_ms\":"    + String((unsigned long)BLACKBOX_STALL_MS);
   j += ",\"phase\":\""     + String(phaseName(blackboxPhase)) + "\"";
   j += ",\"step\":\""      + String(blackboxStep ? blackboxStep : "-") + "\"";
-  j += ",\"rtc_wdt\":"     + String(bbRtcWdtOn ? "true" : "false");
-  j += ",\"rtc_wdt_ms\":"  + String((unsigned long)BLACKBOX_RTCWDT_MS);
+  j += ",\"rtc_wdt\":"     + String(bbHwWdtOn ? "true" : "false");
+  j += ",\"rtc_wdt_ms\":"  + String((unsigned long)BLACKBOX_HWWDT_MS);
   j += ",\"had_previous\":" + String(bbHadPrevious ? "true" : "false");
   j += ",\"max_tries\":"   + String((unsigned)BLACKBOX_MAX_TRIES);
   j += ",\"pending\":"      + String(bbPendingClear ? "true" : "false");

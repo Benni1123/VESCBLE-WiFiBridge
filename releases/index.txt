@@ -1,0 +1,2 @@
+# Zeitpunkt         version.h  Abbild-Version  Kennung           Datei
+2026-09-25 16:28    1.3.5      43a8f6d         33ed9d6c9a35272f   firmware-43a8f6d-33ed9d6c9a35272f.elf.gz
