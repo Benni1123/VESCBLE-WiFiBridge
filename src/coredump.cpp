@@ -9,6 +9,7 @@
 #include "coredump.h"
 
 #include <esp_partition.h>
+#include <esp_app_desc.h>
 
 #if defined(__has_include)
 #  if __has_include(<esp_core_dump.h>)
@@ -27,7 +28,9 @@ static size_t   cdSize      = 0;
 static String   cdTask;                // Name des abgestuerzten Tasks
 static uint32_t cdPc        = 0;       // Absturzadresse
 static String   cdBacktrace;           // Aufrufkette als Adressliste
-static String   cdElfSha;              // SHA256 des Firmware-Abbilds
+static String   cdElfSha;              // SHA256 des Firmware-Abbilds im Dump
+static String   cdRunSha;              // SHA256 der gerade laufenden Firmware
+static bool     cdSameBuild = false;   // stammt der Dump von DIESEM Build?
 
 // ── Partition finden ────────────────────────────────────────────────────────
 static const esp_partition_t *cdPartition() {
@@ -113,7 +116,37 @@ void coreDumpSetup() {
       if (shaBuf[i] != 0 && (shaBuf[i] < 32 || shaBuf[i] > 126)) { shaBuf[i] = 0; break; }
     }
     cdElfSha = String(shaBuf);
-    logShipAdd("[COREDUMP] Firmware-Kennung (SHA256, Anfang): " + cdElfSha);
+
+    // ── Stammt das Abbild von der laufenden Firmware? ───────────────────────
+    //
+    // Ohne diese Angabe ist ein gefundenes Abbild nur halb verwertbar: man
+    // weiss nicht, ob es den letzten Absturz DIESES Builds zeigt oder noch
+    // von einer Version davor stammt. Genau die Frage stellt sich nach jedem
+    // Update, und raten hilft dabei nicht.
+    //
+    // esp_app_get_description() liefert dieselbe Kennung fuer das laufende
+    // Abbild. Sind beide gleich, passen auch die Adressen oben zur aktuellen
+    // firmware.elf — sonst braucht man die aeltere.
+    const esp_app_desc_t *desc = esp_app_get_description();
+    if (desc) {
+      char runBuf[sizeof(desc->app_elf_sha256) + 1];
+      memcpy(runBuf, desc->app_elf_sha256, sizeof(desc->app_elf_sha256));
+      runBuf[sizeof(desc->app_elf_sha256)] = 0;
+      for (size_t i = 0; i < sizeof(runBuf); i++) {
+        if (runBuf[i] != 0 && (runBuf[i] < 32 || runBuf[i] > 126)) { runBuf[i] = 0; break; }
+      }
+      cdRunSha    = String(runBuf);
+      cdSameBuild = (cdRunSha.length() > 0) && (cdRunSha == cdElfSha);
+    }
+
+    if (cdRunSha.length() > 0) {
+      logShipAdd("[COREDUMP] Firmware-Kennung: Abbild=" + cdElfSha +
+                 " laufend=" + cdRunSha +
+                 (cdSameBuild ? " -> GLEICHER Build, Adressen passen zur aktuellen firmware.elf"
+                              : " -> ANDERER Build, das Abbild stammt aus einer frueheren Version"));
+    } else {
+      logShipAdd("[COREDUMP] Firmware-Kennung (Abbild): " + cdElfSha);
+    }
   } else {
     logShipAdd("[COREDUMP] Kurzfassung nicht lesbar - rohes Abbild per /api/coredump holen");
   }
@@ -195,6 +228,8 @@ String coreDumpStatusJson() {
   j += ",\"pc\":\"0x"   + String((unsigned long)cdPc, HEX) + "\"";
   j += ",\"backtrace\":\"" + jsonEscapeDebug(cdBacktrace) + "\"";
   j += ",\"elf_sha\":\"" + jsonEscapeDebug(cdElfSha) + "\"";
+  j += ",\"run_sha\":\"" + jsonEscapeDebug(cdRunSha) + "\"";
+  j += ",\"same_build\":" + String(cdSameBuild ? "true" : "false");
   j += "}";
   return j;
 }

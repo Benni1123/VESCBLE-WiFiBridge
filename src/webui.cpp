@@ -848,7 +848,7 @@ function loadInfo(){
       '<div class="info-row"><span>'+(de()?'Adresse':'Address')+'</span><span class="info-val">'+esc(d.coredump.pc||'?')+'</span></div>'+
       (d.coredump.backtrace?'<div class="info-row"><span>Backtrace</span><span class="info-val" style="font-size:11px;word-break:break-all">'+esc(d.coredump.backtrace)+'</span></div>':'')+
       '<div class="info-row"><span>'+(de()?'Groesse':'Size')+'</span><span class="info-val">'+(d.coredump.size/1024).toFixed(1)+' KB</span></div>'+
-      (d.coredump.elf_sha?'<div class="info-row"><span>'+(de()?'Firmware-Kennung':'Firmware id')+'</span><span class="info-val">'+esc(d.coredump.elf_sha)+'</span></div>':'')+
+      (d.coredump.elf_sha?'<div class="info-row"><span>'+(de()?'Firmware-Kennung':'Firmware id')+'</span><span class="info-val" style="color:'+(d.coredump.same_build?'var(--ok)':'#e0a030')+'">'+esc(d.coredump.elf_sha)+(d.coredump.run_sha?(d.coredump.same_build?(de()?' (dieser Build)':' (this build)'):(de()?' (aelterer Build, laeuft: ':' (older build, running: ')+esc(d.coredump.run_sha)+')'):'')+'</span></div>':'')+
       '<div style="margin-top:6px"><a href="/api/coredump" class="btn" style="display:inline-block;text-decoration:none;padding:6px 12px">'+(de()?'Abbild herunterladen':'Download dump')+'</a> <button type="button" onclick="clearCoreDump()" style="padding:6px 12px">'+(de()?'Loeschen':'Erase')+'</button></div>'
       ):(d.coredump&&d.coredump.available?
       '<div style="margin:10px 0 6px;font-size:11px;color:#666;text-transform:uppercase;letter-spacing:1px">'+(de()?'Absturzabbild':'Core dump')+'</div>'+
