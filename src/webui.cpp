@@ -286,6 +286,7 @@ static const char PAGE_HTML[] PROGMEM = R"rawliteral(
     <div class="tab" onclick="showTab('ota')">OTA Flash</div>
     <div class="tab" id="tab-api-link" style="display:none" onclick="showTab('api')">API</div>
     <div class="tab" id="tab-leds-link" style="display:none" onclick="location.href='/leds'">LED</div>
+    <div class="tab" id="tab-heat-link" onclick="location.href='/heat'">Heizung</div>
   </div>
 
   <!-- INFO -->
@@ -520,8 +521,11 @@ static const char PAGE_HTML[] PROGMEM = R"rawliteral(
             <label class="checkbox-row" style="margin-top:4px;display:inline-flex;margin-right:12px">
               <input type="checkbox" id="dbg_poll" onchange="updateFilter()"> Poll
             </label>
-            <label class="checkbox-row" style="margin-top:4px;display:inline-flex">
+            <label class="checkbox-row" style="margin-top:4px;display:inline-flex;margin-right:12px">
               <input type="checkbox" id="dbg_status" onchange="updateFilter()"> Status
+            </label>
+            <label class="checkbox-row" style="margin-top:4px;display:inline-flex">
+              <input type="checkbox" id="dbg_heat" onchange="updateFilter()"> <span id="lbl-dbg-heat">Heater</span>
             </label>
           </div>
           <div style="display:flex;gap:8px;margin-bottom:8px">
@@ -586,6 +590,8 @@ function applyTranslations(){
   s('opt-apmode-on',        'On (always on)',                               'An (immer an)');
   s('opt-apmode-auto',      'Auto (on when riding, off when idle)',         'Auto (an beim Fahren, aus bei Stillstand)');
   s('lbl-apmode-hint',      'Like BLE Auto: riding above the ERPM threshold keeps the AP awake and brings it back after timeout. A connected AP client pauses the timer.', 'Wie BLE-Auto: Fahren \u00fcber der ERPM-Schwelle h\u00e4lt den AP wach und holt ihn nach dem Timeout zur\u00fcck. Ein verbundener AP-Client pausiert den Timer.');
+  s('tab-heat-link',        'Heater',                                       'Heizung');
+  s('lbl-dbg-heat',         'Heater',                                       'Heizung');
   s('lbl-erpm-title',       'Movement Detection',                           'Bewegungserkennung');
   s('lbl-erpm-power',       'ERPM threshold to wake BLE/WiFi when riding', 'ERPM-Schwelle zum Aufwecken von BLE/WLAN beim Fahren');
   s('lbl-erpm-hint',        'When BLE Auto mode or AP Auto mode is active and has switched off after the idle timeout, riding above this ERPM value switches BLE/AP back on. Higher value = needs faster riding to wake.', 'Wenn BLE-Auto-Modus oder AP-Auto-Modus aktiv ist und sich nach dem Timeout abgeschaltet hat, schaltet das \u00dcberschreiten dieses ERPM-Werts beim Fahren BLE/WLAN wieder ein. H\u00f6herer Wert = schnelleres Fahren n\u00f6tig zum Aufwecken.');
@@ -786,6 +792,25 @@ function reasonDE(s){
   };
   return m[s]||s;
 }
+// Klartext fuer die Heizung. Dieselben Schluessel wie auf /heat, damit beide
+// Seiten dasselbe sagen.
+function heatWhy(r){
+  var m={off:de()?'Modus aus':'mode off',
+         on:de()?'An (immer)':'on (always)',
+         riding:de()?'f\u00e4hrt':'riding',
+         lag:de()?'Nachlauf':'follow-up',
+         idle:de()?'steht':'standing',
+         nodata:de()?'keine frischen VESC-Daten':'no fresh VESC data',
+         undervolt:de()?'Unterspannung':'low voltage',
+         test:de()?'Testlauf':'test run',
+         nopin:de()?'kein g\u00fcltiger GPIO':'no valid GPIO'};
+  return m[r]||r;
+}
+function heatMode(m){
+  if(m===0) return de()?'Aus':'Off';
+  if(m===1) return de()?'An (immer)':'On (always)';
+  return de()?'Auto (nur beim Fahren)':'Auto (only while riding)';
+}
 function loadInfo(){
   fetch('/api/info').then(function(r){return r.json();}).then(function(d){
     document.getElementById('statusBar').textContent=d.mode==='ap'&&!d.ssid?'AP: '+d.ip:'WiFi: '+d.ssid+' ('+d.ip+')';
@@ -813,6 +838,18 @@ function loadInfo(){
       '<div class="info-row" style="'+(d.vesc_connected?'':'opacity:0.4')+'"><span>Temp Motor</span><span class="info-val">'+d.vesc_temp_motor+' °C</span></div>'+
       '<div class="info-row" style="'+(d.vesc_connected?'':'opacity:0.4')+'"><span>'+(de()?'Fehlercode':'Fault')+'</span><span class="info-val" style="color:'+(d.vesc_fault===0?'#81c784':'#e57373')+'">'+(d.vesc_fault_str||'OK')+'</span></div>'+
       '<div class="info-row" style="'+(d.vesc_connected?'':'opacity:0.4')+'"><span>ERPM</span><span class="info-val">'+d.vesc_erpm+'</span></div>'+
+      // ── Griffheizung ──
+      // Nur anzeigen, wenn sie ueberhaupt eingerichtet ist (Modus nicht Aus
+      // oder ein GPIO gesetzt). Eine Zeile "Heizung: aus", die bei niemandem
+      // je etwas anderes sagt, ist nur Rauschen auf der Startseite.
+      (d.heat&&(d.heat.mode!==0||d.heat.pin>=0)?(
+        '<div style="margin:10px 0 6px;font-size:11px;color:#666;text-transform:uppercase;letter-spacing:1px">'+(de()?'Griffheizung':'Grip heater')+'</div>'+
+        '<div class="info-row"><span>'+(de()?'Leistung':'Power')+'</span><span class="info-val" style="color:'+(d.heat.active?'var(--ok)':'var(--text3)')+'">'+d.heat.out+' %'+(d.heat.active?'':' ('+(de()?'aus':'off')+')')+'</span></div>'+
+        '<div class="info-row"><span>'+(de()?'Grund':'Reason')+'</span><span class="info-val">'+esc(heatWhy(d.heat.reason))+(d.heat.reason==='test'&&d.heat.test_left>0?' ('+d.heat.test_left+'s)':'')+'</span></div>'+
+        '<div class="info-row"><span>'+(de()?'Modus':'Mode')+'</span><span class="info-val">'+esc(heatMode(d.heat.mode))+'</span></div>'+
+        '<div class="info-row"><span>GPIO / PWM</span><span class="info-val">'+(d.heat.pin>=0?'GPIO'+d.heat.pin:(de()?'nicht gesetzt':'unset'))+' / '+d.heat.freq+' Hz</span></div>'+
+        (d.heat.pin_error?'<div class="info-row"><span>GPIO</span><span class="info-val" style="color:#e57373">'+esc(d.heat.pin_error)+'</span></div>':'')
+      ):'')+
       '<div class="info-row"><span>'+(de()?'Systemzeit':'System time')+'</span><span class="info-val" style="color:'+(d.time_valid?'var(--text2)':'#e0a030')+'">'+(d.time_valid?esc(d.time_local)+(d.time_source?' ('+esc(timeSourceLabel(d.time_source))+')':''):(de()?'Nicht synchronisiert':'Not synchronized'))+'</span></div>'+
       '<div class="info-row"><span>Uptime</span><span class="info-val">'+d.uptime+'</span></div>'+
       '<div class="info-row"><span>Build</span><span class="info-val">'+d.build+'</span></div>'+
@@ -1101,11 +1138,11 @@ function saveConfig(){
 
 // Debug
 function updateFilter(){
-  var f=(document.getElementById('dbg_ble').checked?1:0)|(document.getElementById('dbg_wifi').checked?2:0)|(document.getElementById('dbg_poll').checked?4:0)|(document.getElementById('dbg_status').checked?8:0);
+  var f=(document.getElementById('dbg_ble').checked?1:0)|(document.getElementById('dbg_wifi').checked?2:0)|(document.getElementById('dbg_poll').checked?4:0)|(document.getElementById('dbg_status').checked?8:0)|(document.getElementById('dbg_heat').checked?16:0);
   fetch('/api/debug?en=1&filter='+f,{method:'POST'});
 }
 function setDebug(on){
-  var f=(document.getElementById('dbg_ble').checked?1:0)|(document.getElementById('dbg_wifi').checked?2:0)|(document.getElementById('dbg_poll').checked?4:0)|(document.getElementById('dbg_status').checked?8:0);
+  var f=(document.getElementById('dbg_ble').checked?1:0)|(document.getElementById('dbg_wifi').checked?2:0)|(document.getElementById('dbg_poll').checked?4:0)|(document.getElementById('dbg_status').checked?8:0)|(document.getElementById('dbg_heat').checked?16:0);
   fetch('/api/debug?en='+(on?1:0)+'&filter='+f,{method:'POST'}).then(function(){
     document.getElementById('debugLogWrap').style.display=on?'':'none';
     if(on)loadUartLog();
@@ -1252,6 +1289,7 @@ function initDebugTab(){
     document.getElementById('dbg_wifi').checked = !!(d.filter & 2);
     document.getElementById('dbg_poll').checked = !!(d.filter & 4);
     document.getElementById('dbg_status').checked = !!(d.filter & 8);
+    document.getElementById('dbg_heat').checked = !!(d.filter & 16);
     document.getElementById('debugLogWrap').style.display=d.enabled?'':'none';
     if(d.enabled)loadUartLog();
   }).catch(function(){});
@@ -1422,6 +1460,9 @@ void handleApiInfo() {
   // sehen, ob noch ein Eintrag im Flash auf seine Uebertragung wartet.
   json += "\"blackbox\":" + blackboxStatusJson() + ",";
   json += "\"coredump\":" + coreDumpStatusJson() + ",";
+  // Griffheizung: Zustand UND Einstellungen in einem Rutsch. Die Seite /heat
+  // zieht sich daraus alles und braucht keinen zweiten Abruf.
+  json += "\"heat\":" + heatStatusJson() + ",";
   if (WiFi.status() != WL_CONNECTED) {
     json += "\"mode\":\"ap\",\"ip\":\""+WiFi.softAPIP().toString()+"\"";
   } else {
@@ -2130,6 +2171,10 @@ void setupWebServer() {
   });
 
   // LED-Modul: registriert /leds (und spaeter LED-API) am Hauptserver.
+  // Griffheizung: eigene Seite /heat plus /api/heat. Eigener NVS-Namensraum,
+  // deshalb greift dort alles sofort statt wie in der Hauptkonfiguration erst
+  // nach einem Neustart.
+  heatSetup(&otaServer);
   ledsSetup(&otaServer);
   ledsStartTask();   // LED-Rendering in eigenen Task auf Kern 1 auslagern
 

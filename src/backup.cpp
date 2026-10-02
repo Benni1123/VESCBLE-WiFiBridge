@@ -9,8 +9,9 @@
 #include <mbedtls/base64.h>
 
 // Die drei Namespaces, in denen die Firmware ihre Einstellungen ablegt.
-// vesccfg: config.cpp, leds: leds.cpp, ledpat: die gespeicherten Muster.
-static const char *BACKUP_NS[] = { "vesccfg", "leds", "ledpat" };
+// vesccfg: config.cpp, leds: leds.cpp, ledpat: die gespeicherten Muster,
+// heat: heater.cpp (GPIO, Leistung, PWM-Frequenz, ERPM-Schwelle).
+static const char *BACKUP_NS[] = { "vesccfg", "leds", "ledpat", "heat" };
 static const size_t BACKUP_NS_COUNT = sizeof(BACKUP_NS) / sizeof(BACKUP_NS[0]);
 
 // Groesster Blob, den wir sichern bzw. einspielen. Ein Muster sind

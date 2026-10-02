@@ -132,7 +132,9 @@ void pollVesc() {
   // normale "VESC Daten auslesen"-Haken aus ist. Das gilt fuer den BLE-Auto-
   // Modus UND fuer den AP-Auto-Modus (fahren haelt den AP wach / holt ihn
   // zurueck, genau wie BLE-Auto).
-  bool needErpmForWake = (cfg_ble_mode == 2) || (cfg_ap_mode == 2);
+  // Die Griffheizung im Auto-Modus gehoert in dieselbe Liste: sie entscheidet
+  // aus ERPM und ist ohne frische Werte funktionslos.
+  bool needErpmForWake = (cfg_ble_mode == 2) || (cfg_ap_mode == 2) || heatNeedsErpm();
   if (!cfg_vesc_poll && !needErpmForWake) return;
 
   bool autoPollActive  = cfg_autopoll_enabled || needErpmForWake;
@@ -179,6 +181,12 @@ void vescLoop() {
   // LED-Rendering laeuft jetzt im eigenen Task (Kern 1). Hier nur noch billig
   // den Zustand melden; das eigentliche show() macht der LED-Task.
   ledsUpdateState(cfg_leds_enabled, vescStatus.erpm);
+
+  // Griffheizung: entscheidet aus ERPM und Spannung, ob geheizt wird. Steht
+  // hier und nicht im loop(), weil an dieser Stelle die VESC-Werte frisch
+  // sind — direkt nach pollVesc(). Die Funktion drosselt sich selbst auf
+  // 200 ms, der Aufruf im Loop-Takt kostet also nichts.
+  heatUpdateState(vescStatus.connected, vescStatus.erpm, vescStatus.voltage);
 
   if (!wifiClient || !wifiClient.connected()) {
     wifiClient = server.accept();   // Core 3.x: available() -> accept() (nur Umbenennung, gleiche Funktion)

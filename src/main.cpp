@@ -9,6 +9,7 @@
 #include "backup.h"
 #include "wifi-ble.h"
 #include "vesc.h"
+#include "heater.h"
 #include "webui.h"
 
 // Die Moduldateien werden absichtlich hier eingebunden. Arduino/PlatformIO
@@ -22,6 +23,7 @@
 #include "backup.cpp"
 #include "wifi-ble.cpp"
 #include "vesc.cpp"
+#include "heater.cpp"
 #include "webui.cpp"
 // blackbox.cpp ZULETZT: der Stall-Waechter liest den RTC-Ringpuffer aus
 // logship.cpp direkt aus. Im Unity-Build ist das dieselbe
