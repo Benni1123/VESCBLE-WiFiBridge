@@ -208,6 +208,7 @@ static const size_t NDOT_FONT_WOFF2_LEN = 2848;
 // allen drei Oberflaechen ueber /style.css geladen und vom Browser einen Tag
 // lang behalten.
 #include "style_page_gz.h"
+#include "app_page_gz.h"
 
 // ── HTML PAGE ─────────────────────────────────────────────────────────────────
 // ── Startseite ───────────────────────────────────────────────────────────────
@@ -897,6 +898,53 @@ void setupWebServer() {
     // Nullbytes, und die Fassung ohne Laengenangabe misst per strlen().
     otaServer.sendHeader("Content-Encoding", "gzip");
     otaServer.send_P(200, "text/css", (PGM_P)STYLE_PAGE_GZ, STYLE_PAGE_GZ_LEN);
+  });
+  // ── Gemeinsames JavaScript ────────────────────────────────────────────────
+  //
+  // Sprache, Thema, Hinweistexte, Reiter-Sichtbarkeit und das Easteregg waren
+  // auf allen drei Seiten Zeichen fuer Zeichen gleich und lagen damit dreimal
+  // im Flash. Jetzt einmal hier.
+  //
+  // KEIN Cache. Anders als beim Stylesheet waere eine veraltete Kopie hier
+  // nicht bloss haesslich: fehlt nach einem Update eine Funktion, die die neue
+  // Seite aufruft, bricht der ganze Block mit einem ReferenceError ab — und
+  // dann fehlen Reiter und Statuszeile. Ueber den eigenen Zugangspunkt kostet
+  // das Neuladen ein paar Kilobyte, das ist der sichere Tausch.
+  otaServer.on("/app.js", HTTP_GET, [](){
+    otaServer.sendHeader("Cache-Control", "no-store, must-revalidate");
+    otaServer.sendHeader("Content-Encoding", "gzip");
+    otaServer.send_P(200, "application/javascript", (PGM_P)APP_PAGE_GZ, APP_PAGE_GZ_LEN);
+  });
+  // ── Reiter-Sichtbarkeit ───────────────────────────────────────────────────
+  //
+  // Welche der optionalen Reiter (LED, Heizung, API) es gibt, weiss nur der
+  // ESP. Bisher hat die Seite das nachtraeglich per /api/info bzw.
+  // /api/debug/unlock erfragt und die Reiter dann eingeblendet — deshalb waren
+  // sie beim Seitenwechsel einen Moment weg und ruckten danach zurueck.
+  //
+  // Diese Datei wird im <head> blockierend geladen und setzt das Attribut
+  // data-ui am <html>-Element. Sie ist also fertig, BEVOR die Reiterleiste
+  // geparst wird — es gibt kein Bild ohne die Reiter. style.css enthaelt die
+  // Regeln, die ohne den passenden Token auf display:none gehen.
+  //
+  // Bewusst NICHT ueber ein Cookie geloest: im Captive-Portal-Browser (Apple
+  // CNA, Android) ist beim ersten Aufruf keines da, und ein altes Cookie waere
+  // schlimmer als keines — es wuerde den falschen Zustand zeichnen.
+  //
+  // no-store ist Pflicht. Mit Cache wuerde ein Browser nach dem Umstellen
+  // eines Hakens weiter die alte Reiterleiste zeigen, und zwar genau so lange,
+  // bis er die Datei von selbst neu holt.
+  //
+  // Nicht gepackt: der Inhalt sind rund 60 Byte, gzip waere groesser.
+  otaServer.on("/ui-state.js", HTTP_GET, [](){
+    String t;
+    if (cfg_leds_enabled) t += "leds ";
+    if (cfg_heat_enabled) t += "heat ";
+    if (debugUnlocked)    t += "api";
+    t.trim();
+    otaServer.sendHeader("Cache-Control", "no-store, must-revalidate");
+    otaServer.send(200, "application/javascript",
+                   "document.documentElement.setAttribute('data-ui','" + t + "');\n");
   });
   // Ndot-Schrift als rohe WOFF2-Bytes (kein Base64-Overhead). Lange Cache-Zeit,
   // damit der Browser sie nur einmal laedt und fuer beide Seiten wiederverwendet.

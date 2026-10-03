@@ -11,6 +11,7 @@
 #
 #     web/heat.html   ->   src/heat_page_gz.h
 #     web/style.css   ->   src/style_page_gz.h
+#     web/app.js      ->   src/app_page_gz.h
 #
 # Die Quelldatei bleibt normales, lesbares HTML. Erzeugt wird daraus ein
 # Byte-Array in PROGMEM plus seine Laenge.
@@ -23,6 +24,10 @@
 #         post:merge_firmware.py
 #         post:archive_elf.py
 #
+# Die erzeugten Dateien gehoeren NICHT in die Versionsverwaltung — sie
+# entstehen bei jedem Build neu. Eintrag fuer .gitignore:
+#
+#     src/*_page_gz.h
 # ─────────────────────────────────────────────────────────────────────────────
 
 # pyright: reportUndefinedVariable=false
@@ -99,5 +104,5 @@ if not os.path.isdir(WEB_DIR):
     print("Seiten: kein web/-Verzeichnis - nichts zu packen")
 else:
     for f in sorted(os.listdir(WEB_DIR)):
-        if f.endswith(".html") or f.endswith(".css"):
+        if f.endswith((".html", ".css", ".js")):
             build_one(os.path.join(WEB_DIR, f))

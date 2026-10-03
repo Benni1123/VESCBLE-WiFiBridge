@@ -57,3 +57,31 @@
     .ep .desc{color:var(--text2);margin-top:4px}
     .ep .fields{margin-top:4px;color:var(--text3);font-size:11px}
     .api-h2{color:var(--text2);font-size:12px;margin:14px 0 8px;text-transform:uppercase;letter-spacing:1px}
+
+    /* ── Sichtbarkeit der optionalen Reiter ──────────────────────────────────
+       LED, Heizung und API gibt es nur, wenn sie eingeschaltet bzw.
+       freigeschaltet sind. Frueher stand dafuer style="display:none" im HTML
+       und JavaScript hat sie nach der Antwort von /api/info wieder eingeblendet
+       — dadurch waren sie beim Seitenwechsel einen Moment weg und ruckten dann
+       zurueck.
+
+       Jetzt entscheidet das Attribut data-ui am <html>-Element, gesetzt von
+       /ui-state.js. Das Script steht im <head> und blockiert den Parser, ist
+       also fertig, BEVOR die Reiterleiste ueberhaupt geparst wird: es gibt kein
+       Bild ohne die Reiter, nichts flackert, und der Zustand kommt direkt vom
+       ESP statt aus einem Cookie — damit stimmt er auch beim allerersten Aufruf
+       im Captive-Portal-Browser, der keine Cookies von vorher hat.
+
+       Kein !important: spaetere Aenderungen im Betrieb (Haken umstellen, 8x auf
+       den Titel tippen) setzen die Tokens in data-ui um, und falls doch mal
+       etwas direkt am Element herumschraubt, gewinnt das. */
+    html:not([data-ui~="leds"]) #tab-leds-link{display:none}
+    html:not([data-ui~="heat"]) #tab-heat-link{display:none}
+    html:not([data-ui~="api"])  #tab-api-link {display:none}
+
+    /* Easteregg-Spruchblase. Lag vorher auf allen drei Seiten inline. */
+  .egg{position:fixed;z-index:9998;pointer-events:none;max-width:260px;padding:9px 13px;
+       border-radius:10px;background:var(--bg2);border:1px solid var(--accent);
+       color:var(--text);font-family:Ndot47,system-ui,-apple-system,sans-serif;font-size:12px;
+       line-height:1.4;box-shadow:0 4px 18px rgba(0,0,0,.35);opacity:0;transition:opacity .6s}
+    .egg.on{opacity:1}

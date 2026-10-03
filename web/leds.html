@@ -5,6 +5,12 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>LEDs</title>
   <link rel="stylesheet" href="/style.css">
+  <!-- Reiter-Sichtbarkeit, vom ESP erzeugt. Muss blockierend im <head> stehen,
+       damit die Leiste nie ohne ihre Reiter gezeichnet wird. -->
+  <script src="/ui-state.js"></script>
+  <!-- Gemeinsames JS (Sprache, Thema, Hinweise, Reiter, Easteregg). Blockierend,
+       damit die Definitionen stehen, bevor der Block am Seitenende laeuft. -->
+  <script src="/app.js"></script>
   <style>
     input[type=range]{width:100%;accent-color:var(--accent);margin-top:6px}
     .rng-row{display:grid;grid-template-columns:24px 1fr 44px;gap:8px;align-items:center;margin-top:8px}
@@ -45,11 +51,6 @@
     .sechead:hover .chev{color:var(--accent)}
     .chev{color:var(--text2);font-size:20px;line-height:1;padding:2px 6px;flex:0 0 auto;transition:transform .15s ease}
     .chev.closed{transform:rotate(-90deg)}
-  .egg{position:fixed;z-index:9998;pointer-events:none;max-width:260px;padding:9px 13px;
-       border-radius:10px;background:var(--bg2);border:1px solid var(--accent);
-       color:var(--text);font-family:Ndot47,system-ui,-apple-system,sans-serif;font-size:12px;
-       line-height:1.4;box-shadow:0 4px 18px rgba(0,0,0,.35);opacity:0;transition:opacity .6s}
-    .egg.on{opacity:1}
   </style>
 </head>
 <body>
@@ -63,9 +64,9 @@
     <div class="tab" onclick="location.href='/?tab=info'">Info</div>
     <div class="tab" onclick="location.href='/?tab=config'">Config</div>
     <div class="tab" onclick="location.href='/?tab=ota'">OTA Flash</div>
-    <div class="tab" id="tab-api-link" style="display:none" onclick="location.href='/?tab=api'">API</div>
+    <div class="tab" id="tab-api-link" onclick="location.href='/?tab=api'">API</div>
     <div class="tab active" onclick="location.href='/leds'">LED</div>
-    <div class="tab" id="tab-heat-link" style="display:none" onclick="location.href='/heat'">Heizung</div>
+    <div class="tab" id="tab-heat-link" onclick="location.href='/heat'">Heizung</div>
   </div>
 
   <!-- Kanal-Hardware (GPIO, LED-Anzahl, Farbreihenfolge, Synchronisierung,
@@ -80,53 +81,9 @@
 </div>
 
 <script>
-var lang=(document.cookie.match(/lang=([a-z]+)/)||[])[1]||(navigator.language.startsWith('de')?'de':'en');
-function de(){return lang==='de';}
-function L(d,e){return de()?d:e;}
-function gid(id){return document.getElementById(id);}
-
-var theme=(document.cookie.match(/theme=([a-z]+)/)||[])[1]||(window.matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light');
-function applyTheme(){document.documentElement.setAttribute('data-theme',theme);var b=gid('themeBtn');if(b)b.textContent=theme==='dark'?'\u2600\uFE0F':'\uD83C\uDF19';document.cookie='theme='+theme+';path=/;max-age=31536000';}
-function toggleTheme(){theme=theme==='dark'?'light':'dark';applyTheme();}
 applyTheme();
-function toggleLang(){lang=lang==='de'?'en':'de';document.cookie='lang='+lang+';path=/;max-age=31536000';location.reload();}
 gid('langBtn').textContent=de()?'EN':'DE';
 
-// Modulreiter ohne Springen: der Zustand der beiden optionalen Reiter (LED,
-// Heizung) kommt aus /api/info und damit erst nach einer Netzwerkantwort. Bis
-// dahin fehlen sie, und wenn sie auftauchen, ruecken die uebrigen Reiter zur
-// Seite — genau das Springen, das beim Klicken nervt.
-//
-// Deshalb wird der zuletzt bekannte Zustand in einem Cookie gemerkt und beim
-// Laden SOFORT angewandt. Die Antwort korrigiert ihn dann nur noch, falls sich
-// etwas geaendert hat. Beim allerersten Aufruf springt es einmal, danach nie
-// wieder.
-function modsSave(l,h){ document.cookie='mods='+(l?'1':'0')+(h?'1':'0')+';path=/;max-age=31536000'; }
-function modsApply(l,h){
-  var e1=document.getElementById('tab-leds-link'); if(e1) e1.style.display=l?'':'none';
-  var e2=document.getElementById('tab-heat-link'); if(e2) e2.style.display=h?'':'none';
-}
-(function(){
-  var m=(document.cookie.match(/mods=(\d\d)/)||[])[1];
-  if(m) modsApply(m[0]==='1', m[1]==='1');
-})();
-var infoVisible=false;
-// Cookie statt localStorage: derselbe Zustand gilt jetzt auch auf der
-// Startseite und auf /heat. Standard aus.
-infoVisible=(document.cookie.match(/hints=(\d)/)||[])[1]==='1';
-function applyInfoState(){
-  if(document.body) document.body.classList.toggle('show-info',infoVisible);
-  var b=gid('btn-info');
-  if(b){
-    if(infoVisible)b.classList.add('on');else b.classList.remove('on');
-    b.title=infoVisible?L('Hinweise ausblenden','Hide notes'):L('Hinweise einblenden','Show notes');
-  }
-}
-function toggleInfo(){
-  infoVisible=!infoVisible;
-  document.cookie='hints='+(infoVisible?'1':'0')+';path=/;max-age=31536000';
-  applyInfoState();
-}
 
 (function(){
   var s=function(id,en,d){var el=gid(id);if(el)el.textContent=de()?d:en;};
@@ -135,86 +92,6 @@ function toggleInfo(){
   var sb=gid('statusBar'); if(sb && sb.textContent==='Loading...') sb.textContent=de()?'Lädt...':'Loading...';
 })();
 
-// ── Easteregg ───────────────────────────────────────────────────────────────
-//
-// Nur fuer das Geraet mit dem BLE-Namen "BLE". Wirft in grossen
-// Abstaenden einen Spruch an eine zufaellige Stelle und blendet ihn wieder aus.
-//
-// Bewusst ohne Interaktion: pointer-events:none, damit nie ein Knopf verdeckt
-// wird, den man gerade druecken will. Und mit grossem Abstand nach oben, damit
-// die Reiterleiste frei bleibt.
-var EGG_LINES = [
-  'BLE meldet sich zum Dienst.',
-  'Akku voll, Kopf leer, Gas.',
-  'Die Griffheizung sagt danke.',
-  'Irgendwo zaehlt ein Zaehler hoch.',
-  'Der Waechter waecht.',
-  'ERPM ist nur eine Zahl.',
-  'Dieses Geraet hat schon Schlimmeres ueberlebt.',
-  'Blackbox leer. Gutes Zeichen.',
-  'Kein Brownout seit Minuten.',
-  'Die LEDs sehen dich.',
-  'Ja, das Log laeuft noch.',
-  'PWM macht genau das, was du gesagt hast.',
-  'Wer braucht schon Bremsen.',
-  'Noch ein Reiter und es passt nicht mehr drauf.',
-  'Der Coredump wartet auf dich.',
-  'Alles im gruenen Bereich. Vermutlich.'
-];
-var eggTimer = null;
-
-// Der Zustand kommt vom Geraet (NVS), nicht aus dem Browser. eggOff ist nur
-// die lokale Kopie, damit eggShow() nicht bei jedem Spruch nachfragen muss;
-// aufgefrischt wird sie mit jedem /api/info.
-var eggOff = false;
-function eggIsOff(){ return eggOff; }
-function eggSetOff(off){
-  eggOff = !!off;
-  fetch('/api/egg?en=' + (off?0:1), {method:'POST'}).catch(function(){});
-  if (off && eggTimer){ clearTimeout(eggTimer); eggTimer = null; }
-  // Laufende Spruchblasen gleich mit wegraeumen, sonst steht die letzte noch
-  // sechs Sekunden da, nachdem man es ausgeschaltet hat.
-  var old = document.querySelectorAll('.egg');
-  for (var i = 0; i < old.length; i++) old[i].parentNode.removeChild(old[i]);
-}
-
-function eggShow(){
-  if (eggIsOff()) return;
-  var d = document.createElement('div');
-  d.className = 'egg';
-  d.textContent = EGG_LINES[Math.floor(Math.random()*EGG_LINES.length)];
-  // SAUER! gehoert an jeden Spruch. Als eigenes Element und nicht per
-  // innerHTML: so kann im Spruchtext nie etwas als Markup gedeutet werden,
-  // egal was dort kuenftig steht.
-  var sa = document.createElement('span');
-  sa.textContent = ' SAUER!';
-  sa.style.cssText = 'color:var(--accent);font-weight:800;letter-spacing:1px';
-  d.appendChild(sa);
-  document.body.appendChild(d);
-  // Erst anhaengen, dann messen: vorher kennt der Browser die Groesse nicht,
-  // und der Spruch landete halb ausserhalb des Fensters.
-  var w = d.offsetWidth, h = d.offsetHeight;
-  var maxX = Math.max(8, window.innerWidth  - w - 8);
-  var maxY = Math.max(60, window.innerHeight - h - 8);
-  d.style.left = (8 + Math.random()*(maxX-8)) + 'px';
-  d.style.top  = (60 + Math.random()*(maxY-60)) + 'px';
-  requestAnimationFrame(function(){ d.classList.add('on'); });
-  setTimeout(function(){
-    d.classList.remove('on');
-    setTimeout(function(){ if(d.parentNode) d.parentNode.removeChild(d); }, 800);
-  }, 6000);
-}
-
-function eggArm(name){
-  if (name !== 'BLE' || eggTimer || eggIsOff()) return;
-  // Zufaelliger Abstand zwischen 40 und 160 Sekunden. Ein fester Takt waere
-  // schnell nur noch Moebel.
-  (function next(){
-    eggTimer = setTimeout(function(){ eggShow(); next(); },
-                          40000 + Math.random()*120000);
-  })();
-  setTimeout(eggShow, 4000);   // einer gleich zur Begruessung
-}
 
 var vescRx=-1, vescTx=-1;
 function loadStatus(){
@@ -230,7 +107,6 @@ function loadStatus(){
     // Heizungs-Reiter einblenden, wenn das Modul aktiv ist. Ohne das sah man
     // von hier aus die Heizung nicht und musste ueber die Startseite zurueck.
     modsApply(true, d.heat_enabled===true);   // LED-Reiter ist hier aktiv
-    modsSave (d.leds_enabled===true, d.heat_enabled===true);
   }).catch(function(){});
 }
 loadStatus();
@@ -865,9 +741,9 @@ function applyHw(){
 // Debug-Freischaltung: serverseitiges RAM-Flag, per 8x-Tippen auf den Titel.
 // Gilt bis zum ESP-Neustart und schaltet hier den API-Tab sowie das
 // Keepalive-Notfallfeld frei.
-var dbgUnlocked=false;
+var dbgUnlocked=uiHas('api');   // Anfangswert aus /ui-state.js
 function applyDebugState(){
-  var el=gid('tab-api-link'); if(el)el.style.display=dbgUnlocked?'':'none';
+  uiSet('api',dbgUnlocked);
   var ka=gid('karow');        if(ka)ka.style.display=dbgUnlocked?'':'none';
 }
 function ledToast(msg){
@@ -907,7 +783,7 @@ function unlockDebug(){
     }
   });
 })();
-applyInfoState();
+applyHints();
 checkApiUnlock();
 load();
 </script>

@@ -5,6 +5,12 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Griffheizung</title>
   <link rel="stylesheet" href="/style.css">
+  <!-- Reiter-Sichtbarkeit, vom ESP erzeugt. Muss blockierend im <head> stehen,
+       damit die Leiste nie ohne ihre Reiter gezeichnet wird. -->
+  <script src="/ui-state.js"></script>
+  <!-- Gemeinsames JS (Sprache, Thema, Hinweise, Reiter, Easteregg). Blockierend,
+       damit die Definitionen stehen, bevor der Block am Seitenende laeuft. -->
+  <script src="/app.js"></script>
   <style>
     input[type=range]{width:100%;accent-color:var(--accent);margin-top:6px}
     .rng-row{display:grid;grid-template-columns:1fr 54px;gap:10px;align-items:center;margin-top:6px}
@@ -15,11 +21,6 @@
     .state{padding:12px;border-radius:8px;background:var(--bg3);border:1px solid var(--border2);display:flex;justify-content:space-between;align-items:center;gap:12px}
     .warn{margin-top:8px;padding:8px 10px;border-left:2px solid #e0a030;border-radius:4px;background:rgba(224,160,48,.08);color:var(--text2);font-size:11px;line-height:1.45}
     .info-note.warn{border-left-color:#e0a030;background:rgba(224,160,48,.08)}
-  .egg{position:fixed;z-index:9998;pointer-events:none;max-width:260px;padding:9px 13px;
-       border-radius:10px;background:var(--bg2);border:1px solid var(--accent);
-       color:var(--text);font-family:Ndot47,system-ui,-apple-system,sans-serif;font-size:12px;
-       line-height:1.4;box-shadow:0 4px 18px rgba(0,0,0,.35);opacity:0;transition:opacity .6s}
-    .egg.on{opacity:1}
     .err{margin-top:8px;padding:8px 10px;border-left:2px solid var(--err);border-radius:4px;background:rgba(229,115,115,.10);color:#e57373;font-size:12px}
     .info-note{display:none;margin-top:7px;padding:7px 9px;border-left:2px solid var(--accent);border-radius:4px;background:rgba(77,163,255,.07);color:var(--text2);font-size:11px;line-height:1.45}
   body.show-info .info-note:not([data-relevant="0"]){display:block}
@@ -40,8 +41,8 @@
     <div class="tab" onclick="location.href='/?tab=info'">Info</div>
     <div class="tab" onclick="location.href='/?tab=config'">Config</div>
     <div class="tab" onclick="location.href='/?tab=ota'">OTA Flash</div>
-    <div class="tab" id="tab-api-link" style="display:none" onclick="location.href='/?tab=api'">API</div>
-    <div class="tab" id="tab-leds-link" style="display:none" onclick="location.href='/leds'">LED</div>
+    <div class="tab" id="tab-api-link" onclick="location.href='/?tab=api'">API</div>
+    <div class="tab" id="tab-leds-link" onclick="location.href='/leds'">LED</div>
     <div class="tab active" onclick="location.href='/heat'" id="tab-heat">Heizung</div>
   </div>
 
@@ -142,55 +143,11 @@
 </div>
 
 <script>
-var lang=(document.cookie.match(/lang=([a-z]+)/)||[])[1]||(navigator.language.startsWith('de')?'de':'en');
-function de(){return lang==='de';}
-function L(d,e){return de()?d:e;}
-function gid(id){return document.getElementById(id);}
-
-var theme=(document.cookie.match(/theme=([a-z]+)/)||[])[1]||(window.matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light');
-function applyTheme(){document.documentElement.setAttribute('data-theme',theme);var b=gid('themeBtn');if(b)b.textContent=theme==='dark'?'☀️':'🌙';document.cookie='theme='+theme+';path=/;max-age=31536000';}
-function toggleTheme(){theme=theme==='dark'?'light':'dark';applyTheme();}
 applyTheme();
-function toggleLang(){lang=lang==='de'?'en':'de';document.cookie='lang='+lang+';path=/;max-age=31536000';location.reload();}
 gid('langBtn').textContent=de()?'EN':'DE';
 
-// ── Hinweistexte ein-/ausblenden ────────────────────────────────────────────
-// Der Zustand steht in einem Cookie und nicht in localStorage: so gilt er
-// seitenuebergreifend (Startseite, /leds, /heat) mit demselben Mechanismus,
-// den auch Thema und Sprache benutzen. Standard ist AUS — die Oberflaeche
-// soll aufgeraeumt aussehen, bis man die Erklaerungen anfordert.
-var hintsOn = (document.cookie.match(/hints=(\d)/)||[])[1] === '1';
-function applyHints(){
-  if (document.body) document.body.classList.toggle('show-info', hintsOn);
-  var b = gid('btn-info');
-  if (b){
-    if (hintsOn) b.classList.add('on'); else b.classList.remove('on');
-    b.title = hintsOn ? (de()?'Hinweise ausblenden':'Hide notes')
-                      : (de()?'Hinweise einblenden':'Show notes');
-  }
-}
-function toggleInfo(){
-  hintsOn = !hintsOn;
-  document.cookie = 'hints=' + (hintsOn?'1':'0') + ';path=/;max-age=31536000';
-  applyHints();
-}
 applyHints();
 
-// Modulreiter ohne Springen: der Zustand der optionalen Reiter kommt aus
-// /api/info und damit erst nach einer Netzwerkantwort. Bis dahin fehlen sie,
-// und wenn sie auftauchen, ruecken die uebrigen Reiter zur Seite.
-//
-// Deshalb wird der zuletzt bekannte Zustand in einem Cookie gemerkt und beim
-// Laden SOFORT angewandt. Die Antwort korrigiert ihn dann nur noch.
-function modsSave(l,h){ document.cookie='mods='+(l?'1':'0')+(h?'1':'0')+';path=/;max-age=31536000'; }
-function modsApply(l,h){
-  var e1=document.getElementById('tab-leds-link'); if(e1) e1.style.display=l?'':'none';
-  var e2=document.getElementById('tab-heat-link'); if(e2) e2.style.display=h?'':'none';
-}
-(function(){
-  var m=(document.cookie.match(/mods=(\d\d)/)||[])[1];
-  if(m) modsApply(m[0]==='1', m[1]==='1');
-})();
 
 var FMIN=100, FMAX=20000;
 
@@ -243,86 +200,6 @@ function tr(){
 }
 tr();
 
-// ── Easteregg ───────────────────────────────────────────────────────────────
-//
-// Nur fuer das Geraet mit dem BLE-Namen "BLE". Wirft in grossen
-// Abstaenden einen Spruch an eine zufaellige Stelle und blendet ihn wieder aus.
-//
-// Bewusst ohne Interaktion: pointer-events:none, damit nie ein Knopf verdeckt
-// wird, den man gerade druecken will. Und mit grossem Abstand nach oben, damit
-// die Reiterleiste frei bleibt.
-var EGG_LINES = [
-  'BLE meldet sich zum Dienst.',
-  'Akku voll, Kopf leer, Gas.',
-  'Die Griffheizung sagt danke.',
-  'Irgendwo zaehlt ein Zaehler hoch.',
-  'Der Waechter waecht.',
-  'ERPM ist nur eine Zahl.',
-  'Dieses Geraet hat schon Schlimmeres ueberlebt.',
-  'Blackbox leer. Gutes Zeichen.',
-  'Kein Brownout seit Minuten.',
-  'Die LEDs sehen dich.',
-  'Ja, das Log laeuft noch.',
-  'PWM macht genau das, was du gesagt hast.',
-  'Wer braucht schon Bremsen.',
-  'Noch ein Reiter und es passt nicht mehr drauf.',
-  'Der Coredump wartet auf dich.',
-  'Alles im gruenen Bereich. Vermutlich.'
-];
-var eggTimer = null;
-
-// Der Zustand kommt vom Geraet (NVS), nicht aus dem Browser. eggOff ist nur
-// die lokale Kopie, damit eggShow() nicht bei jedem Spruch nachfragen muss;
-// aufgefrischt wird sie mit jedem /api/info.
-var eggOff = false;
-function eggIsOff(){ return eggOff; }
-function eggSetOff(off){
-  eggOff = !!off;
-  fetch('/api/egg?en=' + (off?0:1), {method:'POST'}).catch(function(){});
-  if (off && eggTimer){ clearTimeout(eggTimer); eggTimer = null; }
-  // Laufende Spruchblasen gleich mit wegraeumen, sonst steht die letzte noch
-  // sechs Sekunden da, nachdem man es ausgeschaltet hat.
-  var old = document.querySelectorAll('.egg');
-  for (var i = 0; i < old.length; i++) old[i].parentNode.removeChild(old[i]);
-}
-
-function eggShow(){
-  if (eggIsOff()) return;
-  var d = document.createElement('div');
-  d.className = 'egg';
-  d.textContent = EGG_LINES[Math.floor(Math.random()*EGG_LINES.length)];
-  // SAUER! gehoert an jeden Spruch. Als eigenes Element und nicht per
-  // innerHTML: so kann im Spruchtext nie etwas als Markup gedeutet werden,
-  // egal was dort kuenftig steht.
-  var sa = document.createElement('span');
-  sa.textContent = ' SAUER!';
-  sa.style.cssText = 'color:var(--accent);font-weight:800;letter-spacing:1px';
-  d.appendChild(sa);
-  document.body.appendChild(d);
-  // Erst anhaengen, dann messen: vorher kennt der Browser die Groesse nicht,
-  // und der Spruch landete halb ausserhalb des Fensters.
-  var w = d.offsetWidth, h = d.offsetHeight;
-  var maxX = Math.max(8, window.innerWidth  - w - 8);
-  var maxY = Math.max(60, window.innerHeight - h - 8);
-  d.style.left = (8 + Math.random()*(maxX-8)) + 'px';
-  d.style.top  = (60 + Math.random()*(maxY-60)) + 'px';
-  requestAnimationFrame(function(){ d.classList.add('on'); });
-  setTimeout(function(){
-    d.classList.remove('on');
-    setTimeout(function(){ if(d.parentNode) d.parentNode.removeChild(d); }, 800);
-  }, 6000);
-}
-
-function eggArm(name){
-  if (name !== 'BLE' || eggTimer || eggIsOff()) return;
-  // Zufaelliger Abstand zwischen 40 und 160 Sekunden. Ein fester Takt waere
-  // schnell nur noch Moebel.
-  (function next(){
-    eggTimer = setTimeout(function(){ eggShow(); next(); },
-                          40000 + Math.random()*120000);
-  })();
-  setTimeout(eggShow, 4000);   // einer gleich zur Begruessung
-}
 
 function why(r){
   var m={
@@ -417,7 +294,6 @@ function status(){
     // Reiter des anderen Moduls einblenden, wenn es aktiv ist. Beide Schalter
     // stehen in /api/info, das hier ohnehin geholt wird.
     modsApply(d.leds_enabled===true, true);   // Heizungsreiter ist hier aktiv
-    modsSave (d.leds_enabled===true, d.heat_enabled===true);
     var hw=gid('heatDisabled');
     if(hw) hw.style.display=(d.heat_enabled===false)?'':'none';
     if(d.heat) fill(d.heat);
@@ -468,9 +344,9 @@ function test(on){
 // es weder den Tab noch das Tippen, und wer hier gelandet war, musste erst
 // wieder zurueck. Deshalb steht die Freischaltung auf jeder Seite, die eine
 // Tableiste hat.
-var dbgUnlocked=false;
+var dbgUnlocked=uiHas('api');   // Anfangswert aus /ui-state.js
 function applyDebugState(){
-  var el=gid('tab-api-link'); if(el) el.style.display=dbgUnlocked?'':'none';
+  uiSet('api',dbgUnlocked);
   // Der Testlauf heizt unabhaengig von ERPM und gehoert damit zum Aufbau, nicht
   // zum Alltag. Hinter dieselbe Freischaltung wie der API-Reiter: 8x auf den
   // Titel tippen. Ein laufender Test wird davon NICHT beendet — nur die

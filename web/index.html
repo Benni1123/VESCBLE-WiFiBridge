@@ -5,6 +5,12 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>🛴 VESC BLE/WiFi</title>
   <link rel="stylesheet" href="/style.css">
+  <!-- Reiter-Sichtbarkeit, vom ESP erzeugt. Muss blockierend im <head> stehen,
+       damit die Leiste nie ohne ihre Reiter gezeichnet wird. -->
+  <script src="/ui-state.js"></script>
+  <!-- Gemeinsames JS (Sprache, Thema, Hinweise, Reiter, Easteregg). Blockierend,
+       damit die Definitionen stehen, bevor der Block am Seitenende laeuft. -->
+  <script src="/app.js"></script>
 </head>
 <style>
   .info-note{display:none;margin-top:7px;padding:7px 9px;border-left:2px solid var(--accent);border-radius:4px;background:rgba(77,163,255,.07);color:var(--text2);font-size:11px;line-height:1.45}
@@ -12,11 +18,6 @@
   .info-btn{position:fixed;top:12px;right:100px;padding:4px 10px;background:var(--bg2);border:1px solid var(--border);border-radius:4px;color:var(--text2);font-family:'Ndot47',system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;font-size:12px;cursor:pointer}
   .info-btn:hover{border-color:var(--accent);color:var(--accent)}
   .info-btn.on{border-color:var(--accent);color:var(--accent)}
-  .egg{position:fixed;z-index:9998;pointer-events:none;max-width:260px;padding:9px 13px;
-       border-radius:10px;background:var(--bg2);border:1px solid var(--accent);
-       color:var(--text);font-family:Ndot47,system-ui,-apple-system,sans-serif;font-size:12px;
-       line-height:1.4;box-shadow:0 4px 18px rgba(0,0,0,.35);opacity:0;transition:opacity .6s}
-  .egg.on{opacity:1}
 </style>
 <body>
 <button class="info-btn" onclick="toggleInfo()" id="btn-info" title="Info">i</button>
@@ -29,9 +30,9 @@
     <div class="tab active" onclick="showTab('info')">Info</div>
     <div class="tab" onclick="showTab('config')">Config</div>
     <div class="tab" onclick="showTab('ota')">OTA Flash</div>
-    <div class="tab" id="tab-api-link" style="display:none" onclick="showTab('api')">API</div>
-    <div class="tab" id="tab-leds-link" style="display:none" onclick="location.href='/leds'">LED</div>
-    <div class="tab" id="tab-heat-link" style="display:none" onclick="location.href='/heat'">Heizung</div>
+    <div class="tab" id="tab-api-link" onclick="showTab('api')">API</div>
+    <div class="tab" id="tab-leds-link" onclick="location.href='/leds'">LED</div>
+    <div class="tab" id="tab-heat-link" onclick="location.href='/heat'">Heizung</div>
   </div>
 
   <!-- INFO -->
@@ -406,29 +407,7 @@
 </div>
 
 <script>
-var lang = (document.cookie.match(/lang=([a-z]+)/)||[])[1] || (navigator.language.startsWith('de')?'de':'en');
-function de(){return lang==='de';}
 
-// ── Hinweistexte ein-/ausblenden ────────────────────────────────────────────
-// Der Zustand steht in einem Cookie und nicht in localStorage: so gilt er
-// seitenuebergreifend (Startseite, /leds, /heat) mit demselben Mechanismus,
-// den auch Thema und Sprache benutzen. Standard ist AUS — die Oberflaeche
-// soll aufgeraeumt aussehen, bis man die Erklaerungen anfordert.
-var hintsOn = (document.cookie.match(/hints=(\d)/)||[])[1] === '1';
-function applyHints(){
-  if (document.body) document.body.classList.toggle('show-info', hintsOn);
-  var b = document.getElementById('btn-info');
-  if (b){
-    if (hintsOn) b.classList.add('on'); else b.classList.remove('on');
-    b.title = hintsOn ? (de()?'Hinweise ausblenden':'Hide notes')
-                      : (de()?'Hinweise einblenden':'Show notes');
-  }
-}
-function toggleInfo(){
-  hintsOn = !hintsOn;
-  document.cookie = 'hints=' + (hintsOn?'1':'0') + ';path=/;max-age=31536000';
-  applyHints();
-}
 
 function applyTranslations(){
   var s=function(id,en,d){var el=document.getElementById(id);if(el)el.textContent=de()?d:en;};
@@ -549,12 +528,8 @@ function showTab(name){
   if(name==='api') initDebugTab();
 }
 
-var theme=(document.cookie.match(/theme=([a-z]+)/)||[])[1]||(window.matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light');
-function applyTheme(){document.documentElement.setAttribute('data-theme',theme);var b=document.getElementById('themeBtn');if(b)b.textContent=theme==='dark'?'☀️':'🌙';document.cookie='theme='+theme+';path=/;max-age=31536000';}
-function toggleTheme(){theme=theme==='dark'?'light':'dark';applyTheme();}
 applyTheme();
 
-function toggleLang(){lang=lang==='de'?'en':'de';document.cookie='lang='+lang+';path=/;max-age=31536000';location.reload();}
 document.getElementById('langBtn').textContent=de()?'EN':'DE';
 applyTranslations();
 
@@ -571,11 +546,10 @@ var pendingTab='';
 // ── Debug-Unlock: API-Tab (inkl. UART-Log "alles ab letztem Start") ──────────
 // Freischaltung gilt bis zum naechsten ESP-Neustart (Server haelt den Zustand
 // im RAM). 8x auf die Ueberschrift tippen schaltet frei.
-var apiUnlocked=false;
+var apiUnlocked=uiHas('api');   // Anfangswert aus /ui-state.js
 function revealApiTab(show){
   apiUnlocked=!!show;
-  var link=document.getElementById('tab-api-link');
-  if(link) link.style.display=show?'':'none';
+  uiSet('api',show);
   if(!show){
     var panel=document.getElementById('tab-api');
     if(panel && panel.classList.contains('active')) showTab('info');
@@ -695,24 +669,6 @@ function heatMode(m){
 }
 applyHints();
 
-// Modulreiter ohne Springen: der Zustand der beiden optionalen Reiter (LED,
-// Heizung) kommt aus /api/info und damit erst nach einer Netzwerkantwort. Bis
-// dahin fehlen sie, und wenn sie auftauchen, ruecken die uebrigen Reiter zur
-// Seite — genau das Springen, das beim Klicken nervt.
-//
-// Deshalb wird der zuletzt bekannte Zustand in einem Cookie gemerkt und beim
-// Laden SOFORT angewandt. Die Antwort korrigiert ihn dann nur noch, falls sich
-// etwas geaendert hat. Beim allerersten Aufruf springt es einmal, danach nie
-// wieder.
-function modsSave(l,h){ document.cookie='mods='+(l?'1':'0')+(h?'1':'0')+';path=/;max-age=31536000'; }
-function modsApply(l,h){
-  var e1=document.getElementById('tab-leds-link'); if(e1) e1.style.display=l?'':'none';
-  var e2=document.getElementById('tab-heat-link'); if(e2) e2.style.display=h?'':'none';
-}
-(function(){
-  var m=(document.cookie.match(/mods=(\d\d)/)||[])[1];
-  if(m) modsApply(m[0]==='1', m[1]==='1');
-})();
 
 
 // ── ERPM-Simulation ─────────────────────────────────────────────────────────
@@ -737,86 +693,6 @@ function simRender(v){
   el.style.color = v.active ? '#e0a030' : 'var(--text2)';
 }
 
-// ── Easteregg ───────────────────────────────────────────────────────────────
-//
-// Nur fuer das Geraet mit dem BLE-Namen "BLE". Wirft in grossen
-// Abstaenden einen Spruch an eine zufaellige Stelle und blendet ihn wieder aus.
-//
-// Bewusst ohne Interaktion: pointer-events:none, damit nie ein Knopf verdeckt
-// wird, den man gerade druecken will. Und mit grossem Abstand nach oben, damit
-// die Reiterleiste frei bleibt.
-var EGG_LINES = [
-  'BLE meldet sich zum Dienst.',
-  'Akku voll, Kopf leer, Gas.',
-  'Die Griffheizung sagt danke.',
-  'Irgendwo zaehlt ein Zaehler hoch.',
-  'Der Waechter waecht.',
-  'ERPM ist nur eine Zahl.',
-  'Dieses Geraet hat schon Schlimmeres ueberlebt.',
-  'Blackbox leer. Gutes Zeichen.',
-  'Kein Brownout seit Minuten.',
-  'Die LEDs sehen dich.',
-  'Ja, das Log laeuft noch.',
-  'PWM macht genau das, was du gesagt hast.',
-  'Wer braucht schon Bremsen.',
-  'Noch ein Reiter und es passt nicht mehr drauf.',
-  'Der Coredump wartet auf dich.',
-  'Alles im gruenen Bereich. Vermutlich.'
-];
-var eggTimer = null;
-
-// Der Zustand kommt vom Geraet (NVS), nicht aus dem Browser. eggOff ist nur
-// die lokale Kopie, damit eggShow() nicht bei jedem Spruch nachfragen muss;
-// aufgefrischt wird sie mit jedem /api/info.
-var eggOff = false;
-function eggIsOff(){ return eggOff; }
-function eggSetOff(off){
-  eggOff = !!off;
-  fetch('/api/egg?en=' + (off?0:1), {method:'POST'}).catch(function(){});
-  if (off && eggTimer){ clearTimeout(eggTimer); eggTimer = null; }
-  // Laufende Spruchblasen gleich mit wegraeumen, sonst steht die letzte noch
-  // sechs Sekunden da, nachdem man es ausgeschaltet hat.
-  var old = document.querySelectorAll('.egg');
-  for (var i = 0; i < old.length; i++) old[i].parentNode.removeChild(old[i]);
-}
-
-function eggShow(){
-  if (eggIsOff()) return;
-  var d = document.createElement('div');
-  d.className = 'egg';
-  d.textContent = EGG_LINES[Math.floor(Math.random()*EGG_LINES.length)];
-  // SAUER! gehoert an jeden Spruch. Als eigenes Element und nicht per
-  // innerHTML: so kann im Spruchtext nie etwas als Markup gedeutet werden,
-  // egal was dort kuenftig steht.
-  var sa = document.createElement('span');
-  sa.textContent = ' SAUER!';
-  sa.style.cssText = 'color:var(--accent);font-weight:800;letter-spacing:1px';
-  d.appendChild(sa);
-  document.body.appendChild(d);
-  // Erst anhaengen, dann messen: vorher kennt der Browser die Groesse nicht,
-  // und der Spruch landete halb ausserhalb des Fensters.
-  var w = d.offsetWidth, h = d.offsetHeight;
-  var maxX = Math.max(8, window.innerWidth  - w - 8);
-  var maxY = Math.max(60, window.innerHeight - h - 8);
-  d.style.left = (8 + Math.random()*(maxX-8)) + 'px';
-  d.style.top  = (60 + Math.random()*(maxY-60)) + 'px';
-  requestAnimationFrame(function(){ d.classList.add('on'); });
-  setTimeout(function(){
-    d.classList.remove('on');
-    setTimeout(function(){ if(d.parentNode) d.parentNode.removeChild(d); }, 800);
-  }, 6000);
-}
-
-function eggArm(name){
-  if (name !== 'BLE' || eggTimer || eggIsOff()) return;
-  // Zufaelliger Abstand zwischen 40 und 160 Sekunden. Ein fester Takt waere
-  // schnell nur noch Moebel.
-  (function next(){
-    eggTimer = setTimeout(function(){ eggShow(); next(); },
-                          40000 + Math.random()*120000);
-  })();
-  setTimeout(eggShow, 4000);   // einer gleich zur Begruessung
-}
 
 function loadInfo(){
   fetch('/api/info').then(function(r){return r.json();}).then(function(d){
@@ -915,11 +791,8 @@ function loadInfo(){
   }).catch(function(){document.getElementById('infoContent').innerHTML='<div style="color:#e57373;font-size:13px">'+(de()?'Fehler':'Error')+'</div>';});
 }
 loadInfo();
-// Reiter-Sichtbarkeit direkt beim Laden setzen (nicht erst bei Config-Besuch)
-fetch('/api/config').then(function(r){return r.json();}).then(function(d){
-  modsApply(d.leds_enabled===true, d.heat_enabled===true);
-  modsSave (d.leds_enabled===true, d.heat_enabled===true);
-}).catch(function(){});
+// Kein Nachladen der Reiter-Sichtbarkeit mehr: /ui-state.js hat sie schon
+// gesetzt, bevor die Leiste gezeichnet wurde.
 setInterval(function(){if(document.getElementById('tab-info').classList.contains('active'))loadInfo();},1000);
 setInterval(function(){fetch('/api/ping');},2000);
 
@@ -1068,10 +941,8 @@ function loadConfig(){
     document.getElementById('ble_auto_erpm_on').value = d.ble_auto_erpm_on||200;
     document.getElementById('ble_auto_off_sec').value = d.ble_auto_off_sec||120;
     document.getElementById('leds_enabled').checked = d.leds_enabled===true;
-    document.getElementById('tab-leds-link').style.display = d.leds_enabled?'':'none';
     document.getElementById('heat_enabled').checked = d.heat_enabled===true;
     modsApply(d.leds_enabled===true, d.heat_enabled===true);
-    modsSave (d.leds_enabled===true, d.heat_enabled===true);
     modBlocks();
     loadModHw();
     document.getElementById('blemode_auto').style.display = d.ble_mode==2?'':'none';
@@ -1371,8 +1242,6 @@ function saveConfig(){
           // einen Neustart braucht -> live uebernommen, kein Reboot. LED-Reiter
           // sofort passend ein-/ausblenden.
           modsApply(document.getElementById('leds_enabled').checked,
-                    document.getElementById('heat_enabled').checked);
-          modsSave (document.getElementById('leds_enabled').checked,
                     document.getElementById('heat_enabled').checked);
           showToast(de()?'Gespeichert — kein Neustart nötig':'Saved — no reboot needed',true,4000);
         } else {
