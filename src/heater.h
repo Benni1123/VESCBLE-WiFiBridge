@@ -46,6 +46,15 @@ void heatUpdateState(bool vescConnected, int32_t erpm, float voltage);
 // VESC-Daten" und heizte nie — ausser man hatte die Weboberflaeche offen.
 bool heatNeedsErpm();
 
+// Meldet, ob eine eigene Statusabfrage in den Brueckenverkehr eingestreut
+// werden darf, waehrend VESC Tool oder die App verbunden ist.
+//
+// Getrennt von heatNeedsErpm(), weil es zwei verschiedene Dinge sind: ERPM
+// braucht die Heizung immer im Auto-Modus, das Einstreuen ist nur EIN Weg,
+// daran zu kommen — und der einzige, der fremden Datenverkehr beruehrt.
+// Deshalb abschaltbar (API-Tab), ohne alles andere zu verlieren.
+bool heatInjectWanted();
+
 // Meldet, ob gerade tatsaechlich Leistung an der Heizung liegt. Gedacht fuer
 // Aufrufer, die etwas aufschieben wollen, solange geheizt wird.
 bool heatIsOn();

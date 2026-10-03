@@ -162,6 +162,7 @@ class MyCallbacks : public NimBLECharacteristicCallbacks {
     if (rx.length()>0 && pCharacteristic->getUUID().equals(pCharacteristicVescRx->getUUID())) {
       // Byte-Dump: nur ins UI-Log, NICHT in den Log-Versand (Menge).
       if (cfg_debug && (cfg_debug_filter & 1)) { String h="BLE=>VESC: ";for(size_t i=0;i<rx.length();i++){char x[4];snprintf(x,4,"%02X ",(uint8_t)rx.data()[i]);h+=x;} uartLogAddRaw(h); }
+      lastClientToVescMs = millis();   // Client redet -> nichts einstreuen
       Serial1.write((const uint8_t*)rx.data(), rx.length());
     }
   }

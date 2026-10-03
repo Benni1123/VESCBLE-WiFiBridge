@@ -73,12 +73,32 @@ static const char HEAT_NS[] = "heat";
 static int   hMode    = 0;      // 0=Aus, 1=An (immer), 2=Auto (nur beim Fahren)
 static int   hPin     = -1;     // -1 = kein GPIO gewaehlt
 static int   hLevel   = 60;     // Leistung beim Fahren, 0..100 %
-static int   hIdle    = 0;      // Leistung im Stand, 0..100 %
+// Leistung waehrend des Nachlaufs — also an der Ampel. Danach geht die
+// Heizung ganz aus.
+//
+// Vorher hiess das "Leistung im Stand" und galt DAUERHAFT, der Nachlauf lief
+// mit voller Fahrleistung. Das war zweimal falsch herum: an der Ampel braucht
+// es keine volle Leistung, und ein Dauerwert im Stand heizt den Akku leer,
+// genau das, was die ERPM-Kopplung verhindern soll.
+// Absenkung an der Ampel, in Prozent der Fahrleistung. Bewusst RELATIV und
+// nicht als fester Wert: wer die Fahrleistung aendert, will die Ampel nicht
+// jedes Mal nachstellen. Bei 60 % Fahrt und 40 % Absenkung bleiben 36 %.
+static int   hReduce  = 40;     // 0..100 % weniger als beim Fahren
+
+// Wie lange nach dem Anhalten noch VOLL geheizt wird, bevor abgesenkt wird.
+// Zwei Sekunden Stillstand vor einer Kreuzung sind kein Halt — ohne diese
+// Verzoegerung wuerde die Heizung bei jedem Abbremsen kurz herunterregeln und
+// gleich wieder hoch.
+static int   hStopDly = 10;     // Sekunden
 static int   hFreq    = HEAT_FREQ_DEFAULT;
 static int   hErpmOn  = 200;    // |ERPM| darueber = faehrt
 static int   hLagSec  = 30;     // Nachlauf nach dem Anhalten (Ampel)
 static bool  hInvert  = false;  // Treiberstufe mit invertiertem Eingang
 static float hMinVolt = 0.0f;   // Unterspannungsabschaltung, 0 = aus
+// Darf eine eigene Statusabfrage eingestreut werden, wenn ein Client an der
+// Bruecke haengt? Standard an. Abschaltbar im API-Tab, falls VESC Tool oder
+// die App mit dem unverlangten Antwortpaket nicht zurechtkommen.
+static bool  hInject  = true;
 
 // ── Laufzeitzustand ──────────────────────────────────────────────────────────
 static bool     hAttached   = false;   // PWM laeuft auf hAttachedPin
@@ -138,8 +158,10 @@ static void heatClamp() {
   if (hMode  < 0 || hMode  > 2)   hMode  = 0;
   if (hLevel < 0)                 hLevel = 0;
   if (hLevel > 100)               hLevel = 100;
-  if (hIdle  < 0)                 hIdle  = 0;
-  if (hIdle  > 100)               hIdle  = 100;
+  if (hReduce < 0)                hReduce = 0;
+  if (hReduce > 100)              hReduce = 100;
+  if (hStopDly < 0)               hStopDly = 0;
+  if (hStopDly > 3600)            hStopDly = 3600;
   if (hFreq  < (int)HEAT_FREQ_MIN) hFreq = (int)HEAT_FREQ_MIN;
   if (hFreq  > (int)HEAT_FREQ_MAX) hFreq = (int)HEAT_FREQ_MAX;
   if (hErpmOn < 10)               hErpmOn = 10;
@@ -157,12 +179,17 @@ static void heatLoadNvs() {
   hMode    = p.getInt  ("mode",    0);
   hPin     = p.getInt  ("pin",     -1);
   hLevel   = p.getInt  ("level",   60);
-  hIdle    = p.getInt  ("idle",    0);
+  // Eigene Schluessel. Vorgaenger waren "idle" (Dauerleistung im Stand) und
+  // "hold" (fester Wert an der Ampel) — beide mit anderer Bedeutung, deshalb
+  // nicht uebernommen.
+  hReduce  = p.getInt  ("red",     40);
+  hStopDly = p.getInt  ("sdly",    10);
   hFreq    = p.getInt  ("freq",    HEAT_FREQ_DEFAULT);
   hErpmOn  = p.getInt  ("erpm",    200);
   hLagSec  = p.getInt  ("lag",     30);
   hInvert  = p.getBool ("inv",     false);
   hMinVolt = p.getFloat("minv",    0.0f);
+  hInject  = p.getBool ("inject",  true);
   p.end();
   heatClamp();
 }
@@ -173,12 +200,14 @@ static void heatSaveNvs() {
   p.putInt  ("mode",  hMode);
   p.putInt  ("pin",   hPin);
   p.putInt  ("level", hLevel);
-  p.putInt  ("idle",  hIdle);
+  p.putInt  ("red",   hReduce);
+  p.putInt  ("sdly",  hStopDly);
   p.putInt  ("freq",  hFreq);
   p.putInt  ("erpm",  hErpmOn);
   p.putInt  ("lag",   hLagSec);
   p.putBool ("inv",   hInvert);
   p.putFloat("minv",  hMinVolt);
+  p.putBool ("inject",hInject);
   p.end();
 }
 
@@ -254,6 +283,8 @@ static void heatWritePct(int pct) {
   hOutPct = pct;
 }
 
+static int heatHoldPct();   // weiter unten definiert, hier schon gebraucht
+
 // ── Protokoll ────────────────────────────────────────────────────────────────
 //
 // Was hier steht, ist die Frage, die man sich nach einer Fahrt stellt: ging die
@@ -273,15 +304,20 @@ static void heatLog(const char *what) {
   if (hReason == "riding") {
     line += " - faehrt, ERPM " + String(hLastErpm) +
             " (Schwelle " + String(hErpmOn) + ")";
-  } else if (hReason == "lag") {
+  } else if (hReason == "settle") {
+    line += " - gerade angehalten, noch volle Leistung fuer " +
+            String((unsigned long)((uint32_t)hStopDly - (millis() - hLastMoveMs) / 1000UL)) + "s";
+  } else if (hReason == "hold") {
     uint32_t left = 0;
     uint32_t span = (uint32_t)hLagSec * 1000UL;
     uint32_t gone = millis() - hLastMoveMs;
     if (gone < span) left = (span - gone) / 1000UL;
-    line += " - Nachlauf, noch " + String((unsigned long)left) + "s, ERPM " + String(hLastErpm);
+    line += " - Halt (Ampel), " + String(hReduce) + "% unter " + String(hLevel) +
+            "% = " + String(heatHoldPct()) + "%, noch " +
+            String((unsigned long)left) + "s bis aus, ERPM " + String(hLastErpm);
   } else if (hReason == "idle") {
-    line += " - steht, ERPM " + String(hLastErpm) +
-            " (Schwelle " + String(hErpmOn) + "), Nachlauf abgelaufen";
+    line += " - steht, Nachlauf abgelaufen, ERPM " + String(hLastErpm) +
+            " (Schwelle " + String(hErpmOn) + ")";
   } else if (hReason == "nodata") {
     // Zwei verschiedene Ursachen, die nicht in einen Topf gehoeren: entweder
     // der VESC gilt als getrennt, oder er ist verbunden und der letzte Wert
@@ -304,6 +340,8 @@ static void heatLog(const char *what) {
     line += " - Modus An (immer)";
   } else if (hReason == "off") {
     line += " - Modus Aus";
+  } else if (hReason == "disabled") {
+    line += " - in der Konfiguration abgeschaltet";
   } else if (hReason == "nopin") {
     line += " - GPIO " + String(hPin) + " nicht nutzbar: " + hPinError;
   }
@@ -343,7 +381,22 @@ static void heatLogIfChanged() {
   hLogReason = key;
 }
 
-bool heatNeedsErpm() { return hMode == 2; }
+bool heatNeedsErpm() { return cfg_heat_enabled && hMode == 2; }
+
+bool heatInjectWanted() { return cfg_heat_enabled && hInject && hMode == 2; }
+
+// Leistung an der Ampel: Fahrleistung minus Absenkung, PROZENTUAL. Einmal
+// zentral, damit Anzeige, Protokoll und Ausgabe nie auseinanderlaufen.
+//
+// 50 % Fahrt und 5 % Absenkung ergeben 47 % (50 x 0,95 = 47,5, abgerundet).
+// Der Vorteil gegenueber Prozentpunkten: die Absenkung behaelt ihr Verhaeltnis,
+// wenn die Fahrleistung sich aendert.
+static int heatHoldPct() {
+  int v = (hLevel * (100 - hReduce)) / 100;
+  if (v < 0)   v = 0;
+  if (v > 100) v = 100;
+  return v;
+}
 
 // ── Entscheidung ─────────────────────────────────────────────────────────────
 // Die Entscheidung selbst. Steckt in einer eigenen Funktion, damit das
@@ -373,13 +426,16 @@ void heatUpdateState(bool vescConnected, int32_t erpm, float voltage) {
 }
 
 static void heatDecide(bool vescConnected, int32_t erpm, float voltage, uint32_t now) {
-  if (hMode == 0) {
+  // Ohne den Haken in der Konfiguration verhaelt sich das Modul wie "Aus":
+  // kein GPIO, keine PWM, keine Protokollzeilen. Der gespeicherte Modus bleibt
+  // aber stehen — Haken wieder rein und es laeuft weiter wie vorher.
+  if (!cfg_heat_enabled || hMode == 0) {
     if (hAttached) heatWritePct(0);
     // Auch ohne laufende PWM auf 0 setzen: sonst meldet der Status weiter die
     // letzte Leistung, obwohl am Pin nichts mehr liegt. Eine Anzeige, die
     // "40%" sagt, waehrend der Modus auf Aus steht, ist schlimmer als keine.
     hOutPct = 0;
-    hReason = "off";
+    hReason = cfg_heat_enabled ? "off" : "disabled";
     return;
   }
 
@@ -427,7 +483,7 @@ static void heatDecide(bool vescConnected, int32_t erpm, float voltage, uint32_t
     // Keine verlaesslichen ERPM-Werte -> nicht heizen. Das ist der ganze Zweck
     // der Funktion: der Akku soll nicht leer werden, waehrend das Geraet
     // herumsteht. Ohne Daten ist "steht herum" die wahrscheinlichere Lage.
-    heatWritePct(hIdle);
+    heatWritePct(0);
     hReason = "nodata";
     return;
   }
@@ -441,17 +497,28 @@ static void heatDecide(bool vescConnected, int32_t erpm, float voltage, uint32_t
     return;
   }
 
-  // Nachlauf: an der Ampel bleibt es warm. Ohne den waere die Heizung bei
-  // jedem Halt sofort aus und beim Anfahren wieder an — die Griffe wuerden
-  // genau dann kalt, wenn man steht und die Haende nichts zu tun haben.
-  if (hEverMoved && hLagSec > 0 &&
-      (int32_t)(now - hLastMoveMs) < (int32_t)((uint32_t)hLagSec * 1000UL)) {
+  // ── Kurz angehalten: noch nichts aendern ────────────────────────────────
+  // Zwei Sekunden vor einer Kreuzung sind kein Halt. Ohne diese Stufe wuerde
+  // bei jedem Abbremsen abgesenkt und sofort wieder hochgefahren.
+  uint32_t stopped = (uint32_t)(now - hLastMoveMs);
+  if (hEverMoved && stopped < (uint32_t)hStopDly * 1000UL) {
     heatWritePct(hLevel);
-    hReason = "lag";
+    hReason = "settle";
     return;
   }
 
-  heatWritePct(hIdle);
+  // ── Ampel: abgesenkt ────────────────────────────────────────────────────
+  // Die Griffe bleiben warm, der Verbrauch sinkt. An einer Ampel merkt man den
+  // Unterschied in der Temperatur nicht — in der Restreichweite schon.
+  if (hEverMoved && hLagSec > 0 && stopped < (uint32_t)hLagSec * 1000UL) {
+    heatWritePct(heatHoldPct());
+    hReason = "hold";
+    return;
+  }
+
+  // Nachlauf abgelaufen -> komplett aus. Kein Dauerwert im Stand: der wuerde
+  // den Akku leer heizen, waehrend der Scooter herumsteht.
+  heatWritePct(0);
   hReason = "idle";
 }
 
@@ -475,12 +542,15 @@ String heatStatusJson() {
   j += "\"mode\":"      + String(hMode);
   j += ",\"pin\":"      + String(hPin);
   j += ",\"level\":"    + String(hLevel);
-  j += ",\"idle\":"     + String(hIdle);
+  j += ",\"reduce\":"   + String(hReduce);
+  j += ",\"stop_dly\":" + String(hStopDly);
+  j += ",\"hold_pct\":" + String(heatHoldPct());
   j += ",\"freq\":"     + String(hFreq);
   j += ",\"erpm_on\":"  + String(hErpmOn);
   j += ",\"lag_s\":"    + String(hLagSec);
   j += ",\"invert\":"   + String(hInvert ? "true" : "false");
   j += ",\"min_volt\":" + String(hMinVolt, 1);
+  j += ",\"inject\":"   + String(hInject ? "true" : "false");
   j += ",\"out\":"      + String(hOutPct);
   j += ",\"reason\":\"" + hReason + "\"";
   j += ",\"active\":"   + String(heatIsOn() ? "true" : "false");
@@ -518,12 +588,18 @@ static const char HEAT_HTML[] PROGMEM = R"rawliteral(
     .big{font-size:30px;font-weight:700;line-height:1.1}
     .state{padding:12px;border-radius:8px;background:var(--bg3);border:1px solid var(--border2);display:flex;justify-content:space-between;align-items:center;gap:12px}
     .warn{margin-top:8px;padding:8px 10px;border-left:2px solid #e0a030;border-radius:4px;background:rgba(224,160,48,.08);color:var(--text2);font-size:11px;line-height:1.45}
+    .info-note.warn{border-left-color:#e0a030;background:rgba(224,160,48,.08)}
     .err{margin-top:8px;padding:8px 10px;border-left:2px solid var(--err);border-radius:4px;background:rgba(229,115,115,.10);color:#e57373;font-size:12px}
-    .hint{font-size:11px;color:var(--text3);margin-top:6px;line-height:1.45}
+    .info-note{display:none;margin-top:7px;padding:7px 9px;border-left:2px solid var(--accent);border-radius:4px;background:rgba(77,163,255,.07);color:var(--text2);font-size:11px;line-height:1.45}
+  body.show-info .info-note:not([data-relevant="0"]){display:block}
+    .info-btn{position:fixed;top:12px;right:100px;padding:4px 10px;background:var(--bg2);border:1px solid var(--border);border-radius:4px;color:var(--text2);font-family:'Ndot47',system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;font-size:12px;cursor:pointer}
+    .info-btn:hover{border-color:var(--accent);color:var(--accent)}
+    .info-btn.on{border-color:var(--accent);color:var(--accent)}
     .btnrow{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
   </style>
 </head>
 <body>
+<button class="info-btn" onclick="toggleInfo()" id="btn-info" title="Info">i</button>
 <button class="theme-btn" onclick="toggleTheme()" id="themeBtn">&#9728;&#65039;</button>
 <button class="lang-btn" onclick="toggleLang()" id="langBtn">DE</button>
 <div class="wrap">
@@ -534,6 +610,7 @@ static const char HEAT_HTML[] PROGMEM = R"rawliteral(
     <div class="tab" onclick="location.href='/?tab=config'">Config</div>
     <div class="tab" onclick="location.href='/?tab=ota'">OTA Flash</div>
     <div class="tab" id="tab-api-link" style="display:none" onclick="location.href='/?tab=api'">API</div>
+    <div class="tab" id="tab-leds-link" style="display:none" onclick="location.href='/leds'">LED</div>
     <div class="tab active" onclick="location.href='/heat'" id="tab-heat">Heizung</div>
   </div>
 
@@ -550,6 +627,7 @@ static const char HEAT_HTML[] PROGMEM = R"rawliteral(
       </div>
     </div>
     <div class="err" id="pinErr" style="display:none"></div>
+    <div class="warn" id="heatDisabled" style="display:none"></div>
   </div>
 
   <div class="section">
@@ -560,7 +638,7 @@ static const char HEAT_HTML[] PROGMEM = R"rawliteral(
       <option value="2" id="opt-m2">Auto (nur beim Fahren)</option>
       <option value="1" id="opt-m1">An (immer)</option>
     </select>
-    <div class="hint" id="lbl-mode-hint"></div>
+    <div class="info-note" id="lbl-mode-hint"></div>
 
     <label style="margin-top:12px" id="lbl-level">Leistung beim Fahren</label>
     <div class="rng-row">
@@ -569,36 +647,34 @@ static const char HEAT_HTML[] PROGMEM = R"rawliteral(
     </div>
 
     <div id="autoBox">
-      <label style="margin-top:12px" id="lbl-idle">Leistung im Stand</label>
+      <label style="margin-top:12px" id="lbl-red">Im Halt absenken um</label>
       <div class="rng-row">
-        <input type="range" id="idle" min="0" max="100" step="1" oninput="lv('idle')" onchange="save(0)">
-        <span class="rng-val" id="idle_v">0%</span>
+        <input type="range" id="reduce" min="0" max="100" step="5" oninput="lv('reduce')" onchange="save(0)">
+        <span class="rng-val" id="reduce_v">0%</span>
       </div>
-      <div class="hint" id="lbl-idle-hint"></div>
+      <div style="font-size:12px;color:var(--text2);margin-top:4px" id="holdCalc">&nbsp;</div>
+      <div class="info-note" id="lbl-red-hint"></div>
 
       <div class="grid2" style="margin-top:12px">
-        <div><label id="lbl-erpm">ERPM-Schwelle</label><input type="text" id="erpm_on" maxlength="6" placeholder="200"></div>
-        <div><label id="lbl-lag">Nachlauf (s)</label><input type="text" id="lag_s" maxlength="4" placeholder="30"></div>
+        <div><label id="lbl-sdly">Absenken nach (s)</label><input type="text" id="stop_dly" maxlength="4" placeholder="10"></div>
+        <div><label id="lbl-lag">Ganz aus nach (s)</label><input type="text" id="lag_s" maxlength="4" placeholder="30"></div>
       </div>
-      <div class="hint" id="lbl-erpm-hint"></div>
+      <div style="margin-top:12px"><label id="lbl-erpm">ERPM-Schwelle</label><input type="text" id="erpm_on" maxlength="6" placeholder="200"></div>
+      <div class="info-note" id="lbl-erpm-hint"></div>
     </div>
   </div>
 
   <div class="section">
     <h3 id="lbl-hw-t">Hardware</h3>
-    <div class="grid2">
-      <div><label id="lbl-pin">GPIO</label><input type="text" id="pin" maxlength="3" placeholder="-1"></div>
-      <div><label id="lbl-freq">PWM-Frequenz (Hz)</label><input type="text" id="freq" maxlength="5" placeholder="200"></div>
-    </div>
-    <div class="hint" id="lbl-hw-hint"></div>
+    <div class="info-note" id="lbl-hw-hint"></div>
     <label class="checkbox-row" style="margin-top:12px">
       <input type="checkbox" id="invert">
       <span id="lbl-invert">Ausgang invertiert (Treiber schaltet bei LOW ein)</span>
     </label>
     <label style="margin-top:12px" id="lbl-minv">Unterspannungsabschaltung (V, 0 = aus)</label>
     <input type="text" id="min_volt" maxlength="6" placeholder="0">
-    <div class="hint" id="lbl-minv-hint"></div>
-    <div class="warn" id="lbl-gate"></div>
+    <div class="info-note" id="lbl-minv-hint"></div>
+    <div class="info-note warn" id="lbl-gate"></div>
     <div class="btnrow">
       <button class="btn" onclick="save(1)" id="btn-save">Speichern</button>
     </div>
@@ -607,7 +683,7 @@ static const char HEAT_HTML[] PROGMEM = R"rawliteral(
 
   <div class="section">
     <h3 id="lbl-test-t">Testlauf</h3>
-    <div class="hint" id="lbl-test-hint"></div>
+    <div class="info-note" id="lbl-test-hint"></div>
     <div class="grid2" style="margin-top:10px">
       <div><label id="lbl-test-pct">Leistung (%)</label><input type="text" id="test_pct" maxlength="3" placeholder="100"></div>
       <div><label id="lbl-test-sec">Dauer (s)</label><input type="text" id="test_sec" maxlength="3" placeholder="60"></div>
@@ -632,6 +708,44 @@ applyTheme();
 function toggleLang(){lang=lang==='de'?'en':'de';document.cookie='lang='+lang+';path=/;max-age=31536000';location.reload();}
 gid('langBtn').textContent=de()?'EN':'DE';
 
+// ── Hinweistexte ein-/ausblenden ────────────────────────────────────────────
+// Der Zustand steht in einem Cookie und nicht in localStorage: so gilt er
+// seitenuebergreifend (Startseite, /leds, /heat) mit demselben Mechanismus,
+// den auch Thema und Sprache benutzen. Standard ist AUS — die Oberflaeche
+// soll aufgeraeumt aussehen, bis man die Erklaerungen anfordert.
+var hintsOn = (document.cookie.match(/hints=(\d)/)||[])[1] === '1';
+function applyHints(){
+  if (document.body) document.body.classList.toggle('show-info', hintsOn);
+  var b = gid('btn-info');
+  if (b){
+    if (hintsOn) b.classList.add('on'); else b.classList.remove('on');
+    b.title = hintsOn ? (de()?'Hinweise ausblenden':'Hide notes')
+                      : (de()?'Hinweise einblenden':'Show notes');
+  }
+}
+function toggleInfo(){
+  hintsOn = !hintsOn;
+  document.cookie = 'hints=' + (hintsOn?'1':'0') + ';path=/;max-age=31536000';
+  applyHints();
+}
+applyHints();
+
+// Modulreiter ohne Springen: der Zustand der optionalen Reiter kommt aus
+// /api/info und damit erst nach einer Netzwerkantwort. Bis dahin fehlen sie,
+// und wenn sie auftauchen, ruecken die uebrigen Reiter zur Seite.
+//
+// Deshalb wird der zuletzt bekannte Zustand in einem Cookie gemerkt und beim
+// Laden SOFORT angewandt. Die Antwort korrigiert ihn dann nur noch.
+function modsSave(l,h){ document.cookie='mods='+(l?'1':'0')+(h?'1':'0')+';path=/;max-age=31536000'; }
+function modsApply(l,h){
+  var e1=document.getElementById('tab-leds-link'); if(e1) e1.style.display=l?'':'none';
+  var e2=document.getElementById('tab-heat-link'); if(e2) e2.style.display=h?'':'none';
+}
+(function(){
+  var m=(document.cookie.match(/mods=(\d\d)/)||[])[1];
+  if(m) modsApply(m[0]==='1', m[1]==='1');
+})();
+
 var FMIN=100, FMAX=20000;
 
 function tr(){
@@ -647,16 +761,15 @@ function tr(){
     'Auto heizt nur, wenn der VESC Bewegung meldet. Steht der Scooter, geht die Heizung nach dem Nachlauf aus — damit der Akku nicht leer geheizt wird, waehrend das Geraet herumsteht.',
     'Auto heats only while the VESC reports movement. When the scooter stands still the heater turns off after the follow-up time, so the battery is not drained while the device just sits there.');
   s('lbl-level','Leistung beim Fahren','Power while riding');
-  s('lbl-idle','Leistung im Stand','Power when standing');
-  s('lbl-idle-hint','0% = im Stand komplett aus. Ein kleiner Wert haelt die Griffe lauwarm, kostet aber dauerhaft Strom.',
-                    '0% = completely off when standing. A small value keeps the grips lukewarm but draws current continuously.');
+  s('lbl-red','Im Halt absenken um','Reduce when stopped by');
+  s('lbl-red-hint','Prozent der Fahrleistung, nicht ein fester Wert \u2014 wer die Fahrleistung aendert, muss die Ampel nicht nachstellen. Bei 50% Fahrt und 5% Absenkung bleiben 47%. 0% = im Halt genauso warm wie beim Fahren, 100% = im Halt aus.',
+                   'Percent of the riding power, not a fixed value \u2014 change the riding power and the stop level follows. 50% riding with 5% reduction leaves 47%. 0% = as warm as while riding, 100% = off while stopped.');
+  s('lbl-sdly','Absenken nach (s)','Reduce after (s)');
   s('lbl-erpm','ERPM-Schwelle','ERPM threshold');
-  s('lbl-lag','Nachlauf (s)','Follow-up (s)');
+  s('lbl-lag','Ganz aus nach (s)','Off completely after (s)');
   s('lbl-erpm-hint','Ueber dieser ERPM gilt "faehrt". Der Nachlauf haelt die Heizung nach dem Anhalten noch so lange an — fuer die Ampel.',
                     'Above this ERPM counts as "riding". The follow-up keeps the heater on for that long after stopping — for traffic lights.');
   s('lbl-hw-t','Hardware','Hardware');
-  s('lbl-pin','GPIO','GPIO');
-  s('lbl-freq','PWM-Frequenz (Hz)','PWM frequency (Hz)');
   s('lbl-invert','Ausgang invertiert (Treiber schaltet bei LOW ein)','Output inverted (driver switches on at LOW)');
   s('lbl-minv','Unterspannungsabschaltung (V, 0 = aus)','Low-voltage cutoff (V, 0 = off)');
   s('lbl-minv-hint','Unter dieser Akkuspannung wird nicht geheizt. Greift nur bei frischen VESC-Daten.',
@@ -669,6 +782,9 @@ function tr(){
   s('lbl-test-sec','Dauer (s)','Duration (s)');
   s('btn-test','Test starten','Start test');
   s('btn-stop','Stopp','Stop');
+  var hd=gid('heatDisabled');
+  if(hd) hd.innerHTML=L('<b>In der Konfiguration abgeschaltet.</b> Diese Seite laesst sich einstellen, es wird aber nichts geschaltet. Haken setzen unter Config \u2192 Griffheizung.',
+                        '<b>Disabled in configuration.</b> This page can be set up, but nothing is switched. Tick the box under Config \u2192 Grip heater.');
   var g=gid('lbl-gate');
   if(g) g.innerHTML=L('<b>Pflicht in der Schaltung:</b> 10 kΩ Pulldown vom Gate des MOSFET nach Masse. Beim Neustart, bei einem Absturz und in den ersten Millisekunden nach dem Einschalten ist der GPIO Eingang — ohne Pulldown entscheidet dann Zufall, ob die Heizung laeuft. Der Code kann das nicht absichern, der Widerstand schon.',
                       '<b>Required in your wiring:</b> a 10 kΩ pulldown from the MOSFET gate to ground. During a restart, a crash and the first milliseconds after power-on the GPIO is an input — without the pulldown, chance decides whether the heater runs. Code cannot guarantee this, the resistor can.');
@@ -680,12 +796,14 @@ function why(r){
     off:L('Modus aus','Mode off'),
     on:L('An (immer)','On (always)'),
     riding:L('faehrt','riding'),
-    lag:L('Nachlauf nach dem Anhalten','follow-up after stopping'),
-    idle:L('steht','standing still'),
+    settle:L('gerade angehalten','just stopped'),
+    hold:L('Halt \u2014 abgesenkt','stopped \u2014 reduced'),
+    idle:L('steht \u2014 aus','standing \u2014 off'),
     nodata:L('keine frischen VESC-Daten','no fresh VESC data'),
     undervolt:L('Unterspannung — Akku schonen','low voltage — protecting the pack'),
     test:L('Testlauf','test run'),
-    nopin:L('kein gueltiger GPIO','no valid GPIO')
+    nopin:L('kein gueltiger GPIO','no valid GPIO'),
+    disabled:L('in der Konfiguration abgeschaltet','disabled in configuration')
   };
   return m[r]||r;
 }
@@ -697,7 +815,7 @@ function onMode(){
 }
 
 var dragging=false;
-['level','idle'].forEach(function(id){
+['level','reduce'].forEach(function(id){
   gid(id).addEventListener('pointerdown',function(){dragging=true;});
 });
 // Loslassen am FENSTER abfangen, nicht am Regler: wer mit dem Finger
@@ -711,15 +829,17 @@ function fill(d){
   gid('mode').value=d.mode;
   if(!dragging){
     gid('level').value=d.level; lv('level');
-    gid('idle').value=d.idle;   lv('idle');
+    gid('reduce').value=d.reduce; lv('reduce');
   }
   if(document.activeElement!==gid('erpm_on'))  gid('erpm_on').value=d.erpm_on;
   if(document.activeElement!==gid('lag_s'))    gid('lag_s').value=d.lag_s;
-  if(document.activeElement!==gid('pin'))      gid('pin').value=d.pin;
-  if(document.activeElement!==gid('freq'))     gid('freq').value=d.freq;
+  if(document.activeElement!==gid('stop_dly')) gid('stop_dly').value=d.stop_dly;
   if(document.activeElement!==gid('min_volt')) gid('min_volt').value=d.min_volt;
   gid('invert').checked=d.invert===true;
   gid('autoBox').style.display=(String(d.mode)==='2')?'':'none';
+  var hc=gid('holdCalc');
+  if(hc) hc.textContent=L('Im Halt also '+d.hold_pct+'% ('+d.reduce+'% unter '+d.level+'% Fahrleistung)',
+                          'So '+d.hold_pct+'% while stopped ('+d.reduce+'% below '+d.level+'% riding power)');
   gid('outVal').textContent=d.out+'%';
   gid('outVal').style.color=d.active?'var(--ok)':'var(--text3)';
   var w=why(d.reason);
@@ -734,8 +854,8 @@ function fill(d){
     'Auto heats only while the VESC reports movement. When the scooter stands still the heater turns off after the follow-up time, so the battery is not drained. An ERPM reading counts as fresh for '+Math.round((d.stale_ms||10000)/1000)+' s (3x the poll interval of '+(d.poll_s||5)+' s, at least 10 s); after that the heater stays off to be safe.');
   var hh=gid('lbl-hw-hint');
   if(hh) hh.textContent=L(
-    'GPIO frei waehlbar, -1 = nicht gesetzt. Belegt: '+d.vesc_rx+'/'+d.vesc_tx+' (VESC-UART), 19/20 (USB), 43/44 (Konsole), 26-32 (Flash/PSRAM). Frequenz '+FMIN+'-'+FMAX+' Hz — unter '+FMIN+' Hz reicht die PWM-Aufloesung nicht fuer 1%-Schritte. Pins der LED-Kanaele selbst pruefen, die kennt diese Seite nicht.',
-    'GPIO freely selectable, -1 = unset. Taken: '+d.vesc_rx+'/'+d.vesc_tx+' (VESC UART), 19/20 (USB), 43/44 (console), 26-32 (flash/PSRAM). Frequency '+FMIN+'-'+FMAX+' Hz — below '+FMIN+' Hz the PWM resolution is not enough for 1% steps. Check the LED channel pins yourself, this page does not know them.');
+    'Aktuell: '+(d.pin>=0?('GPIO'+d.pin):'kein GPIO')+', '+d.freq+' Hz. Gesperrt: '+d.vesc_rx+'/'+d.vesc_tx+' (VESC-UART), 19/20 (USB), 43/44 (Konsole), 26-32 (Flash/PSRAM), 0/3/45/46 (Strapping). Frequenz '+FMIN+'-'+FMAX+' Hz — unter '+FMIN+' Hz reicht die PWM-Aufloesung nicht fuer 1%-Schritte.',
+    'Current: '+(d.pin>=0?('GPIO'+d.pin):'no GPIO')+', '+d.freq+' Hz. Blocked: '+d.vesc_rx+'/'+d.vesc_tx+' (VESC UART), 19/20 (USB), 43/44 (console), 26-32 (flash/PSRAM), 0/3/45/46 (strapping). Frequency '+FMIN+'-'+FMAX+' Hz — below '+FMIN+' Hz the PWM resolution is not enough for 1% steps.');
 }
 
 function status(){
@@ -743,6 +863,12 @@ function status(){
     gid('statusBar').textContent=(d.mode==='ap'&&!d.ssid)?'AP: '+d.ip:'WiFi: '+d.ssid+' ('+d.ip+')';
     gid('stErpm').textContent='ERPM '+(d.vesc_connected?d.vesc_erpm:'--');
     gid('stVolt').textContent=(d.vesc_connected?d.vesc_voltage:'--')+' V';
+    // Reiter des anderen Moduls einblenden, wenn es aktiv ist. Beide Schalter
+    // stehen in /api/info, das hier ohnehin geholt wird.
+    modsApply(d.leds_enabled===true, true);   // Heizungsreiter ist hier aktiv
+    modsSave (d.leds_enabled===true, d.heat_enabled===true);
+    var hw=gid('heatDisabled');
+    if(hw) hw.style.display=(d.heat_enabled===false)?'':'none';
     if(d.heat) fill(d.heat);
   }).catch(function(){});
 }
@@ -750,10 +876,9 @@ function status(){
 function body(){
   return JSON.stringify({
     mode:     parseInt(gid('mode').value)||0,
-    pin:      parseInt(gid('pin').value,10),
     level:    parseInt(gid('level').value)||0,
-    idle:     parseInt(gid('idle').value)||0,
-    freq:     parseInt(gid('freq').value)||200,
+    reduce:   parseInt(gid('reduce').value)||0,
+    stop_dly: parseInt(gid('stop_dly').value),
     erpm_on:  parseInt(gid('erpm_on').value)||200,
     lag_s:    parseInt(gid('lag_s').value),
     invert:   gid('invert').checked,
@@ -890,6 +1015,19 @@ static bool heatJsonBool(const String &s, const char *key, bool &out) {
   return false;
 }
 
+// Nach einer Aenderung SOFORT neu entscheiden, statt auf den naechsten Tick zu
+// warten.
+//
+// Der Grund: die Antwort auf das Speichern enthaelt den Status, und der wurde
+// bisher gebaut, BEVOR die neue Einstellung ueberhaupt gewirkt hat. Auf der
+// Seite stand dann weiter die alte Leistung — beim naechsten Verschieben des
+// Reglers erschien der Wert von davor. Es sah aus, als hinke die Anzeige
+// dauerhaft einen Schritt hinterher.
+static void heatRecalcNow() {
+  hLastTick = 0;   // Drosselung ueberspringen
+  heatUpdateState(vescStatus.connected, vescStatus.erpm, vescStatus.voltage);
+}
+
 void heatSetup(WebServer *server) {
   heatLoadNvs();
   hPinError = heatPinProblem(hPin);
@@ -903,7 +1041,7 @@ void heatSetup(WebServer *server) {
   hReason = (hMode == 0) ? "off" : "nodata";
 
   Serial.printf("[HEAT] Modus %d, GPIO %d, %d Hz, %d%%/%d%%, ERPM>%d, Nachlauf %ds%s%s\n",
-                hMode, hPin, hFreq, hLevel, hIdle, hErpmOn, hLagSec,
+                hMode, hPin, hFreq, hLevel, heatHoldPct(), hErpmOn, hLagSec,
                 hInvert ? ", invertiert" : "",
                 hPinError.length() ? " -- GPIO abgelehnt" : "");
   if (hPinError.length()) {
@@ -933,12 +1071,14 @@ void heatSetup(WebServer *server) {
     if (heatJsonInt  (b, "mode",     v))  hMode    = (int)v;
     if (heatJsonInt  (b, "pin",      v))  hPin     = (int)v;
     if (heatJsonInt  (b, "level",    v))  hLevel   = (int)v;
-    if (heatJsonInt  (b, "idle",     v))  hIdle    = (int)v;
+    if (heatJsonInt  (b, "reduce",   v))  hReduce  = (int)v;
+    if (heatJsonInt  (b, "stop_dly", v))  hStopDly = (int)v;
     if (heatJsonInt  (b, "freq",     v))  hFreq    = (int)v;
     if (heatJsonInt  (b, "erpm_on",  v))  hErpmOn  = (int)v;
     if (heatJsonInt  (b, "lag_s",    v))  hLagSec  = (int)v;
     if (heatJsonBool (b, "invert",   bo)) hInvert  = bo;
     if (heatJsonFloat(b, "min_volt", f))  hMinVolt = f;
+    if (heatJsonBool (b, "inject",   bo)) hInject  = bo;
     heatClamp();
 
     // Alles, was den Pegel am Pin aendern kann, zuerst auf "aus" fahren.
@@ -950,9 +1090,9 @@ void heatSetup(WebServer *server) {
     }
     hPinError = heatPinProblem(hPin);
     hTestUntil = 0;              // Einstellungen aendern beendet den Testlauf
-    hLastTick  = 0;              // naechster Tick rechnet sofort neu
 
     heatSaveNvs();
+    heatRecalcNow();             // damit die Antwort schon den neuen Stand traegt
 
     bool ok = (hPinError.length() == 0);
     String j = "{\"ok\":" + String(ok ? "true" : "false");
@@ -969,8 +1109,8 @@ void heatSetup(WebServer *server) {
 
     if (sec <= 0 || pct <= 0) {
       hTestUntil = 0;
-      hLastTick  = 0;
       heatOff();
+      heatRecalcNow();
       server->send(200, "application/json",
                    String("{\"ok\":true,\"heat\":") + heatStatusJson() + "}");
       return;
@@ -995,7 +1135,7 @@ void heatSetup(WebServer *server) {
     hTestPct   = (int)pct;
     hTestUntil = millis() + (uint32_t)sec * 1000UL;
     if (hTestUntil == 0) hTestUntil = 1;    // 0 bedeutet "kein Test"
-    hLastTick  = 0;
+    heatRecalcNow();
     logShipAdd("[HEAT] Testlauf " + String((int)pct) + "% fuer " + String((int)sec) + "s");
     server->send(200, "application/json",
                  String("{\"ok\":true,\"heat\":") + heatStatusJson() + "}");

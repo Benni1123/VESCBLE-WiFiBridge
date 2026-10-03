@@ -1458,17 +1458,14 @@ static const char LEDS_PAGE_HTML[] PROGMEM = R"ledslit(
     <div class="tab" onclick="location.href='/?tab=ota'">OTA Flash</div>
     <div class="tab" id="tab-api-link" style="display:none" onclick="location.href='/?tab=api'">API</div>
     <div class="tab active" onclick="location.href='/leds'">LED</div>
+    <div class="tab" id="tab-heat-link" style="display:none" onclick="location.href='/heat'">Heizung</div>
   </div>
 
-  <div class="section">
-    <div class="sechead" onclick="toggleSec('hw')"><h3 id="lbl-hw">Channels</h3><span class="chev" id="hw_chev">&#9660;</span></div>
-    <div id="hw_body">
-      <div id="hwrows"></div>
-      <div class="hwbtns">
-        <button class="btn" onclick="applyHw()" id="btn-hw">Apply hardware</button>
-      </div>
-      <div class="msg" id="hwmsg"></div>
-    </div>
+  <!-- Kanal-Hardware (GPIO, LED-Anzahl, Farbreihenfolge, Synchronisierung,
+       Police-Seite) steht jetzt im Config-Reiter der Hauptseite. Dort liegen
+       auch die GPIOs der Heizung, und nur dort faellt ein doppelt vergebener
+       Pin ueberhaupt auf. Hier bleiben die Effekte je Kanal. -->
+  <div class="section" id="bigOffSec" style="display:none">
     <button id="bigOff" onclick="ledsBigToggle()" style="display:none;width:100%;padding:22px 12px;margin:14px 0 2px;font-size:30px;font-weight:800;letter-spacing:6px;color:#fff;background:linear-gradient(#d32f2f,#8e0000);border:2px solid #ff5a5a;border-radius:12px;box-shadow:0 4px 16px rgba(0,0,0,.3);cursor:pointer">AUS</button>
   </div>
 
@@ -1488,8 +1485,28 @@ applyTheme();
 function toggleLang(){lang=lang==='de'?'en':'de';document.cookie='lang='+lang+';path=/;max-age=31536000';location.reload();}
 gid('langBtn').textContent=de()?'EN':'DE';
 
+// Modulreiter ohne Springen: der Zustand der beiden optionalen Reiter (LED,
+// Heizung) kommt aus /api/info und damit erst nach einer Netzwerkantwort. Bis
+// dahin fehlen sie, und wenn sie auftauchen, ruecken die uebrigen Reiter zur
+// Seite — genau das Springen, das beim Klicken nervt.
+//
+// Deshalb wird der zuletzt bekannte Zustand in einem Cookie gemerkt und beim
+// Laden SOFORT angewandt. Die Antwort korrigiert ihn dann nur noch, falls sich
+// etwas geaendert hat. Beim allerersten Aufruf springt es einmal, danach nie
+// wieder.
+function modsSave(l,h){ document.cookie='mods='+(l?'1':'0')+(h?'1':'0')+';path=/;max-age=31536000'; }
+function modsApply(l,h){
+  var e1=document.getElementById('tab-leds-link'); if(e1) e1.style.display=l?'':'none';
+  var e2=document.getElementById('tab-heat-link'); if(e2) e2.style.display=h?'':'none';
+}
+(function(){
+  var m=(document.cookie.match(/mods=(\d\d)/)||[])[1];
+  if(m) modsApply(m[0]==='1', m[1]==='1');
+})();
 var infoVisible=false;
-try{infoVisible=localStorage.getItem('ledInfoVisible')==='1';}catch(e){}
+// Cookie statt localStorage: derselbe Zustand gilt jetzt auch auf der
+// Startseite und auf /heat. Standard aus.
+infoVisible=(document.cookie.match(/hints=(\d)/)||[])[1]==='1';
 function applyInfoState(){
   if(document.body) document.body.classList.toggle('show-info',infoVisible);
   var b=gid('btn-info');
@@ -1500,7 +1517,7 @@ function applyInfoState(){
 }
 function toggleInfo(){
   infoVisible=!infoVisible;
-  try{localStorage.setItem('ledInfoVisible',infoVisible?'1':'0');}catch(e){}
+  document.cookie='hints='+(infoVisible?'1':'0')+';path=/;max-age=31536000';
   applyInfoState();
 }
 
@@ -1517,7 +1534,13 @@ function loadStatus(){
     gid('statusBar').textContent=d.mode==='ap'&&!d.ssid?'AP: '+d.ip:'WiFi: '+d.ssid+' ('+d.ip+')';
     if(d.rx_pin!==undefined) vescRx=parseInt(d.rx_pin);
     if(d.tx_pin!==undefined) vescTx=parseInt(d.tx_pin);
-    var bo=gid('bigOff'); if(bo){ bo.style.display=(d.ble_name==='Headcrash366')?'':'none'; updateBigOff(); }
+    var big=(d.ble_name==='Headcrash366');
+    var bo=gid('bigOff'); if(bo){ bo.style.display=big?'':'none'; updateBigOff(); }
+    var bs=gid('bigOffSec'); if(bs) bs.style.display=big?'':'none';
+    // Heizungs-Reiter einblenden, wenn das Modul aktiv ist. Ohne das sah man
+    // von hier aus die Heizung nicht und musste ueber die Startseite zurueck.
+    modsApply(true, d.heat_enabled===true);   // LED-Reiter ist hier aktiv
+    modsSave (d.leds_enabled===true, d.heat_enabled===true);
   }).catch(function(){});
 }
 loadStatus();
@@ -1601,21 +1624,20 @@ function coOpts(sel){
   return o;
 }
 function renderHw(){
+  // Der Hardware-Block ist in den Config-Reiter gewandert. Die Funktion bleibt
+  // bestehen, weil load() sie ruft; ohne Ziel-Element tut sie nichts.
+  if(!gid('hwrows')) return;
   var h='';
-  h+='<div class="cnt-ctrl">';
-  h+='<span style="font-size:13px;color:var(--text2)">'+L('Aktive Kanäle','Active channels')+': '+cfg.count+'</span>';
-  h+='<button class="btn red sm" onclick="chCountDelta(-1)" '+(cfg.count<=1?'disabled':'')+'>&#8722;</button>';
-  h+='<button class="btn green sm" onclick="chCountDelta(1)" '+(cfg.count>=4?'disabled':'')+'>+</button>';
-  h+='</div>';
+  // Kanalzahl, GPIO und LED-Anzahl stehen jetzt im Config-Reiter, zusammen mit
+  // dem GPIO der Heizung. Dort faellt ein doppelt vergebener Pin auf; hier
+  // kannte die Seite den Heizungs-Pin gar nicht.
   h+='<div class="chrow" id="karow" style="display:none"><label>'+L('LED-Refresh (Keepalive)','LED refresh (keepalive)')+'</label><div style="display:flex;gap:8px;align-items:center;margin-top:4px"><input type="text" id="hwka" maxlength="4" value="'+(cfg.keepalive!==undefined?cfg.keepalive:0)+'" style="flex:1"><span style="color:var(--text2);font-size:12px">ms (0='+L('aus','off')+')</span></div><div style="color:var(--text2);font-size:11px;margin-top:4px">'+L('Nur fuer den Notfall. Sendet statische Frames (Aus/Feste Farbe) periodisch neu, um durch Stoerungen verfaelschte Pixel zu heilen. Standard 0 = aus. Der Wert bleibt nach einem Neustart erhalten.','Emergency use only. Periodically re-sends static frames (off/solid) to heal pixels corrupted by interference. Default 0 = off. The value is kept across a reboot.')+'</div></div>';
   for(var i=0;i<cfg.count;i++){
     var c=cfg.channels[i];
     h+='<div class="chrow">';
     h+='<div style="font-size:12px;color:var(--text2);margin-bottom:6px">'+L('Kanal','Channel')+' '+(i+1)+'</div>';
-    h+='<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">';
-    h+='<div><label>GPIO</label><input type="text" id="hwpin'+i+'" maxlength="2" placeholder="'+L('Pin?','Pin?')+'" value="'+(c.pin>=0?c.pin:'')+'"></div>';
-    h+='<div><label>'+L('Anzahl','Count')+'</label><input type="text" id="hwcnt'+i+'" maxlength="3" value="'+c.count+'"></div>';
-    h+='</div>';
+    h+='<div style="font-size:11px;color:var(--text3);margin-bottom:6px">'+
+       (c.pin>=0?('GPIO'+c.pin+' \u00b7 '+c.count+' LEDs'):L('kein GPIO','no GPIO'))+'</div>';
     h+='<div style="margin-top:8px"><label>'+L('Farb-Reihenfolge','Color order')+'</label><select id="hwco'+i+'">'+coOpts(c.colororder)+'</select></div>';
     h+='<label class="checkbox-row" style="margin-top:8px"><input type="checkbox" '+(c.synced?'checked':'')+' onchange="toggleSync('+i+',this.checked)">'+L('Synchronisiert','Synced')+'</label>';
     h+='<div style="margin-top:8px;display:flex;gap:6px;align-items:center;flex-wrap:wrap"><label style="margin:0">'+L('Police-Seite','Police side')+'</label>'+
@@ -2124,41 +2146,27 @@ function onPolRole(i,role){
   renderHw();
 }
 
-function chCountDelta(d){
-  var n=cfg.count+d; if(n<1)n=1; if(n>4)n=4;
-  if(n===cfg.count)return;
-  fetch('/api/led/channels?n='+n,{method:'POST'}).then(function(){ load(); }).catch(function(){});
-}
-
+// GPIO, LED-Anzahl und Kanalzahl stehen jetzt im Config-Reiter. Hier bleiben
+// nur die Dinge, die beim Einstellen der Effekte gebraucht werden:
+// Farbreihenfolge und das Keepalive aus dem Debug-Bereich.
+//
+// Wichtig beim Senden: p<i> und n<i> werden NICHT mitgeschickt. Der Handler
+// uebernimmt nur Felder, die da sind — so bleiben Pin und Anzahl stehen,
+// statt von dieser Seite mit alten Werten ueberschrieben zu werden.
 function applyHw(){
-  var qs=[], usedPins={}, em=gid('hwmsg');
-  function belegt(pin,by){ em.textContent=L('GPIO '+pin+' bereits belegt ('+by+')','GPIO '+pin+' already in use ('+by+')'); em.className='msg err'; }
+  var qs=[];
   for(var i=0;i<cfg.count;i++){
-    var pv=(gv('hwpin'+i)||'').trim();
-    var pin=(pv==='')?-1:parseInt(pv); if(isNaN(pin))pin=-1;
-    var cnt=parseInt(gv('hwcnt'+i))||30;
     var co=parseInt(gv('hwco'+i))||0;
-    if(pin>=0){
-      if(pin===vescRx){ belegt(pin,'VESC RX'); return; }
-      if(pin===vescTx){ belegt(pin,'VESC TX'); return; }
-      if(usedPins[pin]!==undefined){ belegt(pin,L('Kanal ','Channel ')+(usedPins[pin]+1)); return; }
-      usedPins[pin]=i;
-    }
-    qs.push('p'+i+'='+pin+'&n'+i+'='+cnt+'&o'+i+'='+co);
+    qs.push('o'+i+'='+co);
   }
-  var anyPin=false; for(var uk in usedPins){anyPin=true;break;}
   // Keepalive: leeres Feld oder nicht sichtbar (Debug gesperrt) = 0 = aus.
   var kaEl=gid('hwka');
   var ka=kaEl?parseInt(kaEl.value):0;
   if(isNaN(ka)||ka<0)ka=0; if(ka>5000)ka=5000;
   var msg=gid('hwmsg');
   fetch('/api/led/hw?'+qs.join('&')+'&ka='+ka,{method:'POST'}).then(function(r){
-    if(r.ok){
-      msg.textContent=L('Übernommen','Applied');msg.className='msg ok';
-      // Eingerichtet -> Konfiguration zuklappen, das schafft Platz fuer die LEDs.
-      if(anyPin)setSec('hw',false);
-    }
-    else{msg.textContent='Error';msg.className='msg err';}
+    if(r.ok){ msg.textContent=L('Übernommen','Applied');msg.className='msg ok'; }
+    else{ msg.textContent='Error';msg.className='msg err'; }
     setTimeout(function(){msg.className='msg';},2000);
     load();
   }).catch(function(){msg.textContent='Error';msg.className='msg err';});

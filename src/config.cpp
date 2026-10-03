@@ -63,10 +63,12 @@ void loadConfig() {
   cfg_ble_auto_off_sec   = prefs.getInt ("ble_off_sec",      120);
   cfg_ble_full_power     = prefs.getBool("ble_fullpwr",      false);
   cfg_leds_enabled       = prefs.getBool("leds_en",          false);
+  cfg_heat_enabled       = prefs.getBool("heat_en",          false);
   // Log-Versand: bewusst unabhaengig von cfg_debug gespeichert und geladen.
   cfg_logship_enabled    = prefs.getBool  ("lship_en",  false);
   cfg_logship_url        = prefs.getString("lship_url", "");
   cfg_logship_token      = prefs.getString("lship_tok", "");
+  cfg_logship_slots      = prefs.getInt   ("lship_sl",  -1);
   cfg_logship_url.replace("\\/", "/");   // gleiche Escaping-Reparatur wie oben
   int count = prefs.getInt("wifi_count", 0);
   cfg_wifi.clear();
@@ -120,6 +122,12 @@ void loadConfig() {
   if (cfg_ble_auto_off_sec > 3600)  cfg_ble_auto_off_sec = 3600;
   // Ohne Ziel-URL kann nichts gesendet werden -> Haken hat dann keine Wirkung.
   if (cfg_logship_url.isEmpty()) cfg_logship_enabled = false;
+  // Nur die angebotenen Stufen zulassen; alles andere waere geraten.
+  if (cfg_logship_slots != -1 && cfg_logship_slots != 0 &&
+      cfg_logship_slots != 150 && cfg_logship_slots != 500 &&
+      cfg_logship_slots != 1000 && cfg_logship_slots != 2000) {
+    cfg_logship_slots = -1;
+  }
 
   // ── Kein Heimnetz UND AP im Auto-Modus: Aufwecken MUSS funktionieren ──────
   // Ohne STA ist der AP der einzige Zugang. Wer ihn trotzdem auf Auto stellt,
@@ -176,9 +184,11 @@ void saveConfig() {
   prefs.putInt   ("ble_off_sec", cfg_ble_auto_off_sec);
   prefs.putBool  ("ble_fullpwr", cfg_ble_full_power);
   prefs.putBool  ("leds_en",     cfg_leds_enabled);
+  prefs.putBool  ("heat_en",     cfg_heat_enabled);
   prefs.putBool  ("lship_en",    cfg_logship_enabled);
   prefs.putString("lship_url",   cfg_logship_url);
   prefs.putString("lship_tok",   cfg_logship_token);
+  prefs.putInt   ("lship_sl",    cfg_logship_slots);
   prefs.putInt   ("wifi_count",  cfg_wifi.size());
   for (int i = 0; i < (int)cfg_wifi.size(); i++) {
     prefs.putString(("wssid"  +String(i)).c_str(), cfg_wifi[i].ssid);

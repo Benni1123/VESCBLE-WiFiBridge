@@ -1,6 +1,7 @@
 #pragma once
 
 #include <Arduino.h>
+#include <WebServer.h>
 
 // ── Stall-Waechter und Blackbox im Flash (NVS) ───────────────────────────────
 //
@@ -90,4 +91,12 @@ extern const char * volatile blackboxStep;
 void blackboxWrite(const char *reason);
 
 // Zustand fuer den Debug-Tab.
+// Registriert /api/blackbox (GET, Klartext) und /api/blackbox/clear (POST).
+//
+// Der Weg zu den Berichten fuehrte bisher nur ueber den Log-Versand. Ohne
+// Heimnetz — oder mit abgeschaltetem Sendepuffer — war die Diagnose damit
+// unerreichbar, obwohl sie im NVS lag. Ueber diese Route holt man sie direkt
+// vom Geraet, auch nur ueber den AP.
+void blackboxRegisterRoutes(WebServer &srv);
+
 String blackboxStatusJson();

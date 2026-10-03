@@ -187,16 +187,39 @@ void logShipSetup() {
   if (shipBuf) return;                       // idempotent
   if (!shipMutex) shipMutex = xSemaphoreCreateMutex();
 
-  size_t want = (size_t)LOGSHIP_SLOTS_PSRAM * sizeof(LogShipSlot);
+  // ── Puffergroesse ────────────────────────────────────────────────────────
+  // cfg_logship_slots: -1 automatisch, 0 aus, sonst die gewuenschte Zahl.
+  // Ausdrueckliches Aus heisst wirklich aus — kein Puffer, keine Belegung.
+  // Dann entfallen allerdings auch die [PRE-RESET]-Zeilen und die Zustellung
+  // des Blackbox-Berichts, denn beide laufen durch diesen Puffer.
+  if (cfg_logship_slots == 0) {
+    shipSlots = 0;
+    Serial.println("[LOGSHIP] Puffer per Einstellung AUS - keine Zeilen, "
+                   "keine [PRE-RESET]-Wiedergabe, keine Blackbox-Zustellung");
+    rtcRingReset();
+    return;
+  }
+
+  uint16_t wantSlots;
+  if (cfg_logship_slots > 0) {
+    wantSlots = (uint16_t)cfg_logship_slots;
+  } else {
+    wantSlots = (ESP.getPsramSize() > 0) ? LOGSHIP_SLOTS_PSRAM : LOGSHIP_SLOTS_HEAP;
+  }
+
+  size_t want = (size_t)wantSlots * sizeof(LogShipSlot);
   if (ESP.getPsramSize() > 0) {
     shipBuf = (LogShipSlot *)heap_caps_malloc(want, MALLOC_CAP_SPIRAM);
-    if (shipBuf) shipSlots = LOGSHIP_SLOTS_PSRAM;
+    if (shipBuf) shipSlots = wantSlots;
   }
   if (!shipBuf) {
-    // Kein PSRAM (oder Allokation gescheitert) -> kleiner Puffer im internen Heap.
-    want = (size_t)LOGSHIP_SLOTS_HEAP * sizeof(LogShipSlot);
+    // Kein PSRAM (oder Allokation gescheitert) -> kleiner Puffer im internen
+    // Heap. Hier NICHT die gewuenschte Zahl nehmen: 2000 Slots sind rund
+    // 650 KB und wuerden den internen Heap sprengen.
+    if (wantSlots > LOGSHIP_SLOTS_HEAP) wantSlots = LOGSHIP_SLOTS_HEAP;
+    want = (size_t)wantSlots * sizeof(LogShipSlot);
     shipBuf = (LogShipSlot *)malloc(want);
-    if (shipBuf) shipSlots = LOGSHIP_SLOTS_HEAP;
+    if (shipBuf) shipSlots = wantSlots;
   }
   if (!shipBuf) {
     shipSlots = 0;
@@ -214,9 +237,10 @@ void logShipSetup() {
   shipBootId = esp_random();
   if (shipBootId == 0) shipBootId = (uint32_t)millis() + 1;
 
-  Serial.printf("[LOGSHIP] buffer: %u lines, %u bytes (%s)\n",
+  Serial.printf("[LOGSHIP] Puffer: %u Zeilen, %u Byte (%s)%s\n",
                 (unsigned)shipSlots, (unsigned)want,
-                (shipSlots == LOGSHIP_SLOTS_PSRAM) ? "PSRAM" : "internal heap");
+                (ESP.getPsramSize() > 0) ? "PSRAM" : "interner Heap",
+                (cfg_logship_slots > 0) ? " [eingestellt]" : " [automatisch]");
 
   logShipApplyConfig();   // beim Boot geladene Werte uebernehmen
 
@@ -568,6 +592,87 @@ void logShipStartTask() {
   xTaskCreatePinnedToCore(logShipTaskFn, "logship", 16384, nullptr, 1, &shipTaskHandle, 0);
 }
 
+// ── Puffer als Klartext ausliefern ──────────────────────────────────────────
+//
+// Wozu: ohne Heimnetz kann nichts gesendet werden, und ohne Versand war der
+// Inhalt des Puffers bisher unerreichbar — auch der eingespielte
+// Blackbox-Bericht und die [PRE-RESET]-Zeilen, also genau das, was man nach
+// einem Aussetzer braucht. Hierueber holt man alles ueber den AP ab, ganz
+// ohne Server.
+//
+// Blockweise: 2000 Zeilen a 320 Zeichen waeren ueber 600 KB am Stueck im Heap.
+// Pro Block wird die Sperre genommen, kopiert und wieder freigegeben — das
+// Senden selbst darf NICHT unter der Sperre laufen, sonst haengt der
+// Sende-Task auf Kern 0 am Netzwerk-Timeout des Browsers.
+void logShipDumpChunked(WebServer &srv) {
+  srv.sendHeader("Cache-Control", "no-store");
+  srv.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  srv.send(200, "text/plain", "");
+
+  if (!shipBuf || shipSlots == 0) {
+    srv.sendContent("# kein Sendepuffer vorhanden (Groesse 0 oder Allokation "
+                    "gescheitert)\n");
+    srv.sendContent("");
+    return;
+  }
+
+  {
+    shipLock();
+    uint16_t cnt  = shipCount;
+    uint16_t slts = shipSlots;
+    uint32_t drp  = shipDropped;
+    uint32_t bid  = shipBootId;
+    shipUnlock();
+    String head = "# VESC-Bridge Sendepuffer\n";
+    head += "# boot_id=" + String(bid) + " zeilen=" + String(cnt) +
+            " plaetze=" + String(slts) + " verworfen=" + String(drp) + "\n";
+    head += "# Spalten: seq  uptime_s  zeit  text\n";
+    srv.sendContent(head);
+  }
+
+  const uint16_t BLOCK = 25;
+  uint16_t sent = 0;
+  for (;;) {
+    String out;
+    out.reserve(BLOCK * 360);
+
+    shipLock();
+    uint16_t have = shipCount;
+    if (sent >= have) { shipUnlock(); break; }
+    uint16_t n = have - sent;
+    if (n > BLOCK) n = BLOCK;
+    for (uint16_t i = 0; i < n; i++) {
+      uint16_t idx = (uint16_t)((shipTail + sent + i) % shipSlots);
+      const LogShipSlot &sl = shipBuf[idx];
+      char ts[24];
+      if (sl.epoch > 0) {
+        time_t t = (time_t)sl.epoch;
+        struct tm tmv;
+        localtime_r(&t, &tmv);
+        strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &tmv);
+      } else {
+        strcpy(ts, "-");
+      }
+      out += String(sl.seq);
+      out += '\t';
+      out += String(sl.uptimeSec);
+      out += '\t';
+      out += ts;
+      out += '\t';
+      out += sl.text;
+      out += '\n';
+    }
+    shipUnlock();
+
+    srv.sendContent(out);
+    sent = (uint16_t)(sent + n);
+    // Dem Netzwerkstapel Luft lassen: ohne das haengt der Webserver bei
+    // grossen Puffern am Sendefenster und der Hauptloop steht.
+    delay(1);
+  }
+  srv.sendContent("");
+}
+
 String logShipStatusJson() {
   shipLock();
   uint16_t buffered = shipCount;
@@ -594,6 +699,9 @@ String logShipStatusJson() {
   json += ",\"last_ok_uptime\":" + String(shipLastOkUptime);
   json += ",\"wifi\":" + String(WiFi.status() == WL_CONNECTED ? "true" : "false");
   json += ",\"psram\":" + String(slots == LOGSHIP_SLOTS_PSRAM ? "true" : "false");
+  json += ",\"slots_cfg\":" + String(cfg_logship_slots);
+  json += ",\"slot_bytes\":" + String((unsigned)sizeof(LogShipSlot));
+  json += ",\"psram_total\":" + String((unsigned long)ESP.getPsramSize());
   json += "}";
   return json;
 }

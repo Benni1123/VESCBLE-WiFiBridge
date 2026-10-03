@@ -1,6 +1,10 @@
 #pragma once
 
 #include <Arduino.h>
+// WebServer wird fuer logShipDumpChunked() gebraucht. Hier ausdruecklich
+// eingebunden und nicht darauf gebaut, dass globals.h vorher kommt: der Header
+// soll fuer sich stehen.
+#include <WebServer.h>
 
 // ── Log-Versand an einen HTTP-Server (NDJSON) ────────────────────────────────
 // Sammelt Logzeilen in einem grossen Ringpuffer (PSRAM) und schiebt sie, sobald
@@ -45,6 +49,12 @@ void logShipRequestFlush();
 
 // Schreibt eine Testzeile in den Puffer und erzwingt den Versand.
 void logShipSendTestLine();
+
+// Liefert den gesamten Pufferinhalt als Klartext aus (blockweise, damit die
+// 2000 Zeilen nicht am Stueck in den Heap muessen). Gedacht fuer den Fall ohne
+// Heimnetz: dort kann nichts gesendet werden, und ohne diese Ausgabe waere der
+// Inhalt — inklusive Blackbox-Bericht und [PRE-RESET]-Zeilen — unerreichbar.
+void logShipDumpChunked(WebServer &srv);
 
 // Zustand fuer /api/logship/status und den Debug-Tab.
 String logShipStatusJson();

@@ -3,3 +3,9 @@
 2026-10-03 00:12    1.3.6      43a8f6d         558defe9c2a45670   firmware-43a8f6d-558defe9c2a45670.elf.gz
 2026-10-03 01:17    1.3.7      43a8f6d         83c5771fa90fecac   firmware-43a8f6d-83c5771fa90fecac.elf.gz
 2026-10-03 01:22    1.4.1      43a8f6d         c69610437e5f3eda   firmware-43a8f6d-c69610437e5f3eda.elf.gz
+2026-10-03 02:26    1.4.2      43a8f6d         b9394700332e17d9   firmware-43a8f6d-b9394700332e17d9.elf.gz
+2026-10-03 02:57    1.4.3      43a8f6d         303f77f2c99b7c17   firmware-43a8f6d-303f77f2c99b7c17.elf.gz
+2026-10-03 03:09    1.4.4      43a8f6d         4e346108409e2d3e   firmware-43a8f6d-4e346108409e2d3e.elf.gz
+2026-10-03 03:19    1.4.5      43a8f6d         6a7ff4d5ca00ce07   firmware-43a8f6d-6a7ff4d5ca00ce07.elf.gz
+2026-10-03 03:25    1.4.6      43a8f6d         792c3bf6f6af873f   firmware-43a8f6d-792c3bf6f6af873f.elf.gz
+2026-10-03 03:30    1.3.6      43a8f6d         5cac0fb6b9d245e2   firmware-43a8f6d-5cac0fb6b9d245e2.elf.gz

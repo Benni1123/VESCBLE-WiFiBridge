@@ -613,6 +613,108 @@ void blackboxStartTask() {
   xTaskCreatePinnedToCore(blackboxTaskFn, "bbwatch", 8192, nullptr, 3, &bbTaskHandle, 0);
 }
 
+// ── Berichte direkt abholen ─────────────────────────────────────────────────
+//
+// Warum das noetig ist: der Blackbox-Bericht liegt im NVS und die letzten
+// Zeilen im RTC-Speicher — beide also in eigenem, vom Sendepuffer
+// unabhaengigem Speicher. Der WEG zu ihnen fuehrte aber bisher nur ueber den
+// Sendepuffer und damit ueber einen Server. Ohne Heimnetz oder mit
+// abgeschaltetem Puffer war die Diagnose unerreichbar, obwohl sie da war.
+//
+// Genau dieser Fall ist der wichtigste: ein Geraet, das steht und kein
+// Absturzabbild hinterlaesst, weil es nicht abgestuerzt ist. Ein Coredump gibt
+// es nur beim Panic — der Stillstand nach 60 Sekunden endet in einem
+// GEPLANTEN Neustart, und der schreibt keinen Dump.
+//
+// Blockweise ausgeliefert: der Bericht kann 3 KB sein, die RTC-Zeilen weitere
+// 3 KB. Beides gleichzeitig als String waere bei knappem Heap unnoetig.
+void blackboxRegisterRoutes(WebServer &srv) {
+  srv.on("/api/blackbox", HTTP_GET, [&srv]() {
+    srv.sendHeader("Cache-Control", "no-store");
+    srv.setContentLength(CONTENT_LENGTH_UNKNOWN);
+    srv.send(200, "text/plain", "");
+
+    unsigned long up = millis() / 1000UL;
+    srv.sendContent(String("# VESC-Bridge Blackbox\n# uptime=") + String(up) +
+                    "s firmware=" + String(FIRMWARE_VERSION) + "\n");
+
+    // ── Bericht aus dem Flash ─────────────────────────────────────────────
+    srv.sendContent("\n--- Bericht aus dem Flash (NVS, ueberlebt auch "
+                    "Stromtrennung) ---\n");
+    {
+      Preferences p;
+      String stored;
+      int    tries = 0;
+      if (p.begin(BLACKBOX_NS, true)) {
+        stored = p.getString(BLACKBOX_KEY, "");
+        tries  = p.getInt(BLACKBOX_TRY, 0);
+        p.end();
+      }
+      if (stored.length() == 0) {
+        srv.sendContent("(kein Eintrag - entweder gab es keinen Stillstand, "
+                        "oder der Bericht wurde nach der Zustellung geloescht)\n");
+      } else {
+        if (tries > 0) {
+          srv.sendContent("(Zustellversuche bisher: " + String(tries) + ")\n");
+        }
+        // In Haeppchen schicken, statt den ganzen String zu uebergeben: der
+        // Webserver kopiert sonst noch einmal alles.
+        const size_t STEP = 512;
+        for (size_t i = 0; i < stored.length(); i += STEP) {
+          srv.sendContent(stored.substring(i, i + STEP));
+        }
+        if (!stored.endsWith("\n")) srv.sendContent("\n");
+      }
+    }
+
+    // ── Live aus dem RTC-Speicher ─────────────────────────────────────────
+    // Das ist der LAUFENDE Betrieb, nicht der letzte Absturz: der Ring wird
+    // beim Start geleert. Wer gerade zusieht, sieht hier die letzten Zeilen,
+    // ohne auf einen Neustart zu warten.
+    srv.sendContent("\n--- Letzte Zeilen im RTC-Speicher (laufender Betrieb; "
+                    "ueberlebt Reset/Panic/Watchdog, nicht Stromtrennung) ---\n");
+    {
+      const size_t CAP = 3072;
+      char *buf = (char *)malloc(CAP);
+      if (!buf) {
+        srv.sendContent("(zu wenig Speicher)\n");
+      } else {
+        size_t n = bbCopyRtcLines(buf, CAP, LOGSHIP_RTC_SLOTS);
+        if (n == 0) srv.sendContent("(leer)\n");
+        else        srv.sendContent(buf);
+        free(buf);
+      }
+    }
+
+    // ── Zustand des Waechters ─────────────────────────────────────────────
+    srv.sendContent("\n--- Zustand des Waechters ---\n");
+    srv.sendContent(blackboxStatusJson());
+    srv.sendContent("\n");
+    srv.sendContent("");
+  });
+
+  // Loeschen. Gebraucht, wenn der Puffer abgeschaltet ist: dann wird der
+  // Bericht nie zugestellt und damit auch nie von selbst geloescht. Er wird
+  // zwar beim naechsten Stillstand ueberschrieben, aber wer ihn gelesen hat,
+  // soll ihn wegraeumen koennen.
+  srv.on("/api/blackbox/clear", HTTP_POST, [&srv]() {
+    Preferences p;
+    bool ok = false;
+    if (p.begin(BLACKBOX_NS, false)) {
+      p.remove(BLACKBOX_KEY);
+      p.remove(BLACKBOX_TRY);
+      p.end();
+      ok = true;
+    }
+    bbPendingClear = false;
+    bbFed          = false;
+    bbFeedFirstSeq = 0;
+    bbFeedLastSeq  = 0;
+    srv.send(200, "application/json",
+             String("{\"ok\":") + (ok ? "true" : "false") + "}");
+  });
+}
+
 // ── Status ───────────────────────────────────────────────────────────────────
 String blackboxStatusJson() {
   String j = "{";

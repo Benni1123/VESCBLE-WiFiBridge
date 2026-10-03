@@ -112,6 +112,10 @@ int    cfg_ble_auto_off_sec   = 120;   // nach X Sekunden ohne Bewegung & Client
 // (BLE und WiFi teilen sich EIN 2,4-GHz-Radio).
 bool   cfg_ble_full_power     = false;
 bool   cfg_leds_enabled       = false; // WS28XX LED-Steuerung aktiv (zeigt LED-Reiter + /leds)
+// Griffheizung aktiv (zeigt den Heizungs-Reiter + /heat). Genau wie bei den
+// LEDs: ohne Haken ist das Modul still und der Reiter weg. Aendert sich dieser
+// Haken allein, braucht es KEINEN Neustart.
+bool   cfg_heat_enabled       = false;
 
 // ── Log-Versand an einen HTTP-Server ─────────────────────────────────────────
 // Die Einstellung ist nur im freigeschalteten API-Tab sichtbar (8x auf den
@@ -122,6 +126,22 @@ bool   cfg_leds_enabled       = false; // WS28XX LED-Steuerung aktiv (zeigt LED-
 bool   cfg_logship_enabled    = false;
 String cfg_logship_url;                // leer = aus
 String cfg_logship_token;              // optional, wird als "Authorization: Bearer ..." gesendet
+
+// Groesse des Sendepuffers in Zeilen.
+//
+//   -1 = automatisch (mit PSRAM 2000 Zeilen, ohne 150)
+//    0 = AUS: es wird gar kein Puffer angelegt
+//   >0 = feste Zahl Zeilen
+//
+// Zum Schonen des PSRAM einstellbar. 2000 Zeilen belegen rund 650 KB von den
+// 2 MB — dauerhaft, denn der Puffer wird beim Start einmal angelegt und
+// danach nie vergroessert. Wer den Platz anderweitig braucht, dreht hier
+// herunter. Die Groesse greift erst nach einem Neustart: einen laufenden
+// Puffer umzuhaengen waere ein Rennen mit dem Sende-Task.
+//
+// ACHTUNG bei 0: ohne Puffer gibt es auch keine [PRE-RESET]-Zeilen und keine
+// Zustellung des Blackbox-Berichts — beide laufen durch diesen Puffer.
+int    cfg_logship_slots      = -1;
 
 struct WiFiEntry {
   String ssid, pass;
@@ -311,6 +331,13 @@ static String        roamRefSsid;                // SSID zum Zeitpunkt des Scans
 static int           roamRefRssi       = 0;      // RSSI zum Zeitpunkt des Scans
 static uint8_t       roamRefBssid[6]   = {0};    // BSSID zum Zeitpunkt des Scans
 static bool          roamRefBssidValid = false;
+
+// Wann hat ein angeschlossener Client (VESC Tool per BLE oder TCP) zuletzt
+// Bytes zum VESC geschickt? Gebraucht fuer das Einstreuen einer eigenen
+// Statusabfrage: solange der Client selbst redet, wird nichts eingestreut —
+// waehrend eines Firmware-Uploads durch die Bruecke waere ein fremdes Paket
+// im Datenstrom das Letzte, was man will.
+static volatile unsigned long lastClientToVescMs = 0;
 
 const size_t MAX_BUF         = 256;
 const size_t MAX_VESC_BUFFER = 1024;

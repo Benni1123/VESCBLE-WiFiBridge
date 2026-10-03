@@ -55,6 +55,72 @@ static String vescFaultToString(int code) {
   }
 }
 
+// ── CRC16 (CCITT/XMODEM), wie der VESC sie rechnet ──────────────────────────
+// Gebraucht fuer den Mitlese-Parser unten: ohne Pruefsumme koennte eine
+// Fehlsynchronisation im Datenstrom ein Scheinpaket ergeben, und ein
+// erfundener ERPM-Wert wuerde die Griffheizung im Stand einschalten.
+static uint16_t vescCrc16(const uint8_t *d, size_t len) {
+  uint16_t crc = 0;
+  for (size_t i = 0; i < len; i++) {
+    crc ^= (uint16_t)d[i] << 8;
+    for (uint8_t b = 0; b < 8; b++) {
+      crc = (crc & 0x8000) ? (uint16_t)((crc << 1) ^ 0x1021) : (uint16_t)(crc << 1);
+    }
+  }
+  return crc;
+}
+
+static void parseGetValues(const uint8_t *payload, size_t len);
+
+// ── Mitlesen des Brueckenverkehrs, Byte fuer Byte ───────────────────────────
+//
+// Warum nicht einfach den Weiterleitungspuffer pruefen, wie es vorher geschah?
+//
+// Weil der nach JEDEM Durchlauf geleert wird. Der Loop kommt rund 1000-mal pro
+// Sekunde vorbei und nimmt mit, was gerade am UART liegt — bei 115200 Baud
+// sind das ein paar Byte. Eine GET_VALUES-Antwort ist aber rund 80 Byte lang
+// und kommt damit fast immer in mehreren Haeppchen. Die alte Pruefung
+// "faengt mit 0x02 an und endet mit 0x03" traf dann auf KEIN Haeppchen zu, und
+// die Werte wurden verworfen, obwohl sie vollstaendig durchgelaufen sind.
+//
+// Deshalb ein eigener Zusammensetzer mit eigenem Puffer, der ueber
+// Haeppchengrenzen hinweg arbeitet und vom Weiterleiten unberuehrt bleibt.
+// Angenommen wird ein Paket nur mit stimmender Pruefsumme.
+#define VSNIFF_MAX 300
+static uint8_t vsBuf[VSNIFF_MAX];
+static size_t  vsLen  = 0;
+static size_t  vsNeed = 0;      // erwartete Gesamtlaenge, 0 = noch unbekannt
+
+static void vescSniffByte(uint8_t b) {
+  if (vsLen == 0) {
+    // Nur kurze Pakete (ein Laengenbyte). Die GET_VALUES-Antwort ist eines.
+    if (b != 0x02) return;
+    vsBuf[vsLen++] = b;
+    vsNeed = 0;
+    return;
+  }
+  if (vsLen == 1) {
+    size_t plen = b;
+    // Zu kurz fuer GET_VALUES oder zu lang fuer den Puffer -> nicht unser
+    // Paket. Von vorn suchen.
+    if (plen < 38 || plen + 5 > VSNIFF_MAX) { vsLen = 0; return; }
+    vsBuf[vsLen++] = b;
+    vsNeed = plen + 5;          // 0x02 + Laenge + Nutzlast + CRC16 + 0x03
+    return;
+  }
+  vsBuf[vsLen++] = b;
+  if (vsLen < vsNeed) return;
+
+  size_t plen = vsBuf[1];
+  bool   ok   = (vsBuf[vsNeed - 1] == 0x03);
+  if (ok) {
+    uint16_t want = ((uint16_t)vsBuf[2 + plen] << 8) | vsBuf[3 + plen];
+    ok = (vescCrc16(vsBuf + 2, plen) == want);
+  }
+  if (ok) parseGetValues(vsBuf + 2, plen);
+  vsLen = 0;
+}
+
 static void parseGetValues(const uint8_t *payload, size_t len) {
   if (len < 38) return;
   if (payload[0] != 0x04) return;
@@ -85,11 +151,64 @@ bool webUiActive() {
   return (millis() - lastBrowserPing < 5000);
 }
 
+// ── Einstreuen einer Statusabfrage bei anliegendem Client ───────────────────
+// Werte gelten als frisch genug, solange sie juenger sind als das hier; sonst
+// wird eine Abfrage eingestreut.
+#define VESC_INJECT_FRESH_MS    4000UL
+// So lange muss der Client geschwiegen haben.
+#define VESC_INJECT_QUIET_MS    1500UL
+// Mindestabstand zwischen zwei eingestreuten Abfragen.
+#define VESC_INJECT_MIN_GAP_MS  2000UL
+static unsigned long lastVescInject = 0;
+
 void pollVesc() {
   unsigned long now = millis();
 
-  if (wifiClient && wifiClient.connected()) return;
-  if (deviceConnected) return;
+  // ── Haengt ein Client (VESC Tool per TCP oder BLE) an der Bruecke? ───────
+  //
+  // Dann gehoeren die UART-Bytes IHM: der Brueckenpfad weiter unten liest sie
+  // und leitet sie weiter. Eigenes Einsammeln ist hier unmoeglich, ohne dem
+  // Client Bytes wegzunehmen — deshalb kein Wechsel in die Antwort-Phase.
+  //
+  // Die Griffheizung braucht ERPM aber auch dann. Loesung: nur die ANFRAGE
+  // einstreuen und die Antwort vom Brueckenpfad mitlesen lassen (das Sniffing
+  // am Ende von vescLoop ruft parseGetValues auf). Die Antwort geht zusaetzlich
+  // an den Client — ein COMM_GET_VALUES-Paket, das er nicht angefordert hat.
+  // VESC Tool verkraftet das, weil es genau dieses Paket ohnehin dauernd
+  // verarbeitet.
+  //
+  // Zwei Bremsen, damit daraus kein Schaden wird:
+  //
+  //   1. Nur wenn der Client seit mindestens 1,5 s selbst nichts geschickt hat.
+  //      Waehrend eines Firmware-Uploads durch die Bruecke laeuft dauernd
+  //      Verkehr — da wird nichts eingestreut, und das ist richtig: dabei
+  //      faehrt niemand.
+  //   2. Nur wenn die Heizung die Werte wirklich braucht (Auto-Modus) und die
+  //      vorhandenen zu alt sind. Im Normalfall liefert das Sniffing genug,
+  //      weil der Client selbst Werte abfragt.
+  bool clientAttached = (wifiClient && wifiClient.connected()) || deviceConnected;
+  if (clientAttached) {
+    // Eine evtl. offene eigene Antwort-Phase verwerfen: ab jetzt liest die
+    // Bruecke. Ohne das wuerde der Puffer beim Trennen mit altem Inhalt
+    // weiterverwendet.
+    vescPollWaiting = false;
+
+    // Nicht heatNeedsErpm(): das Einstreuen ist im API-Tab einzeln
+    // abschaltbar, ohne den Rest der Heizung zu beruehren.
+    if (!heatInjectWanted()) return;
+
+    unsigned long age = now - vescStatus.lastUpdate;
+    if (vescStatus.lastUpdate != 0 && age < VESC_INJECT_FRESH_MS) return;
+    if (now - lastClientToVescMs < VESC_INJECT_QUIET_MS) return;
+    if (now - lastVescInject    < VESC_INJECT_MIN_GAP_MS) return;
+
+    lastVescInject = now;
+    Serial1.write(VESC_GET_VALUES_PKT, sizeof(VESC_GET_VALUES_PKT));
+    if (cfg_debug && (cfg_debug_filter & 4)) {
+      uartLogAddRaw("POLL=>VESC (eingestreut, Client verbunden): 02 01 04 40 84 03");
+    }
+    return;
+  }
 
   // ── Antwort-Phase: warten wir bereits auf eine VESC-Antwort? ──────────────
   // Non-blocking: jeden loop()-Durchlauf die verfuegbaren UART-Bytes einsammeln,
@@ -204,14 +323,18 @@ void vescLoop() {
       if (len > 0) {
         if (cfg_debug && (cfg_debug_filter & 2)) { String h="WiFi=>VESC: ";for(size_t i=0;i<len;i++){char x[4];snprintf(x,4,"%02X ",buf[i]);h+=x;} uartLogAddRaw(h); }
         dlog("WiFi => VESC: %d bytes\n", len);
+        lastClientToVescMs = millis();   // Client redet -> nichts einstreuen
         Serial1.write(buf, len);
       }
     }
   }
 
   if (Serial1.available()) {
+    bool sniff = (cfg_vesc_poll || heatNeedsErpm());
     while (Serial1.available()) {
-      vescBuffer.push_back(Serial1.read());
+      uint8_t rb = Serial1.read();
+      if (sniff) vescSniffByte(rb);
+      vescBuffer.push_back((char)rb);
       if (vescBuffer.length() > MAX_VESC_BUFFER) {
         Serial.println("WARNING: vescBuffer overflow!");
         vescBuffer.clear();
@@ -239,11 +362,10 @@ void vescLoop() {
           wifiClient.stop();
         }
       }
-      // Parse VESC values from bridge traffic too
-      if (cfg_vesc_poll && vescBuffer.size() > 5 && (uint8_t)vescBuffer[0]==0x02 && (uint8_t)vescBuffer.back()==0x03) {
-        uint8_t plen = (uint8_t)vescBuffer[1];
-        if (vescBuffer.size() >= (size_t)(plen+4)) parseGetValues((const uint8_t*)vescBuffer.data()+2, plen);
-      }
+      // Das Mitlesen passiert jetzt bytweise oben (vescSniffByte): nur so
+      // werden Antworten erkannt, die ueber mehrere Loop-Durchlaeufe
+      // eintreffen. Hier stand vorher eine Pruefung des ganzen
+      // Weiterleitungspuffers, die genau daran gescheitert ist.
       vescBuffer.clear();
     }
   }

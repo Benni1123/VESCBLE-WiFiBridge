@@ -274,7 +274,15 @@ static const char PAGE_HTML[] PROGMEM = R"rawliteral(
   <title>🛴 VESC BLE/WiFi</title>
   <link rel="stylesheet" href="/style.css">
 </head>
+<style>
+  .info-note{display:none;margin-top:7px;padding:7px 9px;border-left:2px solid var(--accent);border-radius:4px;background:rgba(77,163,255,.07);color:var(--text2);font-size:11px;line-height:1.45}
+  body.show-info .info-note:not([data-relevant="0"]){display:block}
+  .info-btn{position:fixed;top:12px;right:100px;padding:4px 10px;background:var(--bg2);border:1px solid var(--border);border-radius:4px;color:var(--text2);font-family:'Ndot47',system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;font-size:12px;cursor:pointer}
+  .info-btn:hover{border-color:var(--accent);color:var(--accent)}
+  .info-btn.on{border-color:var(--accent);color:var(--accent)}
+</style>
 <body>
+<button class="info-btn" onclick="toggleInfo()" id="btn-info" title="Info">i</button>
 <button class="theme-btn" onclick="toggleTheme()" id="themeBtn">☀️</button>
 <button class="lang-btn" onclick="toggleLang()" id="langBtn">DE</button>
 <div class="wrap">
@@ -286,7 +294,7 @@ static const char PAGE_HTML[] PROGMEM = R"rawliteral(
     <div class="tab" onclick="showTab('ota')">OTA Flash</div>
     <div class="tab" id="tab-api-link" style="display:none" onclick="showTab('api')">API</div>
     <div class="tab" id="tab-leds-link" style="display:none" onclick="location.href='/leds'">LED</div>
-    <div class="tab" id="tab-heat-link" onclick="location.href='/heat'">Heizung</div>
+    <div class="tab" id="tab-heat-link" style="display:none" onclick="location.href='/heat'">Heizung</div>
   </div>
 
   <!-- INFO -->
@@ -310,7 +318,7 @@ static const char PAGE_HTML[] PROGMEM = R"rawliteral(
       <div id="blepin_wrap" style="display:none;margin-top:8px">
         <label id="lbl-ble-pin">BLE pairing PIN (6 digits)</label>
         <input type="text" id="ble_pin" maxlength="6" inputmode="numeric" placeholder="123456">
-        <div style="font-size:11px;color:var(--text3);margin-top:6px" id="lbl-ble-pin-hint">
+        <div class="info-note" id="lbl-ble-pin-hint">
           Exactly 6 digits required (leading zeros allowed, e.g. 001234). With PIN enabled, unpaired devices cannot communicate — pairing with PIN is enforced. Already paired devices stay paired. Without the checkbox, pairing is accepted automatically (Just Works).
         </div>
       </div>
@@ -318,7 +326,7 @@ static const char PAGE_HTML[] PROGMEM = R"rawliteral(
         <input type="checkbox" id="ble_full_power">
         <span id="lbl-ble-fullpwr">Disable BLE power saving (full performance)</span>
       </label>
-      <div style="font-size:11px;color:var(--text3);margin-top:6px" id="lbl-ble-fullpwr-hint">
+      <div class="info-note" id="lbl-ble-fullpwr-hint">
         Without the checkbox, advertising slows down after 15s idle to give WiFi more airtime (BLE and WiFi share one radio). With the checkbox, advertising stays permanently at the fast interval (20-40ms) — the device is always instantly discoverable and connects fastest, but WiFi throughput may suffer.
       </div>
     </div>
@@ -336,7 +344,7 @@ static const char PAGE_HTML[] PROGMEM = R"rawliteral(
       <div id="apmode_auto" style="display:none;margin-top:10px">
         <label id="lbl-ap-timeout">Idle timeout (seconds, AP off after no movement and no AP client)</label>
         <input type="text" id="ap_timeout" maxlength="6" placeholder="120">
-        <div style="font-size:11px;color:var(--text3);margin-top:6px" id="lbl-apmode-hint">
+        <div class="info-note" id="lbl-apmode-hint">
           Like BLE Auto: riding above the ERPM threshold keeps the AP awake and brings it back after timeout. A connected AP client pauses the timer.
         </div>
       </div>
@@ -352,7 +360,7 @@ static const char PAGE_HTML[] PROGMEM = R"rawliteral(
       <div id="blemode_auto" style="display:none;margin-top:10px">
         <label id="lbl-blemode-off">Idle timeout (seconds, BLE off after no movement and no client)</label>
         <input type="text" id="ble_auto_off_sec" maxlength="5" placeholder="120">
-        <div style="font-size:11px;color:var(--text3);margin-top:6px" id="lbl-blemode-hint">
+        <div class="info-note" id="lbl-blemode-hint">
           Boot default: BLE on. Movement above threshold resets the idle timer. Active connection (BLE/TCP/Web-UI) pauses the timer.
         </div>
       </div>
@@ -361,7 +369,7 @@ static const char PAGE_HTML[] PROGMEM = R"rawliteral(
       <h3 id="lbl-erpm-title">Movement Detection</h3>
       <label id="lbl-erpm-power">ERPM threshold to wake BLE/WiFi when riding</label>
       <input type="text" id="ble_auto_erpm_on" maxlength="6" placeholder="200">
-      <div style="font-size:11px;color:var(--text3);margin-top:6px" id="lbl-erpm-hint">
+      <div class="info-note" id="lbl-erpm-hint">
         When BLE Auto mode or AP Auto mode is active and has switched off after the idle timeout, riding above this ERPM value switches BLE/AP back on. Higher value = needs faster riding to wake.
       </div>
     </div>
@@ -436,13 +444,47 @@ static const char PAGE_HTML[] PROGMEM = R"rawliteral(
     <div class="section">
       <h3 id="lbl-leds-title">LEDs</h3>
       <label class="checkbox-row" style="margin-top:0">
-        <input type="checkbox" id="leds_enabled">
+        <input type="checkbox" id="leds_enabled" onchange="modBlocks()">
         <span id="lbl-leds-enabled">Enable WS28XX control</span>
       </label>
+      <div id="cfg-leds-hw" style="display:none;margin-top:12px">
+        <div style="display:grid;grid-template-columns:1fr auto auto;gap:8px;align-items:center">
+          <span style="font-size:13px;color:var(--text2)"><span id="lbl-led-chcount">Active channels</span>: <b id="led_chn">1</b></span>
+          <button type="button" class="btn red sm" id="led_chminus" onclick="ledChDelta(-1)">&#8722;</button>
+          <button type="button" class="btn green sm" id="led_chplus" onclick="ledChDelta(1)">+</button>
+        </div>
+        <div id="led_pins" style="margin-top:10px"></div>
+        <div id="led_ka_row" style="display:none;margin-top:10px">
+          <label id="lbl-led-ka">LED refresh (keepalive)</label>
+          <div style="display:flex;gap:8px;align-items:center">
+            <input type="text" id="led_ka" maxlength="4" style="flex:1" placeholder="0">
+            <span style="color:var(--text2);font-size:12px">ms</span>
+          </div>
+          <div class="info-note" id="lbl-led-ka-note"></div>
+        </div>
+        <div class="info-note" id="lbl-led-hw-note"></div>
+      </div>
+    </div>
+    <div class="section">
+      <h3 id="lbl-heat-title">Grip heater</h3>
+      <label class="checkbox-row" style="margin-top:0">
+        <input type="checkbox" id="heat_enabled" onchange="modBlocks()">
+        <span id="lbl-heat-enabled">Enable grip heater</span>
+      </label>
+      <div id="cfg-heat-hw" style="display:none;margin-top:12px">
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
+          <div><label id="lbl-heat-gpio">GPIO</label><input type="text" id="heat_pin" maxlength="3" placeholder="-1"></div>
+          <div><label id="lbl-heat-hz">PWM frequency (Hz)</label><input type="text" id="heat_freq" maxlength="5" placeholder="200"></div>
+        </div>
+        <div class="info-note" id="lbl-heat-hw-note"></div>
+      </div>
+      <div class="info-note" id="lbl-heat-note">
+        Shows the Heater tab and the /heat page. Without the checkbox the module stays silent and drives no GPIO. Settings are kept.
+      </div>
 
     </div>
     <button class="btn" onclick="saveConfig()" id="saveBtn">Save</button>
-    <div id="lbl-save-note" style="margin-top:6px;font-size:11px;color:var(--text3)">Saving restarts the ESP so that all settings take effect.</div>
+    <div class="info-note" id="lbl-save-note">Saving restarts the ESP so that all settings take effect.</div>
     <button class="btn" style="margin-top:8px;background:#e0a030" onclick="restartDevice()" id="restartBtn">Restart</button>
     <button class="btn red" style="margin-top:8px" onclick="factoryReset()" id="factoryBtn">Factory Reset</button>
   </div>
@@ -488,12 +530,16 @@ static const char PAGE_HTML[] PROGMEM = R"rawliteral(
       <div class="ep"><span class="method get">GET</span><a class="path" href="/api/time" target="_blank">/api/time</a><div class="desc">Current clock, sync source and NTP status</div></div>
       <div class="ep"><span class="method get">GET</span><a class="path" href="/api/ping" target="_blank">/api/ping</a><div class="desc">Keepalive — activates VESC polling</div></div>
       <div class="ep"><span class="method get">GET</span><a class="path" href="/api/logship" target="_blank">/api/logship</a><div class="desc">Log upload state: buffered lines, dropped, sent, last HTTP code</div></div>
+      <div class="ep"><span class="method get">GET</span><a class="path" href="/api/blackbox" target="_blank">/api/blackbox</a><div class="desc">Black box report from flash + last lines from RTC memory, as plain text &mdash; the only diagnosis for a stall, which leaves no core dump</div></div>
+      <div class="ep"><span class="method get">GET</span><a class="path" href="/api/coredump" target="_blank">/api/coredump</a><div class="desc">Raw core dump image (download) &mdash; only exists after a panic</div></div>
+      <div class="ep"><span class="method get">GET</span><a class="path" href="/api/logship/dump" target="_blank">/api/logship/dump</a><div class="desc">Buffered log lines as plain text &mdash; works without a server or home network</div></div>
       <div class="ep"><span class="method get">GET</span><a class="path" href="/api/backup" target="_blank">/api/backup</a><div class="desc">Full configuration backup as NDJSON (all NVS namespaces, incl. LED patterns)</div></div>
       <div class="api-h2">POST</div>
       <div class="ep"><span class="method post">POST</span><span class="path">/api/config</span><div class="desc">Save config and restart (JSON body)</div></div>
       <div class="ep"><span class="method post">POST</span><span class="path">/api/uart/clear</span><div class="desc">Clear UART debug log</div></div>
       <div class="ep"><span class="method post">POST</span><span class="path">/api/logship</span><div class="desc">Save log upload settings (enabled, url, token) &mdash; takes effect immediately, no restart</div></div>
       <div class="ep"><span class="method post">POST</span><span class="path">/api/logship/test</span><div class="desc">Queue a test line and force an immediate send</div></div>
+      <div class="ep"><span class="method post">POST</span><span class="path">/api/blackbox/clear</span><div class="desc">Delete the black box report from flash</div></div>
       <div class="ep"><span class="method post">POST</span><span class="path">/api/logship/clear</span><div class="desc">Discard all buffered log lines</div></div>
       <div class="ep"><span class="method post">POST</span><span class="path">/api/restore</span><div class="desc">Restore a backup (multipart/form-data, field: backup) and restart</div></div>
       <div class="ep"><span class="method post">POST</span><span class="path">/api/update/install</span><div class="desc">Download and flash from update_url</div></div>
@@ -503,6 +549,17 @@ static const char PAGE_HTML[] PROGMEM = R"rawliteral(
       <div class="ep"><span class="method post">POST</span><span class="path">/api/factory-reset</span><div class="desc">Clear NVS and restart</div></div>
       <div class="ep"><span class="method post">POST</span><span class="path">/update</span><div class="desc">Manual OTA (multipart/form-data, field: firmware)</div></div>
       <div class="ep"><span class="method post">POST</span><span class="path" style="color:#ffb74d">:8080/update</span><div class="desc">Emergency OTA — always available<br><span style="color:var(--text3)">curl -X POST http://IP:8080/update -F "firmware=@firmware.bin"</span></div></div>
+      <div class="api-h2" style="margin-top:16px">VESC</div>
+      <div class="section" style="padding:12px">
+        <label class="checkbox-row" style="margin-top:0">
+          <input type="checkbox" id="heat_inject" onchange="setHeatInject(this.checked)">
+          <span id="lbl-heat-inject">Grip heater: inject status request while a client is connected</span>
+        </label>
+        <div style="font-size:11px;color:var(--text3);margin-top:6px" id="lbl-heat-inject-note">
+          While VESC Tool or the app is connected, the bridge forwards all UART traffic and cannot read it for itself. With this on, the bridge sends its own COMM_GET_VALUES request so the heater keeps getting ERPM. The reply also reaches the client, which VESC Tool normally handles without trouble. Turn it off if the client misbehaves &mdash; everything else about the heater keeps working. No effect during a firmware upload through the bridge: nothing is injected while the client is talking.
+        </div>
+        <div class="msg" id="heatInjectMsg" style="min-height:14px;margin-top:6px;font-size:11px;color:var(--accent)"></div>
+      </div>
       <div class="api-h2" style="margin-top:16px">Debug</div>
       <div class="section" style="padding:12px">
         <label class="checkbox-row" style="margin-top:0">
@@ -560,10 +617,26 @@ static const char PAGE_HTML[] PROGMEM = R"rawliteral(
           <label id="lbl-lship-token">Token (optional, sent as Authorization: Bearer)</label>
           <input type="text" id="lship_token" placeholder="" autocomplete="off" spellcheck="false">
         </div>
+        <div style="margin-top:12px">
+          <label id="lbl-lship-slots">Buffer size (takes effect after restart)</label>
+          <select id="lship_slots" style="width:100%;padding:8px 10px;background:var(--bg3);border:1px solid var(--border);border-radius:4px;color:var(--text);font-family:inherit;font-size:13px">
+            <option value="-1" id="opt-ls-auto">Automatic</option>
+            <option value="2000">2000</option>
+            <option value="1000">1000</option>
+            <option value="500">500</option>
+            <option value="150">150</option>
+            <option value="0" id="opt-ls-off">Off (no buffer)</option>
+          </select>
+          <div style="font-size:11px;color:var(--text3);margin-top:6px" id="lbl-lship-slots-note">
+            2000 lines occupy about 650 KB of PSRAM, allocated once at boot and never freed. Turn it down to save PSRAM. With "Off" there is no buffer at all &mdash; and with it no [PRE-RESET] replay and no black box delivery, because both run through this buffer.
+          </div>
+        </div>
         <div style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap">
           <button class="btn sm" id="lbl-lship-save" onclick="saveLogship()">Save</button>
           <button class="btn sm" id="lbl-lship-test" onclick="testLogship()">Send test line</button>
           <button class="btn sm" id="lbl-lship-refresh" onclick="loadLogship()">&#x21BB; Refresh</button>
+          <button class="btn sm" id="lbl-lship-dump" onclick="window.open('/api/logship/dump','_blank')">Show buffer</button>
+          <button class="btn sm" id="lbl-bb-show" onclick="window.open('/api/blackbox','_blank')">Show black box</button>
           <button class="btn red sm" id="lbl-lship-clear" onclick="clearLogship()">Clear buffer</button>
         </div>
         <div id="lshipStatus" style="margin-top:12px;background:var(--bg3);border:1px solid var(--border2);border-radius:4px;padding:8px;font-size:11px;color:var(--text2)">-</div>
@@ -575,6 +648,27 @@ static const char PAGE_HTML[] PROGMEM = R"rawliteral(
 <script>
 var lang = (document.cookie.match(/lang=([a-z]+)/)||[])[1] || (navigator.language.startsWith('de')?'de':'en');
 function de(){return lang==='de';}
+
+// ── Hinweistexte ein-/ausblenden ────────────────────────────────────────────
+// Der Zustand steht in einem Cookie und nicht in localStorage: so gilt er
+// seitenuebergreifend (Startseite, /leds, /heat) mit demselben Mechanismus,
+// den auch Thema und Sprache benutzen. Standard ist AUS — die Oberflaeche
+// soll aufgeraeumt aussehen, bis man die Erklaerungen anfordert.
+var hintsOn = (document.cookie.match(/hints=(\d)/)||[])[1] === '1';
+function applyHints(){
+  if (document.body) document.body.classList.toggle('show-info', hintsOn);
+  var b = document.getElementById('btn-info');
+  if (b){
+    if (hintsOn) b.classList.add('on'); else b.classList.remove('on');
+    b.title = hintsOn ? (de()?'Hinweise ausblenden':'Hide notes')
+                      : (de()?'Hinweise einblenden':'Show notes');
+  }
+}
+function toggleInfo(){
+  hintsOn = !hintsOn;
+  document.cookie = 'hints=' + (hintsOn?'1':'0') + ';path=/;max-age=31536000';
+  applyHints();
+}
 
 function applyTranslations(){
   var s=function(id,en,d){var el=document.getElementById(id);if(el)el.textContent=de()?d:en;};
@@ -592,6 +686,24 @@ function applyTranslations(){
   s('lbl-apmode-hint',      'Like BLE Auto: riding above the ERPM threshold keeps the AP awake and brings it back after timeout. A connected AP client pauses the timer.', 'Wie BLE-Auto: Fahren \u00fcber der ERPM-Schwelle h\u00e4lt den AP wach und holt ihn nach dem Timeout zur\u00fcck. Ein verbundener AP-Client pausiert den Timer.');
   s('tab-heat-link',        'Heater',                                       'Heizung');
   s('lbl-dbg-heat',         'Heater',                                       'Heizung');
+  s('lbl-led-chcount',      'Active channels',                              'Aktive Kan\u00e4le');
+  s('lbl-led-hw-note',      'Hardware of the strips. The effects themselves stay on the LED page. An empty GPIO means the channel is unused. Everything here is written when you press Save.', 'Hardware der Strips. Die Effekte selbst bleiben auf der LED-Seite. Leeres GPIO = Kanal unbelegt. Alles hier wird erst mit \u201eSpeichern\u201c uebernommen.');
+  s('lbl-led-ka',           'LED refresh (keepalive)',                      'LED-Refresh (Keepalive)');
+  s('lbl-led-ka-note',      'Emergency use only. Periodically re-sends static frames to heal pixels corrupted by interference. 0 = off.', 'Nur fuer den Notfall. Sendet statische Frames periodisch neu, um durch Stoerungen verfaelschte Pixel zu heilen. 0 = aus.');
+  s('lbl-heat-gpio',        'GPIO',                                         'GPIO');
+  s('lbl-heat-hz',          'PWM frequency (Hz)',                           'PWM-Frequenz (Hz)');
+  s('lbl-heat-hw-note',     'GPIO and PWM frequency of the heater. Power, ERPM threshold, stop behaviour, inversion and low-voltage cutoff stay on the heater page. -1 = no GPIO.', 'GPIO und PWM-Frequenz der Heizung. Leistung, ERPM-Schwelle, Halteverhalten, Invertierung und Unterspannungsabschaltung bleiben auf der Heizungsseite. -1 = kein GPIO.');
+  s('lbl-heat-title',       'Grip heater',                                  'Griffheizung');
+  s('lbl-heat-enabled',     'Enable grip heater',                           'Griffheizung aktivieren');
+  s('lbl-lship-slots',      'Buffer size (takes effect after restart)',      'Puffergroesse (greift nach Neustart)');
+  s('opt-ls-auto',          'Automatic',                                    'Automatisch');
+  s('opt-ls-off',           'Off (no buffer)',                              'Aus (kein Puffer)');
+  s('lbl-lship-slots-note', '2000 lines occupy about 650 KB of PSRAM, allocated once at boot and never freed. Turn it down to save PSRAM. With "Off" there is no buffer at all \u2014 and with it no [PRE-RESET] replay and no black box delivery, because both run through this buffer.', '2000 Zeilen belegen rund 650 KB PSRAM, einmal beim Start angelegt und nie wieder freigegeben. Zum Schonen des PSRAM herunterdrehen. Bei "Aus" gibt es gar keinen Puffer \u2014 und damit auch keine [PRE-RESET]-Wiedergabe und keine Zustellung des Blackbox-Berichts, denn beide laufen durch diesen Puffer.');
+  s('lbl-lship-dump',       'Show buffer',                                  'Puffer anzeigen');
+  s('lbl-bb-show',          'Show black box',                               'Blackbox anzeigen');
+  s('lbl-heat-inject',      'Grip heater: inject status request while a client is connected', 'Griffheizung: Statusabfrage einstreuen, wenn ein Client verbunden ist');
+  s('lbl-heat-inject-note', 'While VESC Tool or the app is connected, the bridge forwards all UART traffic and cannot read it for itself. With this on, the bridge sends its own COMM_GET_VALUES request so the heater keeps getting ERPM. The reply also reaches the client, which VESC Tool normally handles without trouble. Turn it off if the client misbehaves \u2014 everything else about the heater keeps working. No effect during a firmware upload through the bridge: nothing is injected while the client is talking.', 'Solange VESC Tool oder die App verbunden ist, leitet die Bruecke den gesamten UART-Verkehr weiter und kann ihn nicht selbst lesen. Mit Haken schickt die Bruecke eine eigene COMM_GET_VALUES-Abfrage, damit die Heizung weiter ERPM bekommt. Die Antwort geht zusaetzlich an den Client; VESC Tool verkraftet das normalerweise. Haken raus, wenn der Client zickt \u2014 alles andere an der Heizung laeuft weiter. Waehrend eines Firmware-Uploads durch die Bruecke passiert ohnehin nichts: solange der Client redet, wird nicht eingestreut.');
+  s('lbl-heat-note',        'Shows the Heater tab and the /heat page. Without the checkbox the module stays silent and drives no GPIO. Settings are kept.', 'Zeigt den Heizungs-Reiter und die Seite /heat. Ohne Haken ist das Modul still und steuert keinen GPIO. Die Einstellungen bleiben erhalten.');
   s('lbl-erpm-title',       'Movement Detection',                           'Bewegungserkennung');
   s('lbl-erpm-power',       'ERPM threshold to wake BLE/WiFi when riding', 'ERPM-Schwelle zum Aufwecken von BLE/WLAN beim Fahren');
   s('lbl-erpm-hint',        'When BLE Auto mode or AP Auto mode is active and has switched off after the idle timeout, riding above this ERPM value switches BLE/AP back on. Higher value = needs faster riding to wake.', 'Wenn BLE-Auto-Modus oder AP-Auto-Modus aktiv ist und sich nach dem Timeout abgeschaltet hat, schaltet das \u00dcberschreiten dieses ERPM-Werts beim Fahren BLE/WLAN wieder ein. H\u00f6herer Wert = schnelleres Fahren n\u00f6tig zum Aufwecken.');
@@ -798,12 +910,13 @@ function heatWhy(r){
   var m={off:de()?'Modus aus':'mode off',
          on:de()?'An (immer)':'on (always)',
          riding:de()?'f\u00e4hrt':'riding',
-         lag:de()?'Nachlauf':'follow-up',
-         idle:de()?'steht':'standing',
+         hold:de()?'Halt \u2014 reduziert':'stopped \u2014 reduced',
+         idle:de()?'steht \u2014 aus':'standing \u2014 off',
          nodata:de()?'keine frischen VESC-Daten':'no fresh VESC data',
          undervolt:de()?'Unterspannung':'low voltage',
          test:de()?'Testlauf':'test run',
-         nopin:de()?'kein g\u00fcltiger GPIO':'no valid GPIO'};
+         nopin:de()?'kein g\u00fcltiger GPIO':'no valid GPIO',
+         disabled:de()?'in der Konfiguration abgeschaltet':'disabled in configuration'};
   return m[r]||r;
 }
 function heatMode(m){
@@ -811,6 +924,27 @@ function heatMode(m){
   if(m===1) return de()?'An (immer)':'On (always)';
   return de()?'Auto (nur beim Fahren)':'Auto (only while riding)';
 }
+applyHints();
+
+// Modulreiter ohne Springen: der Zustand der beiden optionalen Reiter (LED,
+// Heizung) kommt aus /api/info und damit erst nach einer Netzwerkantwort. Bis
+// dahin fehlen sie, und wenn sie auftauchen, ruecken die uebrigen Reiter zur
+// Seite — genau das Springen, das beim Klicken nervt.
+//
+// Deshalb wird der zuletzt bekannte Zustand in einem Cookie gemerkt und beim
+// Laden SOFORT angewandt. Die Antwort korrigiert ihn dann nur noch, falls sich
+// etwas geaendert hat. Beim allerersten Aufruf springt es einmal, danach nie
+// wieder.
+function modsSave(l,h){ document.cookie='mods='+(l?'1':'0')+(h?'1':'0')+';path=/;max-age=31536000'; }
+function modsApply(l,h){
+  var e1=document.getElementById('tab-leds-link'); if(e1) e1.style.display=l?'':'none';
+  var e2=document.getElementById('tab-heat-link'); if(e2) e2.style.display=h?'':'none';
+}
+(function(){
+  var m=(document.cookie.match(/mods=(\d\d)/)||[])[1];
+  if(m) modsApply(m[0]==='1', m[1]==='1');
+})();
+
 function loadInfo(){
   fetch('/api/info').then(function(r){return r.json();}).then(function(d){
     document.getElementById('statusBar').textContent=d.mode==='ap'&&!d.ssid?'AP: '+d.ip:'WiFi: '+d.ssid+' ('+d.ip+')';
@@ -842,7 +976,7 @@ function loadInfo(){
       // Nur anzeigen, wenn sie ueberhaupt eingerichtet ist (Modus nicht Aus
       // oder ein GPIO gesetzt). Eine Zeile "Heizung: aus", die bei niemandem
       // je etwas anderes sagt, ist nur Rauschen auf der Startseite.
-      (d.heat&&(d.heat.mode!==0||d.heat.pin>=0)?(
+      (d.heat_enabled&&d.heat&&(d.heat.mode!==0||d.heat.pin>=0)?(
         '<div style="margin:10px 0 6px;font-size:11px;color:#666;text-transform:uppercase;letter-spacing:1px">'+(de()?'Griffheizung':'Grip heater')+'</div>'+
         '<div class="info-row"><span>'+(de()?'Leistung':'Power')+'</span><span class="info-val" style="color:'+(d.heat.active?'var(--ok)':'var(--text3)')+'">'+d.heat.out+' %'+(d.heat.active?'':' ('+(de()?'aus':'off')+')')+'</span></div>'+
         '<div class="info-row"><span>'+(de()?'Grund':'Reason')+'</span><span class="info-val">'+esc(heatWhy(d.heat.reason))+(d.heat.reason==='test'&&d.heat.test_left>0?' ('+d.heat.test_left+'s)':'')+'</span></div>'+
@@ -895,9 +1029,10 @@ function loadInfo(){
   }).catch(function(){document.getElementById('infoContent').innerHTML='<div style="color:#e57373;font-size:13px">'+(de()?'Fehler':'Error')+'</div>';});
 }
 loadInfo();
-// LED-Reiter-Sichtbarkeit direkt beim Laden setzen (nicht erst bei Config-Besuch)
+// Reiter-Sichtbarkeit direkt beim Laden setzen (nicht erst bei Config-Besuch)
 fetch('/api/config').then(function(r){return r.json();}).then(function(d){
-  document.getElementById('tab-leds-link').style.display = d.leds_enabled?'':'none';
+  modsApply(d.leds_enabled===true, d.heat_enabled===true);
+  modsSave (d.leds_enabled===true, d.heat_enabled===true);
 }).catch(function(){});
 setInterval(function(){if(document.getElementById('tab-info').classList.contains('active'))loadInfo();},1000);
 setInterval(function(){fetch('/api/ping');},2000);
@@ -1048,6 +1183,11 @@ function loadConfig(){
     document.getElementById('ble_auto_off_sec').value = d.ble_auto_off_sec||120;
     document.getElementById('leds_enabled').checked = d.leds_enabled===true;
     document.getElementById('tab-leds-link').style.display = d.leds_enabled?'':'none';
+    document.getElementById('heat_enabled').checked = d.heat_enabled===true;
+    modsApply(d.leds_enabled===true, d.heat_enabled===true);
+    modsSave (d.leds_enabled===true, d.heat_enabled===true);
+    modBlocks();
+    loadModHw();
     document.getElementById('blemode_auto').style.display = d.ble_mode==2?'':'none';
     updateErpmVisibility();
     document.getElementById('version_url').value = d.version_url||'';
@@ -1055,6 +1195,210 @@ function loadConfig(){
     wifiNetworks=(d.wifi||[]).map(function(n){return{ssid:n.ssid||'',pass:n.pass||'',static:n.static||false,ip:n.ip||'',gateway:n.gateway||'',subnet:n.subnet||'255.255.255.0',dns:n.dns||''};});
     renderWifiList();
   });
+}
+
+
+// ── Hardware der Module im Config-Reiter ────────────────────────────────────
+//
+// Die Werte gehoeren weiterhin den Modulen: LED-Pins liegen im NVS von
+// leds.cpp, der Heizungs-GPIO in dem von heater.cpp. Deshalb werden sie hier
+// NICHT in /api/config mitgeschickt, sondern ueber die jeweils eigenen
+// Schnittstellen gespeichert. Sonst gaebe es den Wert an zwei Stellen, und
+// wer in einem Reiter speichert, waehrend im anderen noch der alte steht,
+// ueberschreibt sich selbst.
+var ledCfgCache = null;
+var heatCfgCache = null;
+var ledChCount  = 1;   // Kanalzahl im Config-Reiter, per +/- veraendert
+var ledPolSel   = [0,0,0,0];   // gewaehlte Police-Seite je Kanal
+
+function ledCoOpts(sel){
+  var names = ['GRB','RGB','BRG','RBG','GBR','BGR'], o = '';
+  for (var k = 0; k < names.length; k++){
+    o += '<option value="'+k+'"'+((k===sel)?' selected':'')+'>'+names[k]+'</option>';
+  }
+  return o;
+}
+
+// Police-Seite: drei Knoepfe wie vorher auf der LED-Seite. Gespeichert wird
+// erst mit der Konfiguration, nicht beim Klick — sonst haette man hier eine
+// Einstellung, die sofort greift, neben vieren, die es nicht tun.
+function ledPolRole(i, role){
+  ledPolSel[i] = role;
+  for (var r = 0; r < 3; r++){
+    var b = document.getElementById('ledpr'+i+'_'+r);
+    if (!b) continue;
+    if (r === role) b.classList.add('green'); else b.classList.remove('green');
+  }
+}
+
+function modBlocks(){
+  var l = document.getElementById('leds_enabled').checked;
+  var h = document.getElementById('heat_enabled').checked;
+  document.getElementById('cfg-leds-hw').style.display = l ? '' : 'none';
+  document.getElementById('cfg-heat-hw').style.display = h ? '' : 'none';
+}
+
+function ledChDelta(d){
+  var n = ledChCount + d;
+  if (n < 1) n = 1;
+  if (n > 4) n = 4;
+  if (n === ledChCount) return;
+  ledChCount = n;
+  renderLedPins();
+}
+
+function renderLedPins(){
+  var n = ledChCount;
+  var box = document.getElementById('led_pins');
+  var lab = document.getElementById('led_chn');
+  if (lab) lab.textContent = n;
+  var bm = document.getElementById('led_chminus'), bp = document.getElementById('led_chplus');
+  if (bm) bm.disabled = (n <= 1);
+  if (bp) bp.disabled = (n >= 4);
+  var old = {};
+  // Bereits eingetippte Werte retten: wer die Kanalzahl aendert, soll nicht
+  // seine Eingaben verlieren.
+  for (var k = 0; k < 4; k++){
+    var pe = document.getElementById('ledpin'+k), ce = document.getElementById('ledcnt'+k);
+    var oe = document.getElementById('ledco'+k),  se = document.getElementById('ledsy'+k);
+    if (pe) old['p'+k] = pe.value;
+    if (ce) old['c'+k] = ce.value;
+    if (oe) old['o'+k] = oe.value;
+    if (se) old['s'+k] = se.checked;
+  }
+  var html = '';
+  for (var i = 0; i < n; i++){
+    var c = (ledCfgCache && ledCfgCache.channels && ledCfgCache.channels[i]) || {pin:-1,count:30};
+    var pv = (old['p'+i] !== undefined) ? old['p'+i] : (c.pin >= 0 ? c.pin : '');
+    var cv = (old['c'+i] !== undefined) ? old['c'+i] : c.count;
+    var co = (old['o'+i] !== undefined) ? parseInt(old['o'+i]) : ((c.colororder !== undefined) ? c.colororder : 0);
+    var sy = (old['s'+i] !== undefined) ? old['s'+i] : (c.synced === true);
+    var pr = ledPolSel[i];
+    html += '<div style="background:var(--bg3);border:1px solid var(--border2);border-radius:6px;padding:10px;margin-top:8px">'
+         +  '<div style="font-size:12px;color:var(--text2);margin-bottom:6px">'+(de()?'Kanal':'Channel')+' '+(i+1)+'</div>'
+         +  '<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">'
+         +  '<div><label>GPIO</label><input type="text" id="ledpin'+i+'" maxlength="3" placeholder="'+(de()?'leer = aus':'empty = off')+'" value="'+pv+'"></div>'
+         +  '<div><label>'+(de()?'LED-Anzahl':'LED count')+'</label><input type="text" id="ledcnt'+i+'" maxlength="4" value="'+cv+'"></div>'
+         +  '</div>'
+         +  '<div style="margin-top:8px"><label>'+(de()?'Farb-Reihenfolge':'Color order')+'</label>'
+         +  '<select id="ledco'+i+'" style="width:100%;padding:8px 10px;background:var(--bg3);border:1px solid var(--border);border-radius:4px;color:var(--text);font-family:Ndot47,system-ui,-apple-system,sans-serif;font-size:13px">'+ledCoOpts(co)+'</select></div>'
+         +  '<label class="checkbox-row" style="margin-top:8px"><input type="checkbox" id="ledsy'+i+'"'+(sy?' checked':'')+'> '
+         +  (de()?'Synchronisiert':'Synced')+'</label>'
+         +  '<div style="margin-top:8px;display:flex;gap:6px;align-items:center;flex-wrap:wrap">'
+         +  '<label style="margin:0">'+(de()?'Police-Seite':'Police side')+'</label>'
+         +  '<button type="button" class="btn sm'+(pr===0?' green':'')+'" id="ledpr'+i+'_0" onclick="ledPolRole('+i+',0)">'+(de()?'Teilen':'Split')+'</button>'
+         +  '<button type="button" class="btn sm'+(pr===1?' green':'')+'" id="ledpr'+i+'_1" onclick="ledPolRole('+i+',1)">L</button>'
+         +  '<button type="button" class="btn sm'+(pr===2?' green':'')+'" id="ledpr'+i+'_2" onclick="ledPolRole('+i+',2)">R</button>'
+         +  '</div>'
+         +  '</div>';
+  }
+  box.innerHTML = html;
+}
+
+function loadModHw(){
+  fetch('/api/led/config',{cache:'no-store'}).then(function(r){return r.json();}).then(function(d){
+    ledCfgCache = d;
+    ledChCount = d.count || 1;
+    for (var i = 0; i < 4; i++){
+      ledPolSel[i] = (d.channels && d.channels[i] && d.channels[i].polrole) || 0;
+    }
+    var kr = document.getElementById('led_ka_row');
+    // Keepalive ist ein Notbehelf gegen gestoerte Pixel, kein Alltagsregler —
+    // wie auf der LED-Seite nur im freigeschalteten Bereich sichtbar.
+    if (kr) kr.style.display = apiUnlocked ? '' : 'none';
+    var ke = document.getElementById('led_ka');
+    if (ke && document.activeElement !== ke) ke.value = (d.keepalive !== undefined) ? d.keepalive : 0;
+    renderLedPins();
+  }).catch(function(){});
+  fetch('/api/heat',{cache:'no-store'}).then(function(r){return r.json();}).then(function(d){
+    heatCfgCache = d;
+    var pe = document.getElementById('heat_pin'), fe = document.getElementById('heat_freq');
+    if (pe && document.activeElement !== pe) pe.value = d.pin;
+    if (fe && document.activeElement !== fe) fe.value = d.freq;
+  }).catch(function(){});
+}
+
+// Alle GPIOs an einer Stelle pruefen. Das geht jetzt erst, wo sie
+// zusammenstehen: vorher kannte die LED-Seite den Heizungs-Pin nicht und
+// umgekehrt — ein doppelt vergebener Pin fiel niemandem auf.
+function modHwConflict(){
+  var used = {}, name;
+  var rx = parseInt(document.getElementById('rx_pin').value);
+  var tx = parseInt(document.getElementById('tx_pin').value);
+  if (!isNaN(rx)) used[rx] = 'VESC RX';
+  if (!isNaN(tx)) used[tx] = 'VESC TX';
+  if (document.getElementById('leds_enabled').checked){
+    var n = ledChCount;
+    for (var i = 0; i < n; i++){
+      var e = document.getElementById('ledpin'+i);
+      if (!e) continue;
+      var v = e.value.trim();
+      if (v === '') continue;
+      var pin = parseInt(v);
+      if (isNaN(pin) || pin < 0) continue;
+      name = (de()?'LED-Kanal ':'LED channel ')+(i+1);
+      if (used[pin] !== undefined) return 'GPIO '+pin+': '+name+' / '+used[pin];
+      used[pin] = name;
+    }
+  }
+  if (document.getElementById('heat_enabled').checked){
+    var hp = parseInt(document.getElementById('heat_pin').value);
+    if (!isNaN(hp) && hp >= 0){
+      name = de()?'Heizung':'Heater';
+      if (used[hp] !== undefined) return 'GPIO '+hp+': '+name+' / '+used[hp];
+      used[hp] = name;
+    }
+  }
+  return '';
+}
+
+// Speichert die Modul-Hardware ueber die eigenen Schnittstellen. Liefert ein
+// Promise, das der Aufrufer ABWARTEN muss: direkt danach startet der ESP wegen
+// /api/config neu, und eine noch laufende Anfrage waere verloren.
+function saveModHw(){
+  var jobs = [];
+  if (document.getElementById('leds_enabled').checked){
+    var n = ledChCount;
+    // Erst die Kanalzahl: /api/led/hw schreibt nur so viele Kanaele, wie es
+    // gerade gibt.
+    jobs.push(fetch('/api/led/channels?n='+n,{method:'POST'}).then(function(){
+      var qs = [];
+      for (var i = 0; i < n; i++){
+        var pv = (document.getElementById('ledpin'+i).value||'').trim();
+        var pin = (pv === '') ? -1 : parseInt(pv);
+        if (isNaN(pin)) pin = -1;
+        var cnt = parseInt(document.getElementById('ledcnt'+i).value) || 30;
+        var co = parseInt(document.getElementById('ledco'+i).value) || 0;
+        qs.push('p'+i+'='+pin+'&n'+i+'='+cnt+'&o'+i+'='+co);
+      }
+      var ke = document.getElementById('led_ka');
+      var ka = ke ? parseInt(ke.value) : NaN;
+      if (isNaN(ka) || ka < 0) ka = 0;
+      if (ka > 5000) ka = 5000;
+      // Keepalive nur mitschicken, wenn das Feld sichtbar war. Sonst wuerde
+      // ein eingestellter Wert bei jedem Speichern auf 0 fallen, nur weil der
+      // API-Bereich gesperrt ist.
+      var url = '/api/led/hw?'+qs.join('&') + (document.getElementById('led_ka_row').style.display !== 'none' ? '&ka='+ka : '');
+      return fetch(url,{method:'POST'}).then(function(){
+        var more = [];
+        for (var j = 0; j < n; j++){
+          var on = document.getElementById('ledsy'+j).checked ? 1 : 0;
+          more.push(fetch('/api/led/sync?ch='+j+'&on='+on,{method:'POST'}));
+          more.push(fetch('/api/led/polrole?ch='+j+'&role='+ledPolSel[j],{method:'POST'}));
+        }
+        return Promise.all(more);
+      });
+    }));
+  }
+  if (document.getElementById('heat_enabled').checked){
+    var hp = parseInt(document.getElementById('heat_pin').value);
+    var hf = parseInt(document.getElementById('heat_freq').value);
+    if (isNaN(hp)) hp = -1;
+    if (isNaN(hf)) hf = 200;
+    jobs.push(fetch('/api/heat',{method:'POST',headers:{'Content-Type':'application/json'},
+                                 body:JSON.stringify({pin:hp, freq:hf})}));
+  }
+  return Promise.all(jobs).catch(function(){});
 }
 
 function showToast(msg, ok, duration){
@@ -1084,6 +1428,15 @@ function saveConfig(){
     alert(de()?'BLE-PIN muss genau 6 Ziffern haben. F\u00fchrende Nullen sind erlaubt, z.B. 001234.':'BLE PIN must be exactly 6 digits. Leading zeros are allowed, e.g. 001234.');
     return;
   }
+  // GPIO-Kollisionen abfangen, BEVOR irgendetwas gespeichert wird. Zwei
+  // Module auf demselben Pin heisst nicht "Fehler", sondern "einer von beiden
+  // funktioniert still nicht" — und das sucht man lange.
+  var conflict = modHwConflict();
+  if (conflict){
+    showToast((de()?'GPIO doppelt vergeben — ':'GPIO used twice — ')+conflict, false, 6000);
+    return;
+  }
+
   var wifi=wifiNetworks.filter(function(n){return n.ssid.trim().length>0;});
   var bodyObj={
     ble_name:    document.getElementById('ble_name').value,
@@ -1110,6 +1463,7 @@ function saveConfig(){
     ble_auto_erpm_on:  parseInt(document.getElementById('ble_auto_erpm_on').value)||200,
     ble_auto_off_sec:  parseInt(document.getElementById('ble_auto_off_sec').value)||120,
     leds_enabled:      document.getElementById('leds_enabled').checked,
+    heat_enabled:      document.getElementById('heat_enabled').checked,
     version_url: document.getElementById('version_url').value,
     update_url:  document.getElementById('update_url').value,
     wifi: wifi
@@ -1118,6 +1472,10 @@ function saveConfig(){
   // Kommentar oben). Dadurch greift jede Einstellung zuverlaessig — inklusive
   // neu hinzugefuegter WLAN-Netze, die sich sonst erst viel spaeter (oder gar
   // nicht) automatisch verbunden haben.
+  // Erst die Modul-Hardware (eigene Schnittstellen, kein Neustart), DANN die
+  // Konfiguration. Umgekehrt waere der ESP schon beim Neustarten, waehrend die
+  // Pins noch unterwegs sind.
+  saveModHw().then(function(){
   fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(bodyObj)})
     .then(function(r){
       if(!r.ok){ showToast(de()?'Fehler beim Speichern':'Error saving',false,4000); return; }
@@ -1126,7 +1484,10 @@ function saveConfig(){
           // Es hat sich (ausser evtl. der WS28XX-Steuerung) nichts geaendert, das
           // einen Neustart braucht -> live uebernommen, kein Reboot. LED-Reiter
           // sofort passend ein-/ausblenden.
-          document.getElementById('tab-leds-link').style.display = document.getElementById('leds_enabled').checked ? '' : 'none';
+          modsApply(document.getElementById('leds_enabled').checked,
+                    document.getElementById('heat_enabled').checked);
+          modsSave (document.getElementById('leds_enabled').checked,
+                    document.getElementById('heat_enabled').checked);
           showToast(de()?'Gespeichert — kein Neustart nötig':'Saved — no reboot needed',true,4000);
         } else {
           showToast(de()?'Gespeichert — ESP startet neu...':'Saved — ESP restarting...',true,8000);
@@ -1134,6 +1495,28 @@ function saveConfig(){
         }
       });
     }).catch(function(){showToast('Connection error',false,4000);});
+  });
+}
+
+// Griffheizung: Einstreuen der Statusabfrage ein-/ausschalten. Laeuft ueber
+// /api/heat, nicht ueber /api/config — dort wuerde jedes Speichern einen
+// Neustart ausloesen, und das waere fuer einen Haken absurd.
+function setHeatInject(on){
+  fetch('/api/heat',{method:'POST',headers:{'Content-Type':'application/json'},
+                     body:JSON.stringify({inject:!!on})})
+    .then(function(r){return r.json();}).then(function(d){
+      var m=document.getElementById('heatInjectMsg');
+      if(d&&d.heat){ document.getElementById('heat_inject').checked=d.heat.inject===true; }
+      if(m){ m.textContent=de()?'Gespeichert':'Saved'; setTimeout(function(){m.textContent='';},2000); }
+    }).catch(function(){
+      var m=document.getElementById('heatInjectMsg');
+      if(m) m.textContent=de()?'Keine Verbindung':'No connection';
+    });
+}
+function loadHeatInject(){
+  fetch('/api/heat',{cache:'no-store'}).then(function(r){return r.json();}).then(function(d){
+    if(d) document.getElementById('heat_inject').checked=d.inject===true;
+  }).catch(function(){});
 }
 
 // Debug
@@ -1236,6 +1619,15 @@ function renderLogship(d){
   rows.push((de()?'Verworfen (Puffer voll)':'Dropped (buffer full)')+': '+d.dropped);
   rows.push((de()?'Letzter HTTP-Code':'Last HTTP code')+': '+(d.last_code||'-'));
   rows.push((de()?'Letzte erfolgreiche Uebertragung':'Last successful send')+': '+lshipFmtAge(d.last_ok_uptime));
+  if(d.slot_bytes){
+    var kb=Math.round(d.slots*d.slot_bytes/1024);
+    var pt=d.psram_total?Math.round(d.psram_total/1024):0;
+    rows.push((de()?'Belegung':'Footprint')+': '+kb+' KB'+
+              (pt?' '+(de()?'von':'of')+' '+pt+' KB PSRAM':'')+
+              ' · '+(de()?'Einstellung':'Setting')+': '+
+              (d.slots_cfg===-1?(de()?'automatisch':'automatic'):
+               (d.slots_cfg===0?(de()?'aus':'off'):d.slots_cfg)));
+  }
   rows.push('Boot-ID: '+d.boot_id+(d.token_set?(de()?' · Token gesetzt':' · token set'):''));
   el.innerHTML=rows.map(function(r,i){
     return i===0?r:'<div style="border-top:1px solid var(--border);padding:2px 0">'+r+'</div>';
@@ -1249,6 +1641,8 @@ function loadLogship(){
     if(document.activeElement!==u) u.value=d.url||'';
     if(document.activeElement!==c) c.checked=!!d.enabled;
     if(document.activeElement!==t && !t.value && d.token_set) t.placeholder=de()?'(gesetzt — leer lassen zum Behalten)':'(set — leave empty to keep)';
+    var sl=document.getElementById('lship_slots');
+    if(sl && document.activeElement!==sl && d.slots_cfg!==undefined) sl.value=String(d.slots_cfg);
     renderLogship(d);
   }).catch(function(){});
 }
@@ -1263,7 +1657,8 @@ function saveLogship(){
     showToast(de()?'URL muss mit http:// oder https:// beginnen':'URL must start with http:// or https://',false,4000);
     return;
   }
-  var body={enabled:en, url:url, token:document.getElementById('lship_token').value};
+  var body={enabled:en, url:url, token:document.getElementById('lship_token').value,
+            slots:parseInt(document.getElementById('lship_slots').value,10)};
   fetch('/api/logship',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
     .then(function(r){return r.json();}).then(function(d){
       renderLogship(d);
@@ -1290,6 +1685,7 @@ function initDebugTab(){
     document.getElementById('dbg_poll').checked = !!(d.filter & 4);
     document.getElementById('dbg_status').checked = !!(d.filter & 8);
     document.getElementById('dbg_heat').checked = !!(d.filter & 16);
+    loadHeatInject();
     document.getElementById('debugLogWrap').style.display=d.enabled?'':'none';
     if(d.enabled)loadUartLog();
   }).catch(function(){});
@@ -1462,6 +1858,11 @@ void handleApiInfo() {
   json += "\"coredump\":" + coreDumpStatusJson() + ",";
   // Griffheizung: Zustand UND Einstellungen in einem Rutsch. Die Seite /heat
   // zieht sich daraus alles und braucht keinen zweiten Abruf.
+  // Beide Modulschalter: /heat und /leds bauen daraus ihre Reiterleiste. Ohne
+  // sie sah man vom einen Modul das andere nicht und musste ueber die
+  // Startseite zurueck.
+  json += "\"leds_enabled\":" + String(cfg_leds_enabled?"true":"false") + ",";
+  json += "\"heat_enabled\":" + String(cfg_heat_enabled?"true":"false") + ",";
   json += "\"heat\":" + heatStatusJson() + ",";
   if (WiFi.status() != WL_CONNECTED) {
     json += "\"mode\":\"ap\",\"ip\":\""+WiFi.softAPIP().toString()+"\"";
@@ -1499,6 +1900,7 @@ void handleApiConfigGet() {
   json += "\"ble_full_power\":"+String(cfg_ble_full_power?"true":"false")+",";
   json += "\"ble_auto_off_sec\":"+String(cfg_ble_auto_off_sec)+",";
   json += "\"leds_enabled\":"+String(cfg_leds_enabled?"true":"false")+",";
+  json += "\"heat_enabled\":"+String(cfg_heat_enabled?"true":"false")+",";
   json += "\"logship_enabled\":"+String(cfg_logship_enabled?"true":"false")+",";
   json += "\"logship_url\":\""+jsonEscapeDebug(cfg_logship_url)+"\",";
   // Das Token selbst wird NICHT ausgeliefert, nur ob eines gesetzt ist.
@@ -1610,6 +2012,10 @@ void handleApiConfigPost() {
   cfg_ble_auto_off_sec  = parseInt2("ble_auto_off_sec", 120);
   bool ledsWasEnabled   = cfg_leds_enabled;   // alten Zustand merken
   cfg_leds_enabled      = (body.indexOf("\"leds_enabled\":true") >= 0);
+  // Genau wie bei den LEDs: dieser Haken allein loest KEINEN Neustart aus, er
+  // taucht deshalb unten im Vergleich nicht auf.
+  bool heatWasEnabled   = cfg_heat_enabled;
+  cfg_heat_enabled      = (body.indexOf("\"heat_enabled\":true") >= 0);
   // Log-Upload: wie bei den PIN-Feldern nur uebernehmen, wenn im Body vorhanden.
   // Eine aeltere Companion-App, die die Felder nicht kennt, wuerde den Upload
   // sonst beim Speichern stillschweigend abschalten. Ein LEERES Token bedeutet
@@ -1628,6 +2034,9 @@ void handleApiConfigPost() {
   // Wenn die WS28XX-Steuerung gerade DEAKTIVIERT wurde -> LEDs sofort ausschalten.
   // (Greift auch ohne Reboot; beim Reboot waeren sie ohnehin aus.)
   if (ledsWasEnabled && !cfg_leds_enabled) ledsOff();
+  // Haken raus -> sofort stromlos. Erst beim naechsten Neustart aufzuhoeren
+  // waere bei einer Heizung die falsche Reihenfolge.
+  if (heatWasEnabled && !cfg_heat_enabled) heatOff();
   if (cfg_autopoll_interval < 1)   cfg_autopoll_interval = 1;
   if (cfg_autopoll_interval > 60)  cfg_autopoll_interval = 60;
   if (cfg_ble_mode < 0 || cfg_ble_mode > 2) cfg_ble_mode = 1;
@@ -2047,6 +2456,10 @@ void setupWebServer() {
   // siehe backup.cpp — der NVS wird dort generisch ausgelesen).
   backupRegisterRoutes(otaServer);
   coreDumpRegisterRoutes(otaServer);
+  // Blackbox-Bericht und RTC-Zeilen direkt abholbar machen. Wichtig fuer den
+  // Fall ohne Heimnetz: ein Stillstand hinterlaesst KEIN Absturzabbild (der
+  // Waechter startet geplant neu), die Diagnose steckt nur hier.
+  blackboxRegisterRoutes(otaServer);
   // ── Log-Upload ──────────────────────────────────────────────────────────────
   // Eigene Endpunkte statt /api/config, weil das grosse Speichern den ESP
   // neustartet. Der Sende-Task liest cfg_logship_* laufend -> die Aenderung
@@ -2089,12 +2502,25 @@ void setupWebServer() {
       cfg_logship_enabled = (body.indexOf("\"enabled\":true") >= 0);
     if (cfg_logship_url.isEmpty()) cfg_logship_enabled = false;
 
-    // Nur die drei Schluessel schreiben (wie /api/debug), nicht saveConfig():
+    // Puffergroesse: greift erst beim naechsten Start, deshalb wird hier nur
+    // gespeichert. Einen laufenden Puffer umzuhaengen waere ein Rennen mit dem
+    // Sende-Task, der gerade daraus liest.
+    if (body.indexOf("\"slots\":") >= 0) {
+      int sl = -1;
+      int k = body.indexOf("\"slots\":");
+      if (k >= 0) sl = body.substring(k + 8).toInt();
+      if (sl == -1 || sl == 0 || sl == 150 || sl == 500 || sl == 1000 || sl == 2000) {
+        cfg_logship_slots = sl;
+      }
+    }
+
+    // Nur die vier Schluessel schreiben (wie /api/debug), nicht saveConfig():
     // das wuerde den gesamten Konfigurationsblock neu schreiben.
     prefs.begin("vesccfg", false);
     prefs.putBool  ("lship_en",  cfg_logship_enabled);
     prefs.putString("lship_url", cfg_logship_url);
     prefs.putString("lship_tok", cfg_logship_token);
+    prefs.putInt   ("lship_sl",  cfg_logship_slots);
     prefs.end();
     logShipApplyConfig();   // Sende-Task auf die neuen Werte umstellen
 
@@ -2110,6 +2536,9 @@ void setupWebServer() {
     logShipSendTestLine();
     otaServer.send(200, "application/json", logShipStatusJson());
   });
+  // Pufferinhalt als Klartext. Der einzige Weg an die gesammelten Zeilen,
+  // wenn kein Heimnetz da ist und nichts gesendet werden kann.
+  otaServer.on("/api/logship/dump", HTTP_GET, [](){ logShipDumpChunked(otaServer); });
   otaServer.on("/api/logship/clear", HTTP_POST, [](){
     logShipClear();
     otaServer.send(200, "application/json", logShipStatusJson());
