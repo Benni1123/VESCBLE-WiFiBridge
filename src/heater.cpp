@@ -51,13 +51,21 @@
 // Polling einwandfrei laeuft. Das saehe nach einem Fehler in der Heizung aus
 // und waere doch nur eine Zahl gegen die andere.
 //
-// Deshalb drei Poll-Abstaende, mindestens aber 10 s: ein einzelner verlorener
-// Poll wirft die Heizung nicht aus der Spur, zwei hintereinander schon.
-#define HEAT_STALE_MIN_MS  10000UL
+// Deshalb fuenf Poll-Abstaende, mindestens aber 30 s.
+//
+// Vorher waren es drei Abstaende und mindestens 10 s — zu knapp. Im Betrieb
+// traten auch ohne angeschlossenen Client Luecken von 10 bis 12 s auf, und bei
+// einem Poll-Intervall von 1 s lag die Untergrenze genau dort. Die Heizung
+// schaltete dann mitten in der Fahrt ab, obwohl die Verbindung stand.
+//
+// Teuer ist die Grosszuegigkeit nicht: dass im Stand nicht geheizt wird, haengt
+// NICHT an diesem Fenster, sondern an den Haltezeiten weiter unten. Die laufen
+// auch bei fehlenden Daten weiter.
+#define HEAT_STALE_MIN_MS  30000UL
 
 static inline uint32_t heatStaleMs() {
   uint32_t iv = (uint32_t)cfg_autopoll_interval * 1000UL;
-  uint32_t w  = iv * 3UL;
+  uint32_t w  = iv * 5UL;
   if (w < HEAT_STALE_MIN_MS) w = HEAT_STALE_MIN_MS;
   return w;
 }
@@ -328,8 +336,8 @@ static void heatLog(const char *what) {
     } else {
       line += " - ERPM zu alt: letzter Wert vor " +
               String((unsigned long)(hLastDataMs / 1000UL)) + "s, Fenster " +
-              String((unsigned long)(heatStaleMs() / 1000UL)) + "s (3x Poll " +
-              String(cfg_autopoll_interval) + "s)";
+              String((unsigned long)(heatStaleMs() / 1000UL)) + "s (5x Poll " +
+              String(cfg_autopoll_interval) + "s, min 30s), Haltezeiten laufen weiter";
     }
   } else if (hReason == "undervolt") {
     line += " - Unterspannung " + String(hLastVolt, 1) + " V unter Grenze " +
@@ -479,17 +487,18 @@ static void heatDecide(bool vescConnected, int32_t erpm, float voltage, uint32_t
   }
 
   // ── Auto: nur beim Fahren ─────────────────────────────────────────────────
-  if (!fresh) {
-    // Keine verlaesslichen ERPM-Werte -> nicht heizen. Das ist der ganze Zweck
-    // der Funktion: der Akku soll nicht leer werden, waehrend das Geraet
-    // herumsteht. Ohne Daten ist "steht herum" die wahrscheinlichere Lage.
-    heatWritePct(0);
-    hReason = "nodata";
-    return;
-  }
-
+  //
+  // Fehlende Daten werden behandelt wie "faehrt gerade nicht" — NICHT wie ein
+  // Not-Aus. Vorher ging die Heizung bei einer Datenluecke sofort auf 0 und
+  // beim naechsten Wert wieder hoch; mitten in der Fahrt ist das ein
+  // Kaltschlag an den Griffen, und schuld war nur ein verlorener Poll.
+  //
+  // Jetzt laeuft stattdessen dieselbe Haltesequenz wie nach einem echten
+  // Anhalten: erst volle Leistung, dann abgesenkt, dann aus. Der Schutz vor dem
+  // Leerheizen bleibt also vollstaendig erhalten — er dauert nur genauso lange
+  // wie beim Abstellen, statt sofort zuzuschlagen.
   int32_t a = (erpm < 0) ? -erpm : erpm;
-  if (a > hErpmOn) {
+  if (fresh && a > hErpmOn) {
     hLastMoveMs = now;
     hEverMoved  = true;
     heatWritePct(hLevel);
@@ -497,11 +506,19 @@ static void heatDecide(bool vescConnected, int32_t erpm, float voltage, uint32_t
     return;
   }
 
+  // Noch nie Bewegung gesehen: es gibt keinen Zeitpunkt, ab dem eine
+  // Haltesequenz zaehlen koennte. Also aus.
+  if (!hEverMoved) {
+    heatWritePct(0);
+    hReason = fresh ? "idle" : "nodata";
+    return;
+  }
+
   // ── Kurz angehalten: noch nichts aendern ────────────────────────────────
   // Zwei Sekunden vor einer Kreuzung sind kein Halt. Ohne diese Stufe wuerde
   // bei jedem Abbremsen abgesenkt und sofort wieder hochgefahren.
   uint32_t stopped = (uint32_t)(now - hLastMoveMs);
-  if (hEverMoved && stopped < (uint32_t)hStopDly * 1000UL) {
+  if (stopped < (uint32_t)hStopDly * 1000UL) {
     heatWritePct(hLevel);
     hReason = "settle";
     return;
@@ -510,16 +527,16 @@ static void heatDecide(bool vescConnected, int32_t erpm, float voltage, uint32_t
   // ── Ampel: abgesenkt ────────────────────────────────────────────────────
   // Die Griffe bleiben warm, der Verbrauch sinkt. An einer Ampel merkt man den
   // Unterschied in der Temperatur nicht — in der Restreichweite schon.
-  if (hEverMoved && hLagSec > 0 && stopped < (uint32_t)hLagSec * 1000UL) {
+  if (hLagSec > 0 && stopped < (uint32_t)hLagSec * 1000UL) {
     heatWritePct(heatHoldPct());
     hReason = "hold";
     return;
   }
 
-  // Nachlauf abgelaufen -> komplett aus. Kein Dauerwert im Stand: der wuerde
+  // Haltezeit abgelaufen -> komplett aus. Kein Dauerwert im Stand: der wuerde
   // den Akku leer heizen, waehrend der Scooter herumsteht.
   heatWritePct(0);
-  hReason = "idle";
+  hReason = fresh ? "idle" : "nodata";
 }
 
 bool heatIsOn() { return hAttached && hOutPct > 0; }
