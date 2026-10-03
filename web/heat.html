@@ -1,0 +1,522 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Griffheizung</title>
+  <link rel="stylesheet" href="/style.css">
+  <style>
+    input[type=range]{width:100%;accent-color:var(--accent);margin-top:6px}
+    .rng-row{display:grid;grid-template-columns:1fr 54px;gap:10px;align-items:center;margin-top:6px}
+    .rng-val{font-size:13px;color:var(--accent);text-align:right}
+    select{width:100%;padding:8px 10px;background:var(--bg3);border:1px solid var(--border);border-radius:4px;color:var(--text);font-family:inherit;font-size:13px}
+    .grid2{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+    .big{font-size:30px;font-weight:700;line-height:1.1}
+    .state{padding:12px;border-radius:8px;background:var(--bg3);border:1px solid var(--border2);display:flex;justify-content:space-between;align-items:center;gap:12px}
+    .warn{margin-top:8px;padding:8px 10px;border-left:2px solid #e0a030;border-radius:4px;background:rgba(224,160,48,.08);color:var(--text2);font-size:11px;line-height:1.45}
+    .info-note.warn{border-left-color:#e0a030;background:rgba(224,160,48,.08)}
+  .egg{position:fixed;z-index:9998;pointer-events:none;max-width:260px;padding:9px 13px;
+       border-radius:10px;background:var(--bg2);border:1px solid var(--accent);
+       color:var(--text);font-family:Ndot47,system-ui,-apple-system,sans-serif;font-size:12px;
+       line-height:1.4;box-shadow:0 4px 18px rgba(0,0,0,.35);opacity:0;transition:opacity .6s}
+    .egg.on{opacity:1}
+    .err{margin-top:8px;padding:8px 10px;border-left:2px solid var(--err);border-radius:4px;background:rgba(229,115,115,.10);color:#e57373;font-size:12px}
+    .info-note{display:none;margin-top:7px;padding:7px 9px;border-left:2px solid var(--accent);border-radius:4px;background:rgba(77,163,255,.07);color:var(--text2);font-size:11px;line-height:1.45}
+  body.show-info .info-note:not([data-relevant="0"]){display:block}
+    .info-btn{position:fixed;top:12px;right:100px;padding:4px 10px;background:var(--bg2);border:1px solid var(--border);border-radius:4px;color:var(--text2);font-family:'Ndot47',system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;font-size:12px;cursor:pointer}
+    .info-btn:hover{border-color:var(--accent);color:var(--accent)}
+    .info-btn.on{border-color:var(--accent);color:var(--accent)}
+    .btnrow{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
+  </style>
+</head>
+<body>
+<button class="info-btn" onclick="toggleInfo()" id="btn-info" title="Info">i</button>
+<button class="theme-btn" onclick="toggleTheme()" id="themeBtn">&#9728;&#65039;</button>
+<button class="lang-btn" onclick="toggleLang()" id="langBtn">DE</button>
+<div class="wrap">
+  <h1 id="appTitle" style="cursor:default;user-select:none;-webkit-tap-highlight-color:transparent">&#x1F6F4; VESC BLE/WiFi</h1>
+  <div class="sub" id="statusBar">Loading...</div>
+  <div class="tabs">
+    <div class="tab" onclick="location.href='/?tab=info'">Info</div>
+    <div class="tab" onclick="location.href='/?tab=config'">Config</div>
+    <div class="tab" onclick="location.href='/?tab=ota'">OTA Flash</div>
+    <div class="tab" id="tab-api-link" style="display:none" onclick="location.href='/?tab=api'">API</div>
+    <div class="tab" id="tab-leds-link" style="display:none" onclick="location.href='/leds'">LED</div>
+    <div class="tab active" onclick="location.href='/heat'" id="tab-heat">Heizung</div>
+  </div>
+
+  <div class="section">
+    <h3 id="lbl-state">Status</h3>
+    <div class="state">
+      <div>
+        <div class="big" id="outVal">--</div>
+        <div style="font-size:11px;color:var(--text3)" id="outWhy">&nbsp;</div>
+      </div>
+      <div style="text-align:right;font-size:12px;color:var(--text2)">
+        <div id="stErpm">ERPM --</div>
+        <div id="stVolt">-- V</div>
+      </div>
+    </div>
+    <div class="err" id="pinErr" style="display:none"></div>
+    <div class="warn" id="heatDisabled" style="display:none"></div>
+  </div>
+
+  <div class="section">
+    <h3 id="lbl-mode-t">Betrieb</h3>
+    <label id="lbl-mode">Modus</label>
+    <select id="mode" onchange="onMode()">
+      <option value="0" id="opt-m0">Aus</option>
+      <option value="2" id="opt-m2">Auto (nur beim Fahren)</option>
+      <option value="1" id="opt-m1">An (immer)</option>
+    </select>
+    <div class="info-note" id="lbl-mode-hint"></div>
+
+    <label style="margin-top:12px" id="lbl-level">Leistung beim Fahren</label>
+    <div class="rng-row">
+      <input type="range" id="level" min="0" max="100" step="1" oninput="lv('level')" onchange="save(0)">
+      <span class="rng-val" id="level_v">0%</span>
+    </div>
+
+    <div id="autoBox">
+      <label style="margin-top:12px" id="lbl-red">Im Halt absenken um</label>
+      <div class="rng-row">
+        <input type="range" id="reduce" min="0" max="100" step="5" oninput="lv('reduce')" onchange="save(0)">
+        <span class="rng-val" id="reduce_v">0%</span>
+      </div>
+      <div style="font-size:12px;color:var(--text2);margin-top:4px" id="holdCalc">&nbsp;</div>
+      <div class="info-note" id="lbl-red-hint"></div>
+
+      <div class="grid2" style="margin-top:12px">
+        <div><label id="lbl-sdly">Absenken nach (s)</label><input type="text" id="stop_dly" maxlength="4" placeholder="10"></div>
+        <div><label id="lbl-lag">Ganz aus nach (s)</label><input type="text" id="lag_s" maxlength="4" placeholder="30"></div>
+      </div>
+      <div style="margin-top:12px"><label id="lbl-erpm">ERPM-Schwelle</label><input type="text" id="erpm_on" maxlength="6" placeholder="200"></div>
+      <div class="info-note" id="lbl-erpm-hint"></div>
+    </div>
+  </div>
+
+  <div class="section">
+    <h3 id="lbl-boost-t">Boost nach langer Pause</h3>
+    <label id="lbl-boost-pct">Boost-Leistung (0 = aus)</label>
+    <div class="rng-row">
+      <input type="range" id="boost_pct" min="0" max="100" step="5" oninput="lv('boost_pct')" onchange="save(0)">
+      <span class="rng-val" id="boost_pct_v">0%</span>
+    </div>
+    <div class="grid2" style="margin-top:12px">
+      <div><label id="lbl-boost-after">Erst nach (min aus)</label><input type="text" id="boost_after" maxlength="4" placeholder="30"></div>
+      <div><label id="lbl-boost-sec">Boost-Dauer (s)</label><input type="text" id="boost_sec" maxlength="4" placeholder="120"></div>
+    </div>
+    <div style="font-size:12px;color:var(--text2);margin-top:8px" id="boostState">&nbsp;</div>
+    <div class="info-note" id="lbl-boost-hint"></div>
+  </div>
+
+  <div class="section">
+    <h3 id="lbl-hw-t">Hardware</h3>
+    <div class="info-note" id="lbl-hw-hint"></div>
+    <label class="checkbox-row" style="margin-top:12px">
+      <input type="checkbox" id="invert">
+      <span id="lbl-invert">Ausgang invertiert (Treiber schaltet bei LOW ein)</span>
+    </label>
+    <label style="margin-top:12px" id="lbl-minv">Unterspannungsabschaltung (V, 0 = aus)</label>
+    <input type="text" id="min_volt" maxlength="6" placeholder="0">
+    <div class="info-note" id="lbl-minv-hint"></div>
+    <div class="info-note warn" id="lbl-gate"></div>
+    <div class="btnrow">
+      <button class="btn" onclick="save(1)" id="btn-save">Speichern</button>
+    </div>
+    <div class="msg" id="msg" style="min-height:16px;margin-top:8px;font-size:12px;color:var(--accent)"></div>
+  </div>
+
+  <div class="section" id="testSec" style="display:none">
+    <h3 id="lbl-test-t">Testlauf</h3>
+    <div class="info-note" id="lbl-test-hint"></div>
+    <div class="grid2" style="margin-top:10px">
+      <div><label id="lbl-test-pct">Leistung (%)</label><input type="text" id="test_pct" maxlength="3" placeholder="100"></div>
+      <div><label id="lbl-test-sec">Dauer (s)</label><input type="text" id="test_sec" maxlength="3" placeholder="60"></div>
+    </div>
+    <div class="btnrow">
+      <button class="btn" onclick="test(1)" id="btn-test">Test starten</button>
+      <button class="btn" onclick="test(0)" id="btn-stop">Stopp</button>
+    </div>
+  </div>
+</div>
+
+<script>
+var lang=(document.cookie.match(/lang=([a-z]+)/)||[])[1]||(navigator.language.startsWith('de')?'de':'en');
+function de(){return lang==='de';}
+function L(d,e){return de()?d:e;}
+function gid(id){return document.getElementById(id);}
+
+var theme=(document.cookie.match(/theme=([a-z]+)/)||[])[1]||(window.matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light');
+function applyTheme(){document.documentElement.setAttribute('data-theme',theme);var b=gid('themeBtn');if(b)b.textContent=theme==='dark'?'☀️':'🌙';document.cookie='theme='+theme+';path=/;max-age=31536000';}
+function toggleTheme(){theme=theme==='dark'?'light':'dark';applyTheme();}
+applyTheme();
+function toggleLang(){lang=lang==='de'?'en':'de';document.cookie='lang='+lang+';path=/;max-age=31536000';location.reload();}
+gid('langBtn').textContent=de()?'EN':'DE';
+
+// ── Hinweistexte ein-/ausblenden ────────────────────────────────────────────
+// Der Zustand steht in einem Cookie und nicht in localStorage: so gilt er
+// seitenuebergreifend (Startseite, /leds, /heat) mit demselben Mechanismus,
+// den auch Thema und Sprache benutzen. Standard ist AUS — die Oberflaeche
+// soll aufgeraeumt aussehen, bis man die Erklaerungen anfordert.
+var hintsOn = (document.cookie.match(/hints=(\d)/)||[])[1] === '1';
+function applyHints(){
+  if (document.body) document.body.classList.toggle('show-info', hintsOn);
+  var b = gid('btn-info');
+  if (b){
+    if (hintsOn) b.classList.add('on'); else b.classList.remove('on');
+    b.title = hintsOn ? (de()?'Hinweise ausblenden':'Hide notes')
+                      : (de()?'Hinweise einblenden':'Show notes');
+  }
+}
+function toggleInfo(){
+  hintsOn = !hintsOn;
+  document.cookie = 'hints=' + (hintsOn?'1':'0') + ';path=/;max-age=31536000';
+  applyHints();
+}
+applyHints();
+
+// Modulreiter ohne Springen: der Zustand der optionalen Reiter kommt aus
+// /api/info und damit erst nach einer Netzwerkantwort. Bis dahin fehlen sie,
+// und wenn sie auftauchen, ruecken die uebrigen Reiter zur Seite.
+//
+// Deshalb wird der zuletzt bekannte Zustand in einem Cookie gemerkt und beim
+// Laden SOFORT angewandt. Die Antwort korrigiert ihn dann nur noch.
+function modsSave(l,h){ document.cookie='mods='+(l?'1':'0')+(h?'1':'0')+';path=/;max-age=31536000'; }
+function modsApply(l,h){
+  var e1=document.getElementById('tab-leds-link'); if(e1) e1.style.display=l?'':'none';
+  var e2=document.getElementById('tab-heat-link'); if(e2) e2.style.display=h?'':'none';
+}
+(function(){
+  var m=(document.cookie.match(/mods=(\d\d)/)||[])[1];
+  if(m) modsApply(m[0]==='1', m[1]==='1');
+})();
+
+var FMIN=100, FMAX=20000;
+
+function tr(){
+  var s=function(id,d,e){var el=gid(id);if(el)el.textContent=L(d,e);};
+  s('tab-heat','Heizung','Heater');
+  s('lbl-state','Status','Status');
+  s('lbl-mode-t','Betrieb','Operation');
+  s('lbl-mode','Modus','Mode');
+  s('opt-m0','Aus','Off');
+  s('opt-m1','An (immer)','On (always)');
+  s('opt-m2','Auto (nur beim Fahren)','Auto (only while riding)');
+  s('lbl-mode-hint',
+    'Auto heizt nur, wenn der VESC Bewegung meldet. Steht der Scooter, geht die Heizung nach dem Nachlauf aus — damit der Akku nicht leer geheizt wird, waehrend das Geraet herumsteht.',
+    'Auto heats only while the VESC reports movement. When the scooter stands still the heater turns off after the follow-up time, so the battery is not drained while the device just sits there.');
+  s('lbl-level','Leistung beim Fahren','Power while riding');
+  s('lbl-red','Im Halt absenken um','Reduce when stopped by');
+  s('lbl-red-hint','Prozent der Fahrleistung, nicht ein fester Wert \u2014 wer die Fahrleistung aendert, muss die Ampel nicht nachstellen. Bei 50% Fahrt und 5% Absenkung bleiben 47%. 0% = im Halt genauso warm wie beim Fahren, 100% = im Halt aus.',
+                   'Percent of the riding power, not a fixed value \u2014 change the riding power and the stop level follows. 50% riding with 5% reduction leaves 47%. 0% = as warm as while riding, 100% = off while stopped.');
+  s('lbl-sdly','Absenken nach (s)','Reduce after (s)');
+  s('lbl-boost-t','Boost nach langer Pause','Boost after a long break');
+  s('lbl-boost-pct','Boost-Leistung (0 = aus)','Boost power (0 = off)');
+  s('lbl-boost-after','Erst nach (min aus)','Only after (min off)');
+  s('lbl-boost-sec','Boost-Dauer (s)','Boost duration (s)');
+  s('lbl-boost-hint','War die Heizung laenger als die eingestellte Zeit aus, laeuft sie beim naechsten Einschalten erst mit der Boost-Leistung, danach normal weiter. Kalte Griffe brauchen anfangs mehr als zum Warmhalten. Gezaehlt wird ab der letzten tatsaechlichen Heizleistung, nicht ab der letzten Fahrt \u2014 nach einer kurzen Pause sind die Griffe noch warm, da waere Boost nur Verschwendung. Nach einem Neustart greift er immer.',
+                    'If the heater was off longer than the configured time, it starts at the boost level on the next switch-on and then continues normally. Cold grips need more than keeping warm does. Counted from the last actual heating, not from the last ride \u2014 after a short break the grips are still warm, so boost would be waste. After a restart it always applies.');
+  s('lbl-erpm','ERPM-Schwelle','ERPM threshold');
+  s('lbl-lag','Ganz aus nach (s)','Off completely after (s)');
+  s('lbl-erpm-hint','Ueber dieser ERPM gilt "faehrt". Der Nachlauf haelt die Heizung nach dem Anhalten noch so lange an — fuer die Ampel.',
+                    'Above this ERPM counts as "riding". The follow-up keeps the heater on for that long after stopping — for traffic lights.');
+  s('lbl-hw-t','Hardware','Hardware');
+  s('lbl-invert','Ausgang invertiert (Treiber schaltet bei LOW ein)','Output inverted (driver switches on at LOW)');
+  s('lbl-minv','Unterspannungsabschaltung (V, 0 = aus)','Low-voltage cutoff (V, 0 = off)');
+  s('lbl-minv-hint','Unter dieser Akkuspannung wird nicht geheizt. Greift nur bei frischen VESC-Daten.',
+                    'Below this pack voltage the heater stays off. Only applies with fresh VESC data.');
+  s('btn-save','Speichern','Save');
+  s('lbl-test-t','Testlauf','Test run');
+  s('lbl-test-hint','Heizt unabhaengig von ERPM, damit sich Frequenz und Leistung ohne Fahrt ausprobieren lassen. Endet automatisch — die Unterspannungsabschaltung bleibt aktiv.',
+                    'Heats regardless of ERPM so frequency and power can be tried without riding. Ends automatically — the low-voltage cutoff stays active.');
+  s('lbl-test-pct','Leistung (%)','Power (%)');
+  s('lbl-test-sec','Dauer (s)','Duration (s)');
+  s('btn-test','Test starten','Start test');
+  s('btn-stop','Stopp','Stop');
+  var hd=gid('heatDisabled');
+  if(hd) hd.innerHTML=L('<b>In der Konfiguration abgeschaltet.</b> Diese Seite laesst sich einstellen, es wird aber nichts geschaltet. Haken setzen unter Config \u2192 Griffheizung.',
+                        '<b>Disabled in configuration.</b> This page can be set up, but nothing is switched. Tick the box under Config \u2192 Grip heater.');
+  var g=gid('lbl-gate');
+  if(g) g.innerHTML=L('<b>Pflicht in der Schaltung:</b> 10 kΩ Pulldown vom Gate des MOSFET nach Masse. Beim Neustart, bei einem Absturz und in den ersten Millisekunden nach dem Einschalten ist der GPIO Eingang — ohne Pulldown entscheidet dann Zufall, ob die Heizung laeuft. Der Code kann das nicht absichern, der Widerstand schon.',
+                      '<b>Required in your wiring:</b> a 10 kΩ pulldown from the MOSFET gate to ground. During a restart, a crash and the first milliseconds after power-on the GPIO is an input — without the pulldown, chance decides whether the heater runs. Code cannot guarantee this, the resistor can.');
+}
+tr();
+
+// ── Easteregg ───────────────────────────────────────────────────────────────
+//
+// Nur fuer das Geraet mit dem BLE-Namen "BLE". Wirft in grossen
+// Abstaenden einen Spruch an eine zufaellige Stelle und blendet ihn wieder aus.
+//
+// Bewusst ohne Interaktion: pointer-events:none, damit nie ein Knopf verdeckt
+// wird, den man gerade druecken will. Und mit grossem Abstand nach oben, damit
+// die Reiterleiste frei bleibt.
+var EGG_LINES = [
+  'BLE meldet sich zum Dienst.',
+  'Akku voll, Kopf leer, Gas.',
+  'Die Griffheizung sagt danke.',
+  'Irgendwo zaehlt ein Zaehler hoch.',
+  'Der Waechter waecht.',
+  'ERPM ist nur eine Zahl.',
+  'Dieses Geraet hat schon Schlimmeres ueberlebt.',
+  'Blackbox leer. Gutes Zeichen.',
+  'Kein Brownout seit Minuten.',
+  'Die LEDs sehen dich.',
+  'Ja, das Log laeuft noch.',
+  'PWM macht genau das, was du gesagt hast.',
+  'Wer braucht schon Bremsen.',
+  'Noch ein Reiter und es passt nicht mehr drauf.',
+  'Der Coredump wartet auf dich.',
+  'Alles im gruenen Bereich. Vermutlich.'
+];
+var eggTimer = null;
+
+// Der Zustand kommt vom Geraet (NVS), nicht aus dem Browser. eggOff ist nur
+// die lokale Kopie, damit eggShow() nicht bei jedem Spruch nachfragen muss;
+// aufgefrischt wird sie mit jedem /api/info.
+var eggOff = false;
+function eggIsOff(){ return eggOff; }
+function eggSetOff(off){
+  eggOff = !!off;
+  fetch('/api/egg?en=' + (off?0:1), {method:'POST'}).catch(function(){});
+  if (off && eggTimer){ clearTimeout(eggTimer); eggTimer = null; }
+  // Laufende Spruchblasen gleich mit wegraeumen, sonst steht die letzte noch
+  // sechs Sekunden da, nachdem man es ausgeschaltet hat.
+  var old = document.querySelectorAll('.egg');
+  for (var i = 0; i < old.length; i++) old[i].parentNode.removeChild(old[i]);
+}
+
+function eggShow(){
+  if (eggIsOff()) return;
+  var d = document.createElement('div');
+  d.className = 'egg';
+  d.textContent = EGG_LINES[Math.floor(Math.random()*EGG_LINES.length)];
+  // SAUER! gehoert an jeden Spruch. Als eigenes Element und nicht per
+  // innerHTML: so kann im Spruchtext nie etwas als Markup gedeutet werden,
+  // egal was dort kuenftig steht.
+  var sa = document.createElement('span');
+  sa.textContent = ' SAUER!';
+  sa.style.cssText = 'color:var(--accent);font-weight:800;letter-spacing:1px';
+  d.appendChild(sa);
+  document.body.appendChild(d);
+  // Erst anhaengen, dann messen: vorher kennt der Browser die Groesse nicht,
+  // und der Spruch landete halb ausserhalb des Fensters.
+  var w = d.offsetWidth, h = d.offsetHeight;
+  var maxX = Math.max(8, window.innerWidth  - w - 8);
+  var maxY = Math.max(60, window.innerHeight - h - 8);
+  d.style.left = (8 + Math.random()*(maxX-8)) + 'px';
+  d.style.top  = (60 + Math.random()*(maxY-60)) + 'px';
+  requestAnimationFrame(function(){ d.classList.add('on'); });
+  setTimeout(function(){
+    d.classList.remove('on');
+    setTimeout(function(){ if(d.parentNode) d.parentNode.removeChild(d); }, 800);
+  }, 6000);
+}
+
+function eggArm(name){
+  if (name !== 'BLE' || eggTimer || eggIsOff()) return;
+  // Zufaelliger Abstand zwischen 40 und 160 Sekunden. Ein fester Takt waere
+  // schnell nur noch Moebel.
+  (function next(){
+    eggTimer = setTimeout(function(){ eggShow(); next(); },
+                          40000 + Math.random()*120000);
+  })();
+  setTimeout(eggShow, 4000);   // einer gleich zur Begruessung
+}
+
+function why(r){
+  var m={
+    off:L('Modus aus','Mode off'),
+    on:L('An (immer)','On (always)'),
+    riding:L('faehrt','riding'),
+    boost:L('Boost','boost'),
+    settle:L('gerade angehalten','just stopped'),
+    hold:L('Halt \u2014 abgesenkt','stopped \u2014 reduced'),
+    idle:L('steht \u2014 aus','standing \u2014 off'),
+    nodata:L('keine frischen VESC-Daten','no fresh VESC data'),
+    undervolt:L('Unterspannung — Akku schonen','low voltage — protecting the pack'),
+    test:L('Testlauf','test run'),
+    nopin:L('kein gueltiger GPIO','no valid GPIO'),
+    disabled:L('in der Konfiguration abgeschaltet','disabled in configuration')
+  };
+  return m[r]||r;
+}
+function lv(id){gid(id+'_v').textContent=gid(id).value+'%';}
+function onMode(){
+  var m=gid('mode').value;
+  gid('autoBox').style.display=(m==='2')?'':'none';
+  save(0);
+}
+
+var dragging=false;
+['level','reduce','boost_pct'].forEach(function(id){
+  gid(id).addEventListener('pointerdown',function(){dragging=true;});
+});
+// Loslassen am FENSTER abfangen, nicht am Regler: wer mit dem Finger
+// herauswischt, loest sonst nie ein pointerup auf dem Regler aus, und die
+// Sperre bliebe fuer immer stehen.
+window.addEventListener('pointerup',function(){dragging=false;});
+window.addEventListener('pointercancel',function(){dragging=false;});
+
+function fill(d){
+  FMIN=d.freq_min||100; FMAX=d.freq_max||20000;
+  gid('mode').value=d.mode;
+  if(!dragging){
+    gid('level').value=d.level; lv('level');
+    gid('reduce').value=d.reduce; lv('reduce');
+    gid('boost_pct').value=d.boost_pct; lv('boost_pct');
+  }
+  if(document.activeElement!==gid('erpm_on'))  gid('erpm_on').value=d.erpm_on;
+  if(document.activeElement!==gid('lag_s'))    gid('lag_s').value=d.lag_s;
+  if(document.activeElement!==gid('stop_dly'))    gid('stop_dly').value=d.stop_dly;
+  if(document.activeElement!==gid('boost_after')) gid('boost_after').value=d.boost_after;
+  if(document.activeElement!==gid('boost_sec'))   gid('boost_sec').value=d.boost_sec;
+  if(document.activeElement!==gid('min_volt')) gid('min_volt').value=d.min_volt;
+  gid('invert').checked=d.invert===true;
+  gid('autoBox').style.display=(String(d.mode)==='2')?'':'none';
+  var bs=gid('boostState');
+  if(bs){
+    if(d.boost_pct<=0) bs.textContent=L('Boost aus','Boost off');
+    else if(d.boost_left>0) bs.textContent=L('Boost laeuft \u2014 noch '+d.boost_left+'s','Boost running \u2014 '+d.boost_left+'s left');
+    else if(d.off_for_s<0) bs.textContent=L('Seit dem Neustart nicht geheizt \u2014 Boost greift beim Einschalten','Not heated since restart \u2014 boost will apply');
+    else {
+      var mins=Math.floor(d.off_for_s/60);
+      bs.textContent = (mins>=d.boost_after)
+        ? L('Seit '+mins+' min aus \u2014 Boost greift beim Einschalten','Off for '+mins+' min \u2014 boost will apply')
+        : L('Seit '+mins+' min aus \u2014 Boost ab '+d.boost_after+' min','Off for '+mins+' min \u2014 boost from '+d.boost_after+' min');
+    }
+  }
+  var hc=gid('holdCalc');
+  if(hc) hc.textContent=L('Im Halt also '+d.hold_pct+'% ('+d.reduce+'% unter '+d.level+'% Fahrleistung)',
+                          'So '+d.hold_pct+'% while stopped ('+d.reduce+'% below '+d.level+'% riding power)');
+  gid('outVal').textContent=d.out+'%';
+  gid('outVal').style.color=d.active?'var(--ok)':'var(--text3)';
+  var w=why(d.reason);
+  if(d.reason==='test'&&d.test_left>0) w+=' ('+d.test_left+'s)';
+  gid('outWhy').textContent=w;
+  var pe=gid('pinErr');
+  if(d.pin_error){pe.style.display='';pe.textContent=d.pin_error;}
+  else pe.style.display='none';
+  var mh=gid('lbl-mode-hint');
+  if(mh&&String(d.mode)==='2') mh.textContent=L(
+    'Auto heizt nur, wenn der VESC Bewegung meldet. Steht der Scooter, geht die Heizung nach dem Nachlauf aus \u2014 damit der Akku nicht leer geheizt wird. Ein ERPM-Wert gilt '+Math.round((d.stale_ms||10000)/1000)+' s als frisch (3x das Poll-Intervall von '+(d.poll_s||5)+' s, mindestens 10 s); danach wird vorsichtshalber nicht geheizt.',
+    'Auto heats only while the VESC reports movement. When the scooter stands still the heater turns off after the follow-up time, so the battery is not drained. An ERPM reading counts as fresh for '+Math.round((d.stale_ms||10000)/1000)+' s (3x the poll interval of '+(d.poll_s||5)+' s, at least 10 s); after that the heater stays off to be safe.');
+  var hh=gid('lbl-hw-hint');
+  if(hh) hh.textContent=L(
+    'Aktuell: '+(d.pin>=0?('GPIO'+d.pin):'kein GPIO')+', '+d.freq+' Hz. Gesperrt: '+d.vesc_rx+'/'+d.vesc_tx+' (VESC-UART), 19/20 (USB), 43/44 (Konsole), 26-32 (Flash/PSRAM), 0/3/45/46 (Strapping). Frequenz '+FMIN+'-'+FMAX+' Hz — unter '+FMIN+' Hz reicht die PWM-Aufloesung nicht fuer 1%-Schritte.',
+    'Current: '+(d.pin>=0?('GPIO'+d.pin):'no GPIO')+', '+d.freq+' Hz. Blocked: '+d.vesc_rx+'/'+d.vesc_tx+' (VESC UART), 19/20 (USB), 43/44 (console), 26-32 (flash/PSRAM), 0/3/45/46 (strapping). Frequency '+FMIN+'-'+FMAX+' Hz — below '+FMIN+' Hz the PWM resolution is not enough for 1% steps.');
+}
+
+function status(){
+  fetch('/api/info',{cache:'no-store'}).then(function(r){return r.json();}).then(function(d){
+    gid('statusBar').textContent=(d.mode==='ap'&&!d.ssid)?'AP: '+d.ip:'WiFi: '+d.ssid+' ('+d.ip+')';
+    eggOff = (d.egg === false);
+    eggArm(d.ble_name);
+    gid('stErpm').textContent='ERPM '+(d.vesc_connected?d.vesc_erpm:'--');
+    gid('stVolt').textContent=(d.vesc_connected?d.vesc_voltage:'--')+' V';
+    // Reiter des anderen Moduls einblenden, wenn es aktiv ist. Beide Schalter
+    // stehen in /api/info, das hier ohnehin geholt wird.
+    modsApply(d.leds_enabled===true, true);   // Heizungsreiter ist hier aktiv
+    modsSave (d.leds_enabled===true, d.heat_enabled===true);
+    var hw=gid('heatDisabled');
+    if(hw) hw.style.display=(d.heat_enabled===false)?'':'none';
+    if(d.heat) fill(d.heat);
+  }).catch(function(){});
+}
+
+function body(){
+  return JSON.stringify({
+    mode:     parseInt(gid('mode').value)||0,
+    level:    parseInt(gid('level').value)||0,
+    reduce:   parseInt(gid('reduce').value)||0,
+    stop_dly: parseInt(gid('stop_dly').value),
+    boost_pct:   parseInt(gid('boost_pct').value)||0,
+    boost_after: parseInt(gid('boost_after').value),
+    boost_sec:   parseInt(gid('boost_sec').value),
+    erpm_on:  parseInt(gid('erpm_on').value)||200,
+    lag_s:    parseInt(gid('lag_s').value),
+    invert:   gid('invert').checked,
+    min_volt: parseFloat(gid('min_volt').value)||0
+  });
+}
+
+function save(loud){
+  fetch('/api/heat',{method:'POST',headers:{'Content-Type':'application/json'},body:body()})
+    .then(function(r){return r.json();}).then(function(d){
+      if(d.heat) fill(d.heat);
+      if(loud) gid('msg').textContent=d.ok?L('Gespeichert','Saved'):(d.err||L('Fehler','Error'));
+      if(!d.ok&&!loud) gid('msg').textContent=d.err||L('Fehler','Error');
+      if(d.ok&&loud) setTimeout(function(){gid('msg').textContent='';},2500);
+    }).catch(function(){gid('msg').textContent=L('Keine Verbindung','No connection');});
+}
+
+function test(on){
+  var p=on?{pct:parseInt(gid('test_pct').value)||100,sec:parseInt(gid('test_sec').value)||60}:{pct:0,sec:0};
+  fetch('/api/heat/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(p)})
+    .then(function(r){return r.json();}).then(function(d){
+      if(d.heat) fill(d.heat);
+      gid('msg').textContent=d.ok?(on?L('Test laeuft','Test running'):L('Test gestoppt','Test stopped')):(d.err||L('Fehler','Error'));
+      setTimeout(function(){gid('msg').textContent='';},2500);
+    }).catch(function(){gid('msg').textContent=L('Keine Verbindung','No connection');});
+}
+
+// ── Debug-Freischaltung ──────────────────────────────────────────────────
+//
+// Der API-Tab haengt an einem serverseitigen RAM-Flag, das 8x Tippen auf den
+// Titel setzt. Ohne diesen Block fehlte der Tab hier nicht nur — man kam auch
+// nicht an ihn heran: die Startseite schaltet frei, aber auf dieser Seite gab
+// es weder den Tab noch das Tippen, und wer hier gelandet war, musste erst
+// wieder zurueck. Deshalb steht die Freischaltung auf jeder Seite, die eine
+// Tableiste hat.
+var dbgUnlocked=false;
+function applyDebugState(){
+  var el=gid('tab-api-link'); if(el) el.style.display=dbgUnlocked?'':'none';
+  // Der Testlauf heizt unabhaengig von ERPM und gehoert damit zum Aufbau, nicht
+  // zum Alltag. Hinter dieselbe Freischaltung wie der API-Reiter: 8x auf den
+  // Titel tippen. Ein laufender Test wird davon NICHT beendet — nur die
+  // Bedienelemente verschwinden, und der Test endet ohnehin von selbst.
+  var ts=gid('testSec');      if(ts) ts.style.display=dbgUnlocked?'':'none';
+}
+function heatToast(m){
+  var t=gid('heatToast');
+  if(!t){
+    t=document.createElement('div'); t.id='heatToast';
+    t.style.cssText='position:fixed;top:12px;left:50%;transform:translateX(-50%);padding:10px 18px;border-radius:6px;font-family:inherit;font-size:13px;z-index:9999;transition:opacity .3s;pointer-events:none;background:var(--bg3);border:1px solid var(--accent);color:var(--text)';
+    document.body.appendChild(t);
+  }
+  t.textContent=m; t.style.opacity='1';
+  clearTimeout(t._h); t._h=setTimeout(function(){t.style.opacity='0';},3000);
+}
+function checkApiUnlock(){
+  fetch('/api/debug/unlock',{cache:'no-store'}).then(function(r){return r.ok?r.json():null;}).then(function(j){
+    dbgUnlocked=!!(j&&j.unlocked); applyDebugState();
+  }).catch(function(){});
+}
+function unlockDebug(){
+  fetch('/api/debug/unlock',{method:'POST'}).then(function(){
+    dbgUnlocked=true; applyDebugState();
+    heatToast(L('\uD83D\uDD13 Debug aktiv \u2013 bis Neustart','\uD83D\uDD13 Debug active \u2013 until reboot'));
+  }).catch(function(){});
+}
+(function(){
+  var title=gid('appTitle'); if(!title) return;
+  var taps=0, timer=null;
+  title.addEventListener('click',function(){
+    if(dbgUnlocked) return;
+    taps++;
+    if(timer) clearTimeout(timer);
+    timer=setTimeout(function(){ taps=0; },1500);
+    if(taps>=8){
+      taps=0;
+      if(timer){ clearTimeout(timer); timer=null; }
+      unlockDebug();
+    }
+  });
+})();
+
+checkApiUnlock();
+status();
+setInterval(status,2000);
+</script>
+</body>
+</html>

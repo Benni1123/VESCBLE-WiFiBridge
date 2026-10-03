@@ -117,6 +117,11 @@ bool   cfg_leds_enabled       = false; // WS28XX LED-Steuerung aktiv (zeigt LED-
 // Haken allein, braucht es KEINEN Neustart.
 bool   cfg_heat_enabled       = false;
 
+// Easteregg auf der Startseite (nur beim Geraet mit dem passenden BLE-Namen).
+// Im NVS und nicht im Browser gespeichert: so gilt die Entscheidung fuer das
+// Geraet und nicht fuer das Handy, mit dem man gerade draufschaut.
+bool   cfg_egg_enabled        = true;
+
 // ── Log-Versand an einen HTTP-Server ─────────────────────────────────────────
 // Die Einstellung ist nur im freigeschalteten API-Tab sichtbar (8x auf den
 // Titel tippen), der Wert selbst liegt aber im NVS und gilt dauerhaft — auch

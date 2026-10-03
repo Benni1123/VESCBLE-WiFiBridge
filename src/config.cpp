@@ -64,6 +64,7 @@ void loadConfig() {
   cfg_ble_full_power     = prefs.getBool("ble_fullpwr",      false);
   cfg_leds_enabled       = prefs.getBool("leds_en",          false);
   cfg_heat_enabled       = prefs.getBool("heat_en",          false);
+  cfg_egg_enabled        = prefs.getBool("egg_en",           true);
   // Log-Versand: bewusst unabhaengig von cfg_debug gespeichert und geladen.
   cfg_logship_enabled    = prefs.getBool  ("lship_en",  false);
   cfg_logship_url        = prefs.getString("lship_url", "");
@@ -185,6 +186,7 @@ void saveConfig() {
   prefs.putBool  ("ble_fullpwr", cfg_ble_full_power);
   prefs.putBool  ("leds_en",     cfg_leds_enabled);
   prefs.putBool  ("heat_en",     cfg_heat_enabled);
+  prefs.putBool  ("egg_en",      cfg_egg_enabled);
   prefs.putBool  ("lship_en",    cfg_logship_enabled);
   prefs.putString("lship_url",   cfg_logship_url);
   prefs.putString("lship_tok",   cfg_logship_token);

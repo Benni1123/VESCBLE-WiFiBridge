@@ -1,3 +1,4 @@
+# pyright: reportUndefinedVariable=false
 Import("env")
 import re
 import os

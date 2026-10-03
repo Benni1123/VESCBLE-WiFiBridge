@@ -290,8 +290,72 @@ void vescTcpSetup() {
   Serial.printf("VESC TCP: port %d\n", cfg_port);
 }
 
+// ── ERPM-Simulation (Debug) ─────────────────────────────────────────────────
+//
+// Zum Pruefen der bewegungsabhaengigen Funktionen, ohne den Scooter zu
+// schieben: Boost, Anhalte-Verzoegerung, Absenken und Abschalten haengen alle
+// an ERPM und an Zeiten von 10 bis 30 Sekunden.
+//
+// Drei Dinge sind hier bewusst so:
+//
+//   - Der Wert laeuft von selbst ab. Eine vergessene Simulation duerfte die
+//     Heizung nicht dauerhaft auf "faehrt" halten.
+//   - vescStatus.lastUpdate wird mitgesetzt, sonst gilt der simulierte Wert
+//     sofort als veraltet und nichts passiert.
+//   - Das echte Polling laeuft weiter. Ueberschrieben wird nur die Anzeige
+//     nach aussen, und sobald die Simulation endet, zaehlt wieder der echte
+//     Wert — ohne Umweg.
+#define VESC_SIM_MAX_S 300
+static bool          vescSimOn    = false;
+static int32_t       vescSimErpm  = 0;
+static unsigned long vescSimUntil = 0;
+
+bool vescSimActive() { return vescSimOn; }
+
+void vescSimSet(int32_t erpm, int sec) {
+  if (sec <= 0) {
+    if (vescSimOn) logShipAdd("[SIM] ERPM-Simulation beendet");
+    vescSimOn = false;
+    return;
+  }
+  if (sec > VESC_SIM_MAX_S) sec = VESC_SIM_MAX_S;
+  vescSimErpm  = erpm;
+  vescSimUntil = millis() + (unsigned long)sec * 1000UL;
+  vescSimOn    = true;
+  logShipAdd("[SIM] ERPM " + String(erpm) + " fuer " + String(sec) + "s simuliert");
+}
+
+String vescSimStatusJson() {
+  long left = 0;
+  if (vescSimOn) {
+    long d = (long)(int32_t)(vescSimUntil - millis());
+    left = (d > 0) ? d / 1000 : 0;
+  }
+  return String("{\"active\":") + (vescSimOn ? "true" : "false") +
+         ",\"erpm\":" + String(vescSimErpm) +
+         ",\"left_s\":" + String(left) +
+         ",\"max_s\":" + String(VESC_SIM_MAX_S) + "}";
+}
+
+// Im Loop anwenden, VOR allem, was ERPM liest.
+static void vescSimApply() {
+  if (!vescSimOn) return;
+  if ((int32_t)(millis() - vescSimUntil) >= 0) {
+    vescSimOn = false;
+    logShipAdd("[SIM] ERPM-Simulation abgelaufen");
+    return;
+  }
+  vescStatus.erpm       = vescSimErpm;
+  vescStatus.connected  = true;
+  vescStatus.lastUpdate = millis();   // sonst gilt der Wert sofort als veraltet
+}
+
 // ── VESC-Bridge und Polling ───────────────────────────────────────────────────
 void vescLoop() {
+  // Erst simulieren, dann pollen: ein echter Poll darf den simulierten Wert
+  // ueberschreiben duerfen, sobald die Simulation ablaeuft — aber solange sie
+  // laeuft, gilt sie.
+  vescSimApply();
   pollVesc();
 
   // LED-Modul: bekommt aktuellen ERPM fuer spaetere bewegungsabhaengige Effekte.
@@ -299,6 +363,10 @@ void vescLoop() {
   // werden keine Effekte mehr getrieben, LEDs bleiben aus.
   // LED-Rendering laeuft jetzt im eigenen Task (Kern 1). Hier nur noch billig
   // den Zustand melden; das eigentliche show() macht der LED-Task.
+  // Nach pollVesc() erneut: ein eingetroffener echter Wert haette die
+  // Simulation sonst fuer diesen Durchlauf ueberschrieben.
+  vescSimApply();
+
   ledsUpdateState(cfg_leds_enabled, vescStatus.erpm);
 
   // Griffheizung: entscheidet aus ERPM und Spannung, ob geheizt wird. Steht
